@@ -2876,13 +2876,388 @@ int MPComm::transferImpl(uintptr_t local_addr,
     return global_error.load();
 }
 
+int MPComm::transferImplDynamic(uintptr_t local_addr,
+                                const std::vector<std::string> &host_list,
+                                const std::vector<uintptr_t> &remote_addrs,
+                                const std::vector<size_t> &lengths,
+                                TransferDirection direction) {
+    // Transfer operation name for logging
+    const char* op_name = (direction == TransferDirection::SCATTER) ? "ScatterDynamic" : "GatherDynamic";
+    
+    // Timing: function entry
+    auto t_start = std::chrono::steady_clock::now();
+    
+    if (!initialized_) return MPCOMM_ERR_CONTEXT;
+    
+    size_t host_count = host_list.size();
+    if (host_count == 0 || remote_addrs.size() != host_count ||
+        lengths.size() != host_count) {
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+
+    size_t num_nics = nic_contexts_.size();
+    if (num_nics == 0) {
+        return MPCOMM_ERR_DEVICE;
+    }
+
+    // Timing: after validation
+    auto t_after_validation = std::chrono::steady_clock::now();
+
+    // Get remote rkey (from connection info)
+    auto getRkey = [this](const std::string &host_id, size_t nic_index) -> uint32_t {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        auto it = connections_.find(host_id);
+        if (it == connections_.end()) return 0;
+        if (nic_index >= it->second.nic_endpoints.size()) return 0;
+        return it->second.nic_endpoints[nic_index].rkey;
+    };
+
+    // Prepare all chunks from all hosts
+    // Optimized: use host_idx instead of string copy, direct index assignment
+    struct ChunkTask {
+        size_t host_idx;        // Index into host_list (avoid string copy)
+        uintptr_t local_addr;
+        uintptr_t remote_addr;
+        size_t length;
+    };
+    
+    // Pre-calculate total number of chunks and per-host chunk start indices
+    const size_t max_chunk_size = max_rdma_transfer_size_;
+    size_t total_chunks = 0;
+    
+    // Fast path: pre-compute chunk counts and local offsets per host
+    // Use stack allocation for small host counts to avoid heap allocation
+    constexpr size_t STACK_THRESHOLD = 64;
+    size_t stack_chunk_starts[STACK_THRESHOLD];
+    size_t stack_local_offsets[STACK_THRESHOLD];
+    
+    size_t* host_chunk_starts = (host_count <= STACK_THRESHOLD) ? stack_chunk_starts : new size_t[host_count];
+    size_t* host_local_offsets = (host_count <= STACK_THRESHOLD) ? stack_local_offsets : new size_t[host_count];
+    
+    size_t running_local_offset = 0;
+    for (size_t i = 0; i < host_count; ++i) {
+        host_chunk_starts[i] = total_chunks;
+        host_local_offsets[i] = running_local_offset;
+        total_chunks += (lengths[i] + max_chunk_size - 1) / max_chunk_size;
+        running_local_offset += lengths[i];
+    }
+    
+    // Allocate chunk array and fill directly by index (no push_back overhead)
+    std::vector<ChunkTask> all_chunks(total_chunks);  // Default construct all at once
+    
+    // Fill chunks using direct index assignment (cache-friendly linear write)
+    for (size_t host_idx = 0; host_idx < host_count; ++host_idx) {
+        const size_t host_len = lengths[host_idx];
+        const uintptr_t base_local = local_addr + host_local_offsets[host_idx];
+        const uintptr_t base_remote = remote_addrs[host_idx];
+        size_t chunk_idx = host_chunk_starts[host_idx];
+        
+        // Process full chunks (no min calculation needed)
+        size_t full_chunks = host_len / max_chunk_size;
+        for (size_t i = 0; i < full_chunks; ++i) {
+            all_chunks[chunk_idx++] = {
+                host_idx,
+                base_local + i * max_chunk_size,
+                base_remote + i * max_chunk_size,
+                max_chunk_size
+            };
+        }
+        
+        // Process remainder chunk if any
+        size_t remainder = host_len % max_chunk_size;
+        if (remainder > 0) {
+            all_chunks[chunk_idx] = {
+                host_idx,
+                base_local + full_chunks * max_chunk_size,
+                base_remote + full_chunks * max_chunk_size,
+                remainder
+            };
+        }
+    }
+    
+    // Clean up heap allocation if used
+    if (host_count > STACK_THRESHOLD) {
+        delete[] host_chunk_starts;
+        delete[] host_local_offsets;
+    }
+    if (total_chunks == 0) {
+        return MPCOMM_SUCCESS;
+    }
+
+    // Timing: after chunk preparation
+    auto t_after_chunk_prep = std::chrono::steady_clock::now();
+
+    printf("MPComm: %s with %zu chunks across %zu NICs (dynamic load balancing)\n",
+           op_name, total_chunks, num_nics);
+
+    // Per-NIC flow control state
+    // Flow control parameters
+    const size_t max_outstanding_per_nic = 256 * qps_per_connection_;  // Total outstanding per NIC
+    const int poll_batch_size = 32;
+    
+    std::vector<size_t> per_nic_posted(num_nics, 0);
+    std::vector<size_t> per_nic_completed(num_nics, 0);
+    std::vector<size_t> per_nic_bytes(num_nics, 0);  // For statistics
+    
+    // Per-NIC per-QP counters for proper QP flow control
+    // per_nic_qp_posted[nic][qp] = number of WRs posted to that QP
+    std::vector<std::vector<size_t>> per_nic_qp_posted(num_nics);
+    std::vector<std::vector<size_t>> per_nic_qp_completed(num_nics);
+    for (size_t nic = 0; nic < num_nics; ++nic) {
+        per_nic_qp_posted[nic].resize(qps_per_connection_, 0);
+        per_nic_qp_completed[nic].resize(qps_per_connection_, 0);
+    }
+    
+    // Work completion array for polling
+    struct ibv_wc wc_array[32];
+    
+    // Track total completions
+    size_t total_completed = 0;
+    
+    // Timing: start of transfer
+    auto t_transfer_start = std::chrono::steady_clock::now();
+    
+    // Dynamic NIC selection: choose NIC that can accept work AND has highest throughput
+    // Strategy: Among NICs with available slots, prefer the one with highest completion rate
+    // (i.e., completed more chunks relative to posted). This naturally favors faster NICs.
+    size_t rr_nic_index = 0;  // Round-robin fallback index
+    
+    auto selectBestNic = [&]() -> size_t {
+        size_t best_nic = num_nics;  // Invalid initially
+        size_t max_available = 0;
+        
+        for (size_t nic = 0; nic < num_nics; ++nic) {
+            size_t outstanding = per_nic_posted[nic] - per_nic_completed[nic];
+            
+            // Skip NICs that are full
+            if (outstanding >= max_outstanding_per_nic) {
+                continue;
+            }
+            
+            // Select NIC with most available slots
+            size_t available = max_outstanding_per_nic - outstanding;
+            if (available > max_available) {
+                max_available = available;
+                best_nic = nic;
+            }
+        }
+        
+        // Fallback to round-robin if no NIC found (all full)
+        if (best_nic == num_nics) {
+            best_nic = rr_nic_index % num_nics;
+            rr_nic_index++;
+        }
+        
+        return best_nic;
+    };
+    
+    // Poll all NICs for completions
+    auto pollAllNics = [&]() -> int {
+        for (size_t nic = 0; nic < num_nics; ++nic) {
+            auto &ctx = *nic_contexts_[nic];
+            int n = ibv_poll_cq(ctx.cq, poll_batch_size, wc_array);
+            if (n < 0) {
+                fprintf(stderr, "MPComm: ibv_poll_cq failed on NIC %zu in %s\n", nic, op_name);
+                return MPCOMM_ERR_TRANSFER;
+            }
+            for (int i = 0; i < n; ++i) {
+                if (wc_array[i].status != IBV_WC_SUCCESS) {
+                    fprintf(stderr, "MPComm: WC error on NIC %zu in %s: status=%d, wr_id=0x%lx\n",
+                            nic, op_name, wc_array[i].status, wc_array[i].wr_id);
+                    return MPCOMM_ERR_TRANSFER;
+                }
+                // Decode nic_index and qp_index from wr_id
+                // wr_id format: (nic_index << 56) | (qp_index << 48) | addr_part
+                size_t completed_nic = (wc_array[i].wr_id >> 56) & 0xFF;
+                size_t completed_qp = (wc_array[i].wr_id >> 48) & 0xFF;
+                
+                if (completed_nic < num_nics) {
+                    per_nic_completed[completed_nic]++;
+                    if (completed_qp < qps_per_connection_) {
+                        per_nic_qp_completed[completed_nic][completed_qp]++;
+                    }
+                }
+                total_completed++;
+            }
+        }
+        return MPCOMM_SUCCESS;
+    };
+
+    // Variables for proactive polling
+    size_t posts_since_last_poll = 0;  // Counter for proactive poll interval
+    size_t prev_completed = 0;         // For detecting progress in blocking wait
+
+    // Post all chunks with dynamic NIC selection
+    for (size_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+        auto &chunk = all_chunks[chunk_idx];
+        
+        // Poll to make room if all NICs are full
+        while (true) {
+            // Try to find a NIC with available slots
+            size_t best_nic = selectBestNic();
+            size_t outstanding = per_nic_posted[best_nic] - per_nic_completed[best_nic];
+            
+            if (outstanding < max_outstanding_per_nic) {
+                // Found a NIC with available slots
+                // Select QP using round-robin within this NIC
+                size_t qp_index = per_nic_posted[best_nic] % qps_per_connection_;
+                
+                // Get lkey for this NIC
+                uint32_t lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
+                if (lkey == 0) {
+                    fprintf(stderr, "MPComm: No lkey for address %p on NIC %zu\n",
+                            reinterpret_cast<void *>(chunk.local_addr), best_nic);
+                    return MPCOMM_ERR_MEMORY;
+                }
+                
+                // Get rkey for this NIC
+                const std::string& host_id = host_list[chunk.host_idx];
+                uint32_t rkey = getRkey(host_id, best_nic);
+                if (rkey == 0) {
+                    fprintf(stderr, "MPComm: No rkey for %s on NIC %zu\n",
+                            host_id.c_str(), best_nic);
+                    return MPCOMM_ERR_CONNECTION;
+                }
+                
+                // Get QP
+                struct ibv_qp *qp = getOrCreateQP(best_nic, host_id, best_nic, qp_index);
+                if (!qp) {
+                    fprintf(stderr, "MPComm: No QP for %s on NIC %zu (qp_index=%zu)\n",
+                            host_id.c_str(), best_nic, qp_index);
+                    return MPCOMM_ERR_CONNECTION;
+                }
+                
+                // Prepare SGE and WR
+                struct ibv_sge sge;
+                memset(&sge, 0, sizeof(sge));
+                sge.addr = chunk.local_addr;
+                sge.length = static_cast<uint32_t>(chunk.length);
+                sge.lkey = lkey;
+                
+                struct ibv_send_wr wr;
+                memset(&wr, 0, sizeof(wr));
+                // Encode nic_index and qp_index in wr_id for completion tracking
+                // wr_id format: (nic_index << 56) | (qp_index << 48) | addr_part
+                uint64_t addr_part = chunk.local_addr & 0x0000FFFFFFFFFFFFULL;
+                wr.wr_id = (static_cast<uint64_t>(best_nic) << 56) | 
+                           (static_cast<uint64_t>(qp_index) << 48) | addr_part;
+                wr.opcode = (direction == TransferDirection::SCATTER) ? 
+                            IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+                wr.sg_list = &sge;
+                wr.num_sge = 1;
+                wr.send_flags = IBV_SEND_SIGNALED;
+                wr.wr.rdma.remote_addr = chunk.remote_addr;
+                wr.wr.rdma.rkey = rkey;
+                
+                struct ibv_send_wr *bad_wr = nullptr;
+                int ret = ibv_post_send(qp, &wr, &bad_wr);
+                if (ret != 0) {
+                    fprintf(stderr, "MPComm: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
+                    return MPCOMM_ERR_TRANSFER;
+                }
+                
+                per_nic_posted[best_nic]++;
+                per_nic_qp_posted[best_nic][qp_index]++;
+                per_nic_bytes[best_nic] += chunk.length;
+                posts_since_last_poll++;
+                
+                // Proactive polling: poll after every N posts to release slots early
+                // This improves throughput by keeping the pipeline full
+                constexpr size_t POLL_INTERVAL = 16;  // Poll every 16 posts
+                if (posts_since_last_poll >= POLL_INTERVAL) {
+                    pollAllNics();  // Non-blocking poll, ignore return for proactive polling
+                    posts_since_last_poll = 0;
+                }
+                
+                break;  // Chunk posted successfully, move to next chunk
+            }
+            
+            // All NICs are full, must poll for completions (blocking wait)
+            int poll_ret = pollAllNics();
+            if (poll_ret != MPCOMM_SUCCESS) {
+                return poll_ret;
+            }
+            
+            // If no completions found, yield and retry
+            if (total_completed == prev_completed) {
+                std::this_thread::yield();
+            }
+            prev_completed = total_completed;
+        }
+    }
+    
+    // Drain remaining completions
+    while (total_completed < total_chunks) {
+        int poll_ret = pollAllNics();
+        if (poll_ret != MPCOMM_SUCCESS) {
+            return poll_ret;
+        }
+        if (total_completed < total_chunks) {
+            std::this_thread::yield();
+        }
+    }
+    
+    // Timing: end of transfer
+    auto t_transfer_end = std::chrono::steady_clock::now();
+    
+    // Calculate statistics
+    double transfer_ms = std::chrono::duration<double, std::milli>(
+        t_transfer_end - t_transfer_start).count();
+    
+    size_t total_bytes = 0;
+    for (size_t nic = 0; nic < num_nics; ++nic) {
+        total_bytes += per_nic_bytes[nic];
+    }
+    double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
+    
+    // Print per-NIC statistics
+    printf("\n========== %s Statistics (Dynamic Load Balancing) ==========\n", op_name);
+    printf("%-20s %15s %12s %12s %12s\n", 
+           "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
+    printf("------------------------------------------------------------------------\n");
+    for (size_t nic = 0; nic < num_nics; ++nic) {
+        double share_pct = (total_bytes > 0) ? 
+                           (100.0 * per_nic_bytes[nic] / total_bytes) : 0.0;
+        double nic_bandwidth_gbps = (per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
+        printf("%-20s %15zu %12zu %11.1f%% %12.2f\n",
+               nic_contexts_[nic]->device_name.c_str(),
+               per_nic_bytes[nic], per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
+    }
+    printf("------------------------------------------------------------------------\n");
+    printf("%-20s %15zu %12zu %12s %12.2f\n",
+           "Total", total_bytes, total_chunks, "-", total_bandwidth_gbps);
+    printf("Time: %.2f ms\n", transfer_ms);
+    printf("==============================================================\n\n");
+
+    // Timing: after print stats
+    auto t_end = std::chrono::steady_clock::now();
+
+    // Print overhead timing (in microseconds)
+    auto us = [](auto start, auto end) {
+        return std::chrono::duration<double, std::micro>(end - start).count();
+    };
+    printf("========== %s Overhead (us) ==========\n", op_name);
+    printf("  Validation:        %10.2f us\n", us(t_start, t_after_validation));
+    printf("  Chunk preparation: %10.2f us\n", us(t_after_validation, t_after_chunk_prep));
+    printf("  Transfer:          %10.2f us\n", us(t_transfer_start, t_transfer_end));
+    printf("  Print stats:       %10.2f us\n", us(t_transfer_end, t_end));
+    printf("  -----------------------------------\n");
+    printf("  Total function:    %10.2f us\n", us(t_start, t_end));
+    printf("===========================================\n\n");
+
+    return MPCOMM_SUCCESS;
+}
+
 int MPComm::scatter(uintptr_t local_addr,
                     const std::vector<std::string> &host_list,
                     const std::vector<uintptr_t> &remote_addrs,
                     const std::vector<size_t> &lengths,
                     int num_threads) {
-    return transferImpl(local_addr, host_list, remote_addrs, lengths,
-                        num_threads, TransferDirection::SCATTER);
+    // Use dynamic load balancing implementation for better performance
+    // num_threads parameter is kept for API compatibility but ignored
+    (void)num_threads;
+    return transferImplDynamic(local_addr, host_list, remote_addrs, lengths,
+                               TransferDirection::SCATTER);
 }
 
 int MPComm::gather(uintptr_t local_addr,
@@ -2890,8 +3265,11 @@ int MPComm::gather(uintptr_t local_addr,
                    const std::vector<uintptr_t> &remote_addrs,
                    const std::vector<size_t> &lengths,
                    int num_threads) {
-    return transferImpl(local_addr, host_list, remote_addrs, lengths,
-                        num_threads, TransferDirection::GATHER);
+    // Use dynamic load balancing implementation for better performance
+    // num_threads parameter is kept for API compatibility but ignored
+    (void)num_threads;
+    return transferImplDynamic(local_addr, host_list, remote_addrs, lengths,
+                               TransferDirection::GATHER);
 }
 
 }  // namespace mpcomm

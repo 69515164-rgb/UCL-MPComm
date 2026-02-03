@@ -303,6 +303,9 @@ public:
     /**
      * Scatter: distribute local data to multiple remote hosts
      * 
+     * Uses dynamic load balancing across NICs - chunks are assigned to
+     * the NIC with the most available capacity for better performance.
+     * 
      * Data layout:
      *   local_buffer[0..lengths[0]] -> host_list[0]:remote_addrs[0]
      *   local_buffer[lengths[0]..lengths[0]+lengths[1]] -> host_list[1]:remote_addrs[1]
@@ -312,7 +315,7 @@ public:
      * @param host_list        List of destination host IDs
      * @param remote_addrs     Remote buffer addresses on each host
      * @param lengths          Data lengths for each host
-     * @param num_threads      Number of threads (each uses different NIC)
+     * @param num_threads      Kept for API compatibility (ignored, uses dynamic balancing)
      * @return 0 on success, negative error code on failure
      */
     int scatter(uintptr_t local_addr,
@@ -324,6 +327,9 @@ public:
     /**
      * Gather: collect data from multiple remote hosts to local buffer
      * 
+     * Uses dynamic load balancing across NICs - chunks are assigned to
+     * the NIC with the most available capacity for better performance.
+     * 
      * Data layout:
      *   host_list[0]:remote_addrs[0] -> local_buffer[0..lengths[0]]
      *   host_list[1]:remote_addrs[1] -> local_buffer[lengths[0]..lengths[0]+lengths[1]]
@@ -333,7 +339,7 @@ public:
      * @param host_list        List of source host IDs
      * @param remote_addrs     Remote buffer addresses on each host
      * @param lengths          Data lengths for each host
-     * @param num_threads      Number of threads (each uses different NIC)
+     * @param num_threads      Kept for API compatibility (ignored, uses dynamic balancing)
      * @return 0 on success, negative error code on failure
      */
     int gather(uintptr_t local_addr,
@@ -506,6 +512,15 @@ private:
                      const std::vector<size_t> &lengths,
                      int num_threads,
                      TransferDirection direction);
+
+    // Dynamic load-balanced implementation for scatter and gather
+    // Uses a single thread to manage all NICs, dynamically assigning chunks
+    // to the NIC with the most available slots (least outstanding WRs)
+    int transferImplDynamic(uintptr_t local_addr,
+                            const std::vector<std::string> &host_list,
+                            const std::vector<uintptr_t> &remote_addrs,
+                            const std::vector<size_t> &lengths,
+                            TransferDirection direction);
 
     // Member variables
     std::string local_host_id_;

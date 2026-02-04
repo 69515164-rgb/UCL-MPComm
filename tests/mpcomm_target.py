@@ -21,6 +21,9 @@ This script runs on the target host and waits for incoming RDMA connections.
 
 Usage:
     python mpcomm_target.py --host-id target1 --tcp-port 12345 --device mlx5_0
+    
+    # Multi-NUMA mode (allocate separate buffer on each NUMA node)
+    python mpcomm_target.py --host-id target1 --tcp-port 12345 --num-numas 2
 
 Environment variables:
     MPCOMM_HOST_ID: Local host identifier (default: 127.0.0.1:12345)
@@ -234,7 +237,202 @@ class MPCommTargetServer:
         print("[target] Stopping server...")
 
 
-def _install_signal_handlers(target: MPCommTargetServer) -> None:
+class MultiNumaTargetServer:
+    """Target server that maintains buffers with NUMA regions.
+    
+    This class allocates a buffer for each NUMA node and publishes each buffer
+    with its NUMA info. Initiator can query all buffers and match NUMA-to-NUMA:
+    - initiator NUMA 0 -> target buffer with numa_node=0
+    - initiator NUMA 1 -> target buffer with numa_node=1
+    - etc.
+    
+    Each buffer is published separately with publish_buffer(addr, length, numa_node).
+    The new multi-buffer API allows querying all buffers with their NUMA info.
+    """
+
+    def __init__(
+        self,
+        *,
+        host_id: str,
+        tcp_port: int,
+        device_name: str,
+        buffer_size: int,
+        num_numas: int,
+        verbose: bool,
+    ) -> None:
+        self.host_id = host_id
+        self.tcp_port = tcp_port
+        self.device_name = device_name
+        self.buffer_size = buffer_size
+        self.num_numas = num_numas
+        self.verbose = verbose
+        self._stop_requested = False
+
+        if num_numas < 1:
+            raise ValueError("num_numas must be at least 1")
+
+        # Initialize MPComm
+        self.comm = mpcomm.MPComm()
+        ret = self.comm.init(host_id, device_name, tcp_port)
+        if ret != 0:
+            raise RuntimeError(f"MPComm initialization failed with code {ret}")
+
+        # Get actual TCP port
+        self.tcp_port = self.comm.get_tcp_port()
+
+        print(f"[multi-numa target] Initialized MPComm with {self.comm.get_num_nics()} NICs")
+        print(f"[multi-numa target] Using {num_numas} NUMA node(s)")
+        for i in range(self.comm.get_num_nics()):
+            print(f"  NIC {i}: GID={self.comm.get_gid(i)}")
+
+        # Allocate and register buffers for each NUMA node
+        self._tensors: List[Optional[torch.Tensor]] = []
+        self.numa_buffer_addrs: List[int] = []
+        self._ipv4_bytes = _resolve_ipv4_bytes(host_id)
+        self._allocate_numa_buffers()
+        
+        # Initialize each NUMA buffer with IPv4 pattern
+        for numa_id in range(num_numas):
+            self._initialize_buffer_pattern(numa_id, self.numa_buffer_addrs[numa_id])
+
+        # Publish each buffer with its NUMA info
+        for numa_id in range(num_numas):
+            ret = self.comm.publish_buffer(
+                self.numa_buffer_addrs[numa_id],
+                self.buffer_size,
+                numa_id  # Pass NUMA node info
+            )
+            if ret != 0:
+                raise RuntimeError(f"Failed to publish buffer for NUMA {numa_id}: {ret}")
+            print(f"[multi-numa target] Published buffer for NUMA {numa_id}")
+
+    def _allocate_numa_buffers(self) -> None:
+        """Allocate tensor buffers on different NUMA nodes."""
+        for numa_id in range(self.num_numas):
+            try:
+                # Try to use numa library if available
+                try:
+                    import numa
+                    if numa.available():
+                        actual_numa_node = numa_id % (numa.get_max_node() + 1)
+                        numa.set_preferred(actual_numa_node)
+                        print(f"[multi-numa target] NUMA {numa_id}: binding to node {actual_numa_node}")
+                except ImportError:
+                    pass  # numa library not available, continue without NUMA binding
+
+                tensor = torch.empty(self.buffer_size, dtype=torch.uint8)
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+
+                # Touch the memory to ensure allocation on current NUMA node
+                tensor.fill_(0)
+
+                addr = tensor.data_ptr()
+                ret = self.comm.register_memory(addr, self.buffer_size)
+                if ret != 0:
+                    raise RuntimeError(f"Failed to register memory for NUMA {numa_id}: {ret}")
+
+                self._tensors.append(tensor)
+                self.numa_buffer_addrs.append(addr)
+                print(f"[multi-numa target] NUMA {numa_id}: Registered buffer at 0x{addr:x} "
+                      f"({_format_bytes(self.buffer_size)})")
+            except Exception as e:
+                raise RuntimeError(f"Failed to allocate buffer for NUMA {numa_id}: {e}")
+
+    def _initialize_buffer_pattern(self, numa_id: int, addr: int) -> None:
+        """Initialize buffer with IPv4 pattern for verification."""
+        pattern_size = min(self.buffer_size, 1024 * 1024)  # Initialize first 1MB
+        payload = _build_ipv4_pattern(self._ipv4_bytes, pattern_size)
+
+        ret = self.comm.write_bytes_to_buffer(addr, payload, len(payload))
+        if ret != 0:
+            print(f"[multi-numa target] Warning: failed to seed buffer {numa_id} with IPv4 pattern",
+                  file=sys.stderr)
+            return
+
+        print(f"[multi-numa target] NUMA {numa_id}: Seeded buffer with IPv4 pattern "
+              f"{self._ipv4_bytes} preview={_preview_hex(payload)}")
+
+    def _unpublish_buffers(self) -> None:
+        """Unpublish all buffers before cleanup."""
+        self.comm.unpublish_all_buffers()
+
+    def get_buffer_info(self) -> dict:
+        """Get buffer information for exchange with initiator."""
+        # Return info for all NUMA buffers
+        buffers_info = []
+        for numa_id, addr in enumerate(self.numa_buffer_addrs):
+            buffers_info.append({
+                "numa_node": numa_id,
+                "addr": addr,
+                "length": self.buffer_size,
+                "rkeys": self.comm.get_all_rkeys(addr),
+            })
+
+        return {
+            "host_id": self.host_id,
+            "tcp_addr": self.host_id.split(":")[0],
+            "tcp_port": self.tcp_port,
+            "num_numas": self.num_numas,
+            "num_nics": self.comm.get_num_nics(),
+            "buffers": buffers_info,
+        }
+
+    def stop(self) -> None:
+        """Request the server to stop."""
+        self._stop_requested = True
+
+    def close(self) -> None:
+        """Cleanup resources."""
+        self._unpublish_buffers()
+        for numa_id, (addr, tensor) in enumerate(zip(self.numa_buffer_addrs, self._tensors)):
+            if addr and tensor is not None:
+                self.comm.unregister_memory(addr)
+        self.numa_buffer_addrs = []
+        self._tensors = []
+        self.comm.stop_accept_thread()
+        self.comm.shutdown()
+
+    def run(self) -> None:
+        """Run the target server, accepting connections and waiting."""
+        # Start accept thread for incoming connections
+        ret = self.comm.start_accept_thread()
+        if ret != 0:
+            raise RuntimeError(f"Failed to start accept thread: {ret}")
+
+        # Print connection info
+        print("\n" + "=" * 70)
+        print("MPComm Multi-NUMA Target Server Ready")
+        print("=" * 70)
+        info = self.get_buffer_info()
+        print(f"  Host ID:      {info['host_id']}")
+        print(f"  TCP Address:  {info['tcp_addr']}:{info['tcp_port']}")
+        print(f"  Num NICs:     {info['num_nics']}")
+        print(f"  Num NUMAs:    {info['num_numas']}")
+        print()
+        print("  Published Buffers (each with NUMA info):")
+        for buf in info['buffers']:
+            print(f"    NUMA {buf['numa_node']}: addr=0x{buf['addr']:x}, "
+                  f"length={_format_bytes(buf['length'])}, rkeys={buf['rkeys']}")
+        print("=" * 70)
+        print("\nBuffers are published with NUMA info and accessible via TCP metadata exchange.")
+        print("Initiator can use query_remote_buffers() to get all buffer info automatically,")
+        print("or use query_remote_buffer_by_numa(numa_node) to get a specific NUMA buffer.")
+        print("\nWaiting for connections... (Press Ctrl+C to stop)\n")
+
+        # Main loop
+        poll_interval = 5.0
+        while not self._stop_requested:
+            time.sleep(poll_interval)
+            if self.verbose:
+                for numa_id, addr in enumerate(self.numa_buffer_addrs):
+                    preview_data = self.comm.read_bytes_from_buffer(addr, 64)
+                    print(f"[multi-numa target] NUMA {numa_id} buffer preview: {_preview_hex(preview_data)}")
+
+        print("[multi-numa target] Stopping server...")
+
+
+def _install_signal_handlers(target) -> None:
     """Install signal handlers for graceful shutdown."""
     def _handler(signum, _frame):
         print(f"\n[target] Received signal {signum}, stopping...")
@@ -260,6 +458,12 @@ Examples:
 
     # Start target server with larger buffer
     python mpcomm_target.py --host-id target1:12345 --buffer-size 20GB
+    
+    # Multi-NUMA mode (2 NUMA nodes, each with separate buffer)
+    python mpcomm_target.py --host-id target1:12345 --num-numas 2
+    
+    # Multi-NUMA with custom buffer size per NUMA
+    python mpcomm_target.py --host-id target1:12345 --num-numas 2 --buffer-size 10GB
 """,
     )
 
@@ -286,6 +490,13 @@ Examples:
         "--buffer-size",
         default=os.getenv("MPCOMM_BUFFER_SIZE", str(DEFAULT_BUFFER_SIZE)),
         help="Buffer size with optional suffix (K/M/G/T) (default: 10GB)",
+    )
+
+    parser.add_argument(
+        "--num-numas",
+        type=int,
+        default=1,
+        help="Number of NUMA nodes to allocate buffers on (default: 1)",
     )
 
     parser.add_argument(
@@ -327,14 +538,26 @@ def main() -> None:
     args = parse_args()
 
     buffer_size = parse_size(args.buffer_size)
+    num_numas = args.num_numas
 
-    target = MPCommTargetServer(
-        host_id=args.host_id,
-        tcp_port=args.tcp_port,
-        device_name=args.device,
-        buffer_size=buffer_size,
-        verbose=args.verbose,
-    )
+    if num_numas > 1:
+        print(f"[main] Starting Multi-NUMA target server with {num_numas} NUMA nodes")
+        target = MultiNumaTargetServer(
+            host_id=args.host_id,
+            tcp_port=args.tcp_port,
+            device_name=args.device,
+            buffer_size=buffer_size,
+            num_numas=num_numas,
+            verbose=args.verbose,
+        )
+    else:
+        target = MPCommTargetServer(
+            host_id=args.host_id,
+            tcp_port=args.tcp_port,
+            device_name=args.device,
+            buffer_size=buffer_size,
+            verbose=args.verbose,
+        )
 
     _install_signal_handlers(target)
 

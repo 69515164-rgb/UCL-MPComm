@@ -27,6 +27,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -49,6 +50,50 @@ enum MPCommError {
     MPCOMM_ERR_TRANSFER = -5,
     MPCOMM_ERR_TIMEOUT = -6,
     MPCOMM_ERR_INVALID_ARG = -7,
+    MPCOMM_ERR_INVALID_HANDLE = -8,  // Invalid async transfer handle
+    MPCOMM_ERR_PENDING = -9,         // Transfer still in progress (not an error)
+};
+
+// Async transfer handle type
+using TransferHandle = uint64_t;
+static constexpr TransferHandle INVALID_TRANSFER_HANDLE = 0;
+
+// wr_id encoding for async transfers
+// Format: [63:56] nic_index (8-bit) | [55:48] qp_index (8-bit) | 
+//         [47:32] transfer_handle (16-bit) | [31:0] chunk_index (32-bit)
+// This allows up to 256 NICs, 256 QPs, 65536 concurrent transfers, 4B chunks
+struct WrIdEncoding {
+    static constexpr uint64_t NIC_SHIFT = 56;
+    static constexpr uint64_t QP_SHIFT = 48;
+    static constexpr uint64_t HANDLE_SHIFT = 32;
+    static constexpr uint64_t CHUNK_MASK = 0xFFFFFFFFULL;
+    static constexpr uint64_t HANDLE_MASK = 0xFFFFULL;
+    static constexpr uint64_t QP_MASK = 0xFFULL;
+    static constexpr uint64_t NIC_MASK = 0xFFULL;
+    
+    static inline uint64_t encode(size_t nic_index, size_t qp_index, 
+                                  TransferHandle handle, size_t chunk_index) {
+        return (static_cast<uint64_t>(nic_index & NIC_MASK) << NIC_SHIFT) |
+               (static_cast<uint64_t>(qp_index & QP_MASK) << QP_SHIFT) |
+               (static_cast<uint64_t>(handle & HANDLE_MASK) << HANDLE_SHIFT) |
+               (chunk_index & CHUNK_MASK);
+    }
+    
+    static inline size_t decodeNic(uint64_t wr_id) {
+        return static_cast<size_t>((wr_id >> NIC_SHIFT) & NIC_MASK);
+    }
+    
+    static inline size_t decodeQp(uint64_t wr_id) {
+        return static_cast<size_t>((wr_id >> QP_SHIFT) & QP_MASK);
+    }
+    
+    static inline TransferHandle decodeHandle(uint64_t wr_id) {
+        return static_cast<TransferHandle>((wr_id >> HANDLE_SHIFT) & HANDLE_MASK);
+    }
+    
+    static inline size_t decodeChunk(uint64_t wr_id) {
+        return static_cast<size_t>(wr_id & CHUNK_MASK);
+    }
 };
 
 // Maximum size for a single RDMA transfer (default: 1 GB)
@@ -69,6 +114,19 @@ size_t getQpsPerConnection();
 // Get the actual max RDMA transfer size (reads from env var or uses default)
 size_t getMaxRdmaTransferSize();
 
+// NUMA topology information for a single NUMA node
+struct NumaTopology {
+    int numa_node;                              // NUMA node ID
+    std::vector<std::string> local_nics;        // NICs local to this NUMA node (optimal)
+    std::vector<std::string> remote_nics;       // NICs on other NUMA nodes (fallback)
+};
+
+// NIC topology information
+struct NicTopologyInfo {
+    std::string nic_name;                       // NIC device name (e.g., mlx5_0)
+    int numa_node;                              // NUMA node this NIC belongs to (-1 if unknown)
+};
+
 // Remote endpoint information exchanged via TCP
 struct RemoteEndpointInfo {
     char gid[64];           // GID as hex string (xx:xx:...:xx format, 47 chars + null)
@@ -86,6 +144,16 @@ struct MemoryRegionInfo {
     struct ibv_mr *mr;
     uint32_t lkey;
     uint32_t rkey;
+    int numa_node;      // NUMA node this memory belongs to (-1 if unknown)
+};
+
+// Remote buffer entry received from peer (single buffer)
+// Defined early so it can be used in ConnectionInfo
+struct RemoteBufferEntry {
+    uint64_t addr;              // Remote buffer address
+    uint64_t length;            // Remote buffer length
+    int numa_node;              // NUMA node this buffer belongs to (-1 if unknown)
+    std::vector<uint32_t> rkeys;  // Remote keys for each NIC
 };
 
 // Per-NIC context (one per RDMA device)
@@ -114,24 +182,79 @@ struct ConnectionInfo {
     std::string host_id;
     int tcp_port;
     std::vector<RemoteEndpointInfo> nic_endpoints;  // One per remote NIC
+    
+    // Remote NUMA topology (for NUMA-aware NIC selection)
+    // Maps remote NIC index to its NUMA node
+    std::vector<int> remote_nic_numa_nodes;  // remote_nic_numa_nodes[nic_idx] = numa_node
+    int remote_numa_count;                   // Number of NUMA nodes on remote side
+    
+    // Remote NIC names (for name-based matching)
+    std::vector<std::string> remote_nic_names;  // remote_nic_names[nic_idx] = device_name
+    
+    // Local NIC to Remote NIC mapping (for name-based suffix matching)
+    // Maps local NIC index to the list of remote NIC indices it connects to
+    // Example: local_to_remote_nic_map[2] = {3} means local NIC2 connects to remote NIC3
+    std::unordered_map<size_t, std::vector<size_t>> local_to_remote_nic_map;
+    
+    // Remote buffers information (for multi-NUMA support)
+    // Each buffer has its own rkeys, allowing parallel access to different NUMA buffers
+    // Key: buffer address, Value: buffer entry with rkeys
+    std::unordered_map<uint64_t, RemoteBufferEntry> remote_buffers;
+    
+    ConnectionInfo() : tcp_port(0), remote_numa_count(0) {}
+    
+    // Helper: find rkey for a specific remote address and NIC
+    // Returns the rkey if found, or falls back to nic_endpoints[nic_idx].rkey
+    uint32_t getRkeyForAddr(uint64_t remote_addr, size_t nic_idx) const {
+        // First check if this address belongs to a known remote buffer
+        for (const auto& [buf_addr, buf_entry] : remote_buffers) {
+            if (remote_addr >= buf_addr && remote_addr < buf_addr + buf_entry.length) {
+                // Found the buffer containing this address
+                if (nic_idx < buf_entry.rkeys.size()) {
+                    return buf_entry.rkeys[nic_idx];
+                }
+                break;
+            }
+        }
+        // Fallback to the legacy single-rkey in nic_endpoints
+        if (nic_idx < nic_endpoints.size()) {
+            return nic_endpoints[nic_idx].rkey;
+        }
+        return 0;
+    }
+    
+    // Helper: find remote buffer by NUMA node
+    const RemoteBufferEntry* getBufferByNuma(int numa_node) const {
+        for (const auto& [addr, entry] : remote_buffers) {
+            if (entry.numa_node == numa_node) {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
 };
 
 // Published buffer information (for metadata exchange)
-struct PublishedBufferInfo {
+// Single buffer entry with NUMA info
+struct PublishedBufferEntry {
     uint64_t addr;              // Buffer address
     uint64_t length;            // Buffer length
+    int numa_node;              // NUMA node this buffer belongs to (-1 if unknown)
     std::vector<uint32_t> rkeys;  // Remote keys for each NIC
+};
+
+// All published buffers
+struct PublishedBufferInfo {
+    std::vector<PublishedBufferEntry> buffers;  // All published buffers
 };
 
 // Forward declaration for thread pool
 class ThreadPool;
 
-// Remote buffer info received from peer
+// Remote buffer info received from peer (all buffers)
 struct RemoteBufferInfo {
     std::string host_id;        // Remote host identifier
-    uint64_t addr;              // Remote buffer address
-    uint64_t length;            // Remote buffer length
-    std::vector<uint32_t> rkeys;  // Remote keys for each NIC
+    std::vector<RemoteBufferEntry> buffers;  // All remote buffers with NUMA info
 };
 
 // Async RDMA operation context
@@ -166,6 +289,76 @@ struct AsyncRdmaContext {
     AsyncRdmaContext& operator=(const AsyncRdmaContext&) = delete;
     AsyncRdmaContext(AsyncRdmaContext&&) = default;
     AsyncRdmaContext& operator=(AsyncRdmaContext&&) = default;
+};
+
+// Chunk task for transfer operations
+struct ChunkTask {
+    size_t host_idx;        // Index into host_list (avoid string copy)
+    uintptr_t local_addr;
+    uintptr_t remote_addr;
+    size_t length;
+};
+
+// Result of an async transfer operation
+struct TransferResult {
+    int error_code;           // MPCOMM_SUCCESS or error code
+    size_t bytes_transferred; // Total bytes transferred
+    double elapsed_ms;        // Transfer time in milliseconds
+};
+
+// Forward declaration
+class MPComm;
+
+// Context for tracking async transfer operations
+struct TransferContext {
+    TransferHandle handle;                          // Unique handle ID
+    std::atomic<size_t> total_chunks;               // Total chunks to transfer
+    std::atomic<size_t> total_completed;            // Completed chunks
+    std::atomic<int> error_code;                    // Error code (0 if no error)
+    std::atomic<bool> finished;                     // True when transfer complete or error
+    
+    // Transfer parameters (stored for async processing)
+    uintptr_t local_addr;
+    std::vector<std::string> host_list;
+    std::vector<uintptr_t> remote_addrs;
+    std::vector<size_t> lengths;
+    bool is_scatter;                                // true=scatter, false=gather
+    
+    // All chunks to be transferred
+    std::vector<ChunkTask> all_chunks;
+    std::atomic<size_t> next_chunk_idx;             // Next chunk to post
+    
+    // Per-NIC flow control state
+    std::vector<size_t> per_nic_posted;
+    std::vector<size_t> per_nic_completed;
+    std::vector<size_t> per_nic_bytes;
+    std::vector<std::vector<size_t>> per_nic_qp_posted;
+    std::vector<std::vector<size_t>> per_nic_qp_completed;
+    
+    // NUMA-aware NIC selection
+    std::vector<size_t> candidate_nic_indices;
+    
+    // Timing
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point end_time;
+    
+    // Round-robin index for NIC selection
+    size_t rr_nic_index;
+    
+    TransferContext() 
+        : handle(INVALID_TRANSFER_HANDLE)
+        , total_chunks(0)
+        , total_completed(0)
+        , error_code(0)
+        , finished(false)
+        , local_addr(0)
+        , is_scatter(true)
+        , next_chunk_idx(0)
+        , rr_nic_index(0) {}
+    
+    // Disable copy
+    TransferContext(const TransferContext&) = delete;
+    TransferContext& operator=(const TransferContext&) = delete;
 };
 
 /**
@@ -260,25 +453,35 @@ public:
     /**
      * Publish a local buffer for remote access
      * After calling this, remote hosts can query this buffer's info via TCP
-     * @param addr    Buffer address (must be registered)
-     * @param length  Buffer length
+     * Supports multiple buffers - each call adds a buffer to the published list
+     * @param addr       Buffer address (must be registered)
+     * @param length     Buffer length
+     * @param numa_node  NUMA node this buffer belongs to (-1 = auto-detect or unknown)
      * @return 0 on success, negative error code on failure
      */
-    int publishBuffer(void *addr, size_t length);
+    int publishBuffer(void *addr, size_t length, int numa_node = -1);
 
     /**
      * Unpublish a previously published buffer
+     * Removes the buffer from the published list
      * @param addr  Buffer address
      * @return 0 on success, negative error code on failure
      */
     int unpublishBuffer(void *addr);
 
     /**
+     * Unpublish all published buffers
+     * Clears the entire published buffer list
+     */
+    void unpublishAllBuffers();
+
+    /**
      * Query remote host's published buffer information via TCP
+     * Returns all published buffers with NUMA info
      * @param remote_host_id  Remote host identifier (must be connected)
      * @param remote_tcp_addr Remote TCP address
      * @param remote_tcp_port Remote TCP port
-     * @param out_info        Output: remote buffer information
+     * @param out_info        Output: remote buffer information (all buffers)
      * @return 0 on success, negative error code on failure
      */
     int queryRemoteBuffer(const std::string &remote_host_id,
@@ -287,10 +490,32 @@ public:
                           RemoteBufferInfo &out_info);
 
     /**
+     * Query remote host's buffer by NUMA node
+     * Convenience method to get a specific NUMA node's buffer
+     * @param remote_host_id  Remote host identifier (must be connected)
+     * @param remote_tcp_addr Remote TCP address
+     * @param remote_tcp_port Remote TCP port
+     * @param numa_node       NUMA node to query (-1 = first buffer)
+     * @param out_entry       Output: matching buffer entry
+     * @return 0 on success, negative error code on failure
+     */
+    int queryRemoteBufferByNuma(const std::string &remote_host_id,
+                                const std::string &remote_tcp_addr,
+                                int remote_tcp_port,
+                                int numa_node,
+                                RemoteBufferEntry &out_entry);
+
+    /**
      * Get local published buffer info (for debugging/display)
-     * @return Published buffer info, or nullptr if not published
+     * @return Published buffer info containing all buffers, or nullptr if none published
      */
     const PublishedBufferInfo* getPublishedBufferInfo() const;
+
+    /**
+     * Get number of published buffers
+     * @return Number of buffers currently published
+     */
+    size_t getPublishedBufferCount() const;
 
     /**
      * Get rkey for local memory region (for exchanging with remote)
@@ -301,8 +526,19 @@ public:
     uint32_t getRkey(size_t nic_index, void *addr) const;
 
     /**
-     * Scatter: distribute local data to multiple remote hosts
+     * Get rkey for remote memory region (for exchanging with remote)
+     * @param remote_host_id  Remote host identifier
+     * @param remote_addr     Remote memory address
+     * @return rkey, or 0 if not found
+     */
+    uint32_t getRkeyForRemoteAddr(const std::string &remote_host_id, uint64_t remote_addr) const;
+
+    // ==================== Async Transfer API ====================
+    
+    /**
+     * Start async scatter operation (returns immediately)
      * 
+     * Distribute local data to multiple remote hosts using RDMA WRITE.
      * Uses dynamic load balancing across NICs - chunks are assigned to
      * the NIC with the most available capacity for better performance.
      * 
@@ -311,22 +547,23 @@ public:
      *   local_buffer[lengths[0]..lengths[0]+lengths[1]] -> host_list[1]:remote_addrs[1]
      *   ...
      * 
+     * Use isTransferComplete() or waitTransfer() to check/wait for completion.
+     * 
      * @param local_addr       Local buffer address (must be registered)
      * @param host_list        List of destination host IDs
      * @param remote_addrs     Remote buffer addresses on each host
      * @param lengths          Data lengths for each host
-     * @param num_threads      Kept for API compatibility (ignored, uses dynamic balancing)
-     * @return 0 on success, negative error code on failure
+     * @return TransferHandle on success, INVALID_TRANSFER_HANDLE on failure
      */
-    int scatter(uintptr_t local_addr,
-                const std::vector<std::string> &host_list,
-                const std::vector<uintptr_t> &remote_addrs,
-                const std::vector<size_t> &lengths,
-                int num_threads = 1);
+    TransferHandle scatterAsync(uintptr_t local_addr,
+                                const std::vector<std::string> &host_list,
+                                const std::vector<uintptr_t> &remote_addrs,
+                                const std::vector<size_t> &lengths);
 
     /**
-     * Gather: collect data from multiple remote hosts to local buffer
+     * Start async gather operation (returns immediately)
      * 
+     * Collect data from multiple remote hosts to local buffer using RDMA READ.
      * Uses dynamic load balancing across NICs - chunks are assigned to
      * the NIC with the most available capacity for better performance.
      * 
@@ -335,18 +572,60 @@ public:
      *   host_list[1]:remote_addrs[1] -> local_buffer[lengths[0]..lengths[0]+lengths[1]]
      *   ...
      * 
+     * Use isTransferComplete() or waitTransfer() to check/wait for completion.
+     * 
      * @param local_addr       Local buffer address (must be registered)
      * @param host_list        List of source host IDs
      * @param remote_addrs     Remote buffer addresses on each host
      * @param lengths          Data lengths for each host
-     * @param num_threads      Kept for API compatibility (ignored, uses dynamic balancing)
-     * @return 0 on success, negative error code on failure
+     * @return TransferHandle on success, INVALID_TRANSFER_HANDLE on failure
      */
-    int gather(uintptr_t local_addr,
-               const std::vector<std::string> &host_list,
-               const std::vector<uintptr_t> &remote_addrs,
-               const std::vector<size_t> &lengths,
-               int num_threads = 1);
+    TransferHandle gatherAsync(uintptr_t local_addr,
+                               const std::vector<std::string> &host_list,
+                               const std::vector<uintptr_t> &remote_addrs,
+                               const std::vector<size_t> &lengths);
+
+    /**
+     * Check if async transfer is complete (non-blocking)
+     * 
+     * This function polls for completions and updates internal state.
+     * 
+     * @param handle  Transfer handle from scatterAsync/gatherAsync
+     * @return true if transfer is complete (success or error), false if still in progress
+     */
+    bool isTransferComplete(TransferHandle handle);
+
+    /**
+     * Wait for async transfer to complete (blocking with optional timeout)
+     * 
+     * @param handle      Transfer handle from scatterAsync/gatherAsync
+     * @param timeout_ms  Timeout in milliseconds (-1 = wait forever)
+     * @return MPCOMM_SUCCESS on success, MPCOMM_ERR_TIMEOUT on timeout,
+     *         or other error code on failure
+     */
+    int waitTransfer(TransferHandle handle, int timeout_ms = -1);
+
+    /**
+     * Get result of completed async transfer
+     * 
+     * Should only be called after isTransferComplete() returns true.
+     * 
+     * @param handle  Transfer handle from scatterAsync/gatherAsync
+     * @return TransferResult with error_code, bytes_transferred, elapsed_ms
+     */
+    TransferResult getTransferResult(TransferHandle handle);
+
+    /**
+     * Release async transfer handle and associated resources
+     * 
+     * Must be called after transfer is complete to free resources.
+     * Calling on an incomplete transfer will cancel and release it.
+     * 
+     * @param handle  Transfer handle from scatterAsync/gatherAsync
+     */
+    void releaseTransfer(TransferHandle handle);
+
+    // ==================== End Async Transfer API ====================
 
     /**
      * Get number of available NICs
@@ -413,7 +692,72 @@ public:
      */
     static const char* getQpsPerConnectionEnvVarName();
 
+    /**
+     * Get NUMA topology information
+     * @return Vector of NumaTopology structures
+     */
+    const std::vector<NumaTopology>& getNumaTopology() const;
+
+    /**
+     * Get NIC topology information
+     * @return Vector of NicTopologyInfo structures
+     */
+    const std::vector<NicTopologyInfo>& getNicTopology() const;
+
+    /**
+     * Get the NUMA node for a specific NIC
+     * @param nic_name  NIC device name
+     * @return NUMA node ID, or -1 if unknown
+     */
+    int getNicNumaNode(const std::string& nic_name) const;
+
+    /**
+     * Get local NICs for a specific NUMA node
+     * @param numa_node  NUMA node ID
+     * @return Vector of local NIC names (optimal NICs for this NUMA node)
+     */
+    std::vector<std::string> getLocalNicsForNuma(int numa_node) const;
+
+    /**
+     * Get NUMA node for a given memory address (check registered memory regions)
+     * @param addr  Memory address
+     * @return NUMA node ID, or -1 if not found in registered regions
+     */
+    int getNumaNodeForAddr(void* addr) const;
+
+    /**
+     * Get local NIC indices for a specific NUMA node
+     * @param numa_node  NUMA node ID
+     * @return Vector of local NIC indices (optimal NICs for this NUMA node)
+     */
+    std::vector<size_t> getLocalNicIndicesForNuma(int numa_node) const;
+
+    /**
+     * Get remote NIC indices for a specific remote NUMA node
+     * Used for NUMA-aware data transfer - select remote NICs that are local
+     * to the destination memory's NUMA node
+     * @param remote_host_id  Remote host identifier
+     * @param remote_numa_node  Remote NUMA node ID
+     * @return Vector of remote NIC indices that belong to the specified NUMA node
+     */
+    std::vector<size_t> getRemoteNicIndicesForNuma(const std::string& remote_host_id, 
+                                                   int remote_numa_node) const;
+
+    /**
+     * Get NUMA node for a specific remote NIC
+     * @param remote_host_id  Remote host identifier
+     * @param nic_index  Remote NIC index
+     * @return NUMA node ID, or -1 if unknown
+     */
+    int getRemoteNicNumaNode(const std::string& remote_host_id, size_t nic_index) const;
+
 private:
+    // Topology discovery helper functions
+    int getNumaNodeCount();
+    int readNicNumaNode(const std::string& nic_name);
+    std::vector<std::string> getCandidateNics();
+    void discoverTopology();
+    void printTopologyInfo();
     // Internal helper functions
     int openDevices(const std::string &device_names);
     int setupNicContext(const std::string &device_name, NicContext &ctx);
@@ -440,26 +784,6 @@ private:
                      uint64_t remote_addr, uint32_t rkey,
                      size_t length);
 
-    // Async RDMA operations - post all chunks at once, return immediately
-    int postRdmaWriteAsync(NicContext &ctx, struct ibv_qp *qp,
-                           void *local_addr, uint32_t lkey,
-                           uint64_t remote_addr, uint32_t rkey,
-                           size_t length, AsyncRdmaContext &async_ctx);
-    int postRdmaReadAsync(NicContext &ctx, struct ibv_qp *qp,
-                          void *local_addr, uint32_t lkey,
-                          uint64_t remote_addr, uint32_t rkey,
-                          size_t length, AsyncRdmaContext &async_ctx);
-
-    // Async RDMA operations with multi-QP rotation - each slice uses a different QP
-    int postRdmaWriteAsyncMultiQP(NicContext &ctx, const std::string &host_id,
-                                  size_t nic_index, void *local_addr, uint32_t lkey,
-                                  uint64_t remote_addr, uint32_t rkey,
-                                  size_t length, AsyncRdmaContext &async_ctx);
-    int postRdmaReadAsyncMultiQP(NicContext &ctx, const std::string &host_id,
-                                 size_t nic_index, void *local_addr, uint32_t lkey,
-                                 uint64_t remote_addr, uint32_t rkey,
-                                 size_t length, AsyncRdmaContext &async_ctx);
-
     // Synchronous RDMA operations with multi-QP rotation - Post-Poll loop in single thread
     // No separate poll thread, better efficiency for scatter/gather
     int rdmaWriteSyncMultiQP(NicContext &ctx, const std::string &host_id,
@@ -468,18 +792,6 @@ private:
     int rdmaReadSyncMultiQP(NicContext &ctx, const std::string &host_id,
                             size_t nic_index, void *local_addr, uint32_t lkey,
                             uint64_t remote_addr, uint32_t rkey, size_t length);
-
-    // Poll for async completion - non-blocking check
-    // Returns: MPCOMM_SUCCESS if all done, MPCOMM_ERR_TIMEOUT if still in progress,
-    //          or other error code on failure
-    int pollAsyncCompletion(NicContext &ctx, AsyncRdmaContext &async_ctx);
-
-    // Wait for async completion - blocking wait with timeout
-    int waitAsyncCompletion(NicContext &ctx, AsyncRdmaContext &async_ctx,
-                            int timeout_ms = 5000);
-
-    // Background poll thread function for async RDMA operations
-    static void asyncPollThreadFunc(AsyncRdmaContext *async_ctx);
 
     int pollCompletion(NicContext &ctx, int timeout_ms = 5000);
 
@@ -505,22 +817,23 @@ private:
         GATHER    // remote -> local (RDMA READ)
     };
 
-    // Unified implementation for scatter and gather
-    int transferImpl(uintptr_t local_addr,
-                     const std::vector<std::string> &host_list,
-                     const std::vector<uintptr_t> &remote_addrs,
-                     const std::vector<size_t> &lengths,
-                     int num_threads,
-                     TransferDirection direction);
+    // Async transfer implementation - prepares context and posts initial chunks
+    TransferHandle transferAsyncStart(uintptr_t local_addr,
+                                      const std::vector<std::string> &host_list,
+                                      const std::vector<uintptr_t> &remote_addrs,
+                                      const std::vector<size_t> &lengths,
+                                      TransferDirection direction);
 
-    // Dynamic load-balanced implementation for scatter and gather
-    // Uses a single thread to manage all NICs, dynamically assigning chunks
-    // to the NIC with the most available slots (least outstanding WRs)
-    int transferImplDynamic(uintptr_t local_addr,
-                            const std::vector<std::string> &host_list,
-                            const std::vector<uintptr_t> &remote_addrs,
-                            const std::vector<size_t> &lengths,
-                            TransferDirection direction);
+    // Async transfer progress - posts more chunks and polls for completions
+    // Returns: MPCOMM_SUCCESS if complete, MPCOMM_ERR_PENDING if in progress,
+    //          or other error code on failure
+    int transferAsyncProgress(TransferContext& ctx);
+
+    // Helper: select best NIC for async transfer (lowest outstanding)
+    size_t selectBestNicForAsync(TransferContext& ctx);
+
+    // Helper: poll all NICs for async transfer completions
+    int pollAllNicsForAsync(TransferContext& ctx);
 
     // Member variables
     std::string local_host_id_;
@@ -533,7 +846,7 @@ private:
     
     // Remote host connection info (key: host_id)
     std::unordered_map<std::string, ConnectionInfo> connections_;
-    std::mutex connections_mutex_;
+    mutable std::mutex connections_mutex_;
 
     // Published buffer (single buffer for simplicity)
     std::unique_ptr<PublishedBufferInfo> published_buffer_;
@@ -543,11 +856,20 @@ private:
     std::atomic<bool> accept_running_;
     std::unique_ptr<std::thread> accept_thread_;
 
+    // Async transfer management
+    std::unordered_map<TransferHandle, std::unique_ptr<TransferContext>> active_transfers_;
+    mutable std::mutex transfers_mutex_;
+    std::atomic<TransferHandle> next_transfer_handle_{1};
+
     // Thread pool for scatter/gather operations
     std::unique_ptr<ThreadPool> thread_pool_;
     size_t thread_pool_size_;  // Configurable via env var
 
     bool initialized_;
+
+    // Topology information
+    std::vector<NumaTopology> numa_topology_;
+    std::vector<NicTopologyInfo> nic_topology_;
 };
 
 // Utility functions

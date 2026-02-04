@@ -136,63 +136,102 @@ public:
         return rkeys;
     }
 
+    // ==================== Async Transfer API ==
+
     /**
-     * Scatter: distribute local data to multiple remote hosts (RDMA WRITE)
+     * Start async scatter operation (returns immediately)
      * @param local_addr       Local buffer address
      * @param host_list        List of destination host IDs
      * @param remote_addrs     Remote buffer addresses on each host
      * @param lengths          Data lengths for each host
-     * @param num_threads      Number of threads (each uses different NIC)
-     * @return 0 on success, negative error code on failure
+     * @return TransferHandle on success, 0 (INVALID_TRANSFER_HANDLE) on failure
      */
-    int scatter(uintptr_t local_addr,
-                const std::vector<std::string> &host_list,
-                const std::vector<uintptr_t> &remote_addrs,
-                const std::vector<size_t> &lengths,
-                int num_threads = 1) {
-        return comm_.scatter(local_addr, host_list, remote_addrs, lengths, num_threads);
+    uint64_t scatterAsync(uintptr_t local_addr,
+                          const std::vector<std::string> &host_list,
+                          const std::vector<uintptr_t> &remote_addrs,
+                          const std::vector<size_t> &lengths) {
+        return comm_.scatterAsync(local_addr, host_list, remote_addrs, lengths);
     }
 
     /**
-     * Gather: collect data from multiple remote hosts to local buffer (RDMA READ)
+     * Start async gather operation (returns immediately)
      * @param local_addr       Local buffer address
      * @param host_list        List of source host IDs
      * @param remote_addrs     Remote buffer addresses on each host
      * @param lengths          Data lengths for each host
-     * @param num_threads      Number of threads (each uses different NIC)
-     * @return 0 on success, negative error code on failure
+     * @return TransferHandle on success, 0 (INVALID_TRANSFER_HANDLE) on failure
      */
-    int gather(uintptr_t local_addr,
-               const std::vector<std::string> &host_list,
-               const std::vector<uintptr_t> &remote_addrs,
-               const std::vector<size_t> &lengths,
-               int num_threads = 1) {
-        return comm_.gather(local_addr, host_list, remote_addrs, lengths, num_threads);
+    uint64_t gatherAsync(uintptr_t local_addr,
+                         const std::vector<std::string> &host_list,
+                         const std::vector<uintptr_t> &remote_addrs,
+                         const std::vector<size_t> &lengths) {
+        return comm_.gatherAsync(local_addr, host_list, remote_addrs, lengths);
     }
 
     /**
-     * mp_replicate: unified interface for scatter/gather operations
+     * Unified async interface for scatter/gather operations
      * @param comm_type        "scatter" or "gather"
      * @param host_list        List of remote host IDs
      * @param local_addr       Local buffer address
      * @param remote_addrs     Remote buffer addresses on each host
      * @param lengths          Data lengths for each host
-     * @param num_threads      Number of threads (each uses different NIC)
-     * @return 0 on success, negative error code on failure
+     * @return TransferHandle on success, 0 (INVALID_TRANSFER_HANDLE) on failure
      */
-    int mpReplicate(const std::string &comm_type,
-                    const std::vector<std::string> &host_list,
-                    uintptr_t local_addr,
-                    const std::vector<uintptr_t> &remote_addrs,
-                    const std::vector<size_t> &lengths,
-                    int num_threads = 1) {
+    uint64_t mpReplicateAsync(const std::string &comm_type,
+                              const std::vector<std::string> &host_list,
+                              uintptr_t local_addr,
+                              const std::vector<uintptr_t> &remote_addrs,
+                              const std::vector<size_t> &lengths) {
         if (comm_type == "scatter") {
-            return scatter(local_addr, host_list, remote_addrs, lengths, num_threads);
+            return scatterAsync(local_addr, host_list, remote_addrs, lengths);
         } else if (comm_type == "gather") {
-            return gather(local_addr, host_list, remote_addrs, lengths, num_threads);
+            return gatherAsync(local_addr, host_list, remote_addrs, lengths);
         }
-        return MPCOMM_ERR_INVALID_ARG;
+        return INVALID_TRANSFER_HANDLE;
     }
+
+    /**
+     * Check if async transfer is complete (non-blocking)
+     * @param handle  Transfer handle from async operations
+     * @return true if transfer is complete, false if still in progress
+     */
+    bool isTransferComplete(uint64_t handle) {
+        return comm_.isTransferComplete(handle);
+    }
+
+    /**
+     * Wait for async transfer to complete (blocking with optional timeout)
+     * @param handle      Transfer handle from async operations
+     * @param timeout_ms  Timeout in milliseconds (-1 = wait forever)
+     * @return 0 on success, MPCOMM_ERR_TIMEOUT on timeout, or other error code
+     */
+    int waitTransfer(uint64_t handle, int timeout_ms = -1) {
+        return comm_.waitTransfer(handle, timeout_ms);
+    }
+
+    /**
+     * Get result of completed async transfer
+     * @param handle  Transfer handle from async operations
+     * @return dict with error_code, bytes_transferred, elapsed_ms
+     */
+    py::dict getTransferResult(uint64_t handle) {
+        TransferResult result = comm_.getTransferResult(handle);
+        py::dict dict;
+        dict["error_code"] = result.error_code;
+        dict["bytes_transferred"] = result.bytes_transferred;
+        dict["elapsed_ms"] = result.elapsed_ms;
+        return dict;
+    }
+
+    /**
+     * Release async transfer handle and associated resources
+     * @param handle  Transfer handle from async operations
+     */
+    void releaseTransfer(uint64_t handle) {
+        comm_.releaseTransfer(handle);
+    }
+
+    // ==================== End Async Transfer API ====================
 
     /**
      * Get number of available NICs
@@ -267,12 +306,14 @@ public:
 
     /**
      * Publish a local buffer for remote access
-     * @param addr    Buffer address (must be registered)
-     * @param length  Buffer length
+     * Multiple buffers can be published - each call adds to the list
+     * @param addr       Buffer address (must be registered)
+     * @param length     Buffer length
+     * @param numa_node  NUMA node this buffer belongs to (-1 = auto-detect)
      * @return 0 on success, negative error code on failure
      */
-    int publishBuffer(uintptr_t addr, size_t length) {
-        return comm_.publishBuffer(reinterpret_cast<void *>(addr), length);
+    int publishBuffer(uintptr_t addr, size_t length, int numa_node = -1) {
+        return comm_.publishBuffer(reinterpret_cast<void *>(addr), length, numa_node);
     }
 
     /**
@@ -285,7 +326,81 @@ public:
     }
 
     /**
+     * Unpublish all published buffers
+     */
+    void unpublishAllBuffers() {
+        comm_.unpublishAllBuffers();
+    }
+
+    /**
+     * Get number of published buffers
+     * @return Number of buffers currently published
+     */
+    size_t getPublishedBufferCount() {
+        return comm_.getPublishedBufferCount();
+    }
+
+    /**
      * Query remote host's published buffer information via TCP
+     * Returns all published buffers with NUMA info
+     * @param remote_host_id  Remote host identifier (must be connected)
+     * @param remote_tcp_addr Remote TCP address
+     * @param remote_tcp_port Remote TCP port
+     * @return dict with buffer info: {'host_id': str, 'buffers': [{'addr': int, 'length': int, 'numa_node': int, 'rkeys': [int...]}]}
+     *         or empty dict on failure
+     */
+    py::dict queryRemoteBuffers(const std::string &remote_host_id,
+                                const std::string &remote_tcp_addr,
+                                int remote_tcp_port) {
+        RemoteBufferInfo info;
+        int ret = comm_.queryRemoteBuffer(remote_host_id, remote_tcp_addr,
+                                          remote_tcp_port, info);
+        py::dict result;
+        if (ret == 0) {
+            result["host_id"] = info.host_id;
+            py::list buffers_list;
+            for (const auto &buf : info.buffers) {
+                py::dict buf_dict;
+                buf_dict["addr"] = buf.addr;
+                buf_dict["length"] = buf.length;
+                buf_dict["numa_node"] = buf.numa_node;
+                buf_dict["rkeys"] = buf.rkeys;
+                buffers_list.append(buf_dict);
+            }
+            result["buffers"] = buffers_list;
+        }
+        return result;
+    }
+
+    /**
+     * Query remote host's buffer by NUMA node (convenience method)
+     * @param remote_host_id  Remote host identifier (must be connected)
+     * @param remote_tcp_addr Remote TCP address
+     * @param remote_tcp_port Remote TCP port
+     * @param numa_node       NUMA node to query (-1 = first buffer)
+     * @return dict with buffer info: {'addr': int, 'length': int, 'numa_node': int, 'rkeys': [int...]}
+     *         or empty dict on failure
+     */
+    py::dict queryRemoteBufferByNuma(const std::string &remote_host_id,
+                                     const std::string &remote_tcp_addr,
+                                     int remote_tcp_port,
+                                     int numa_node = -1) {
+        RemoteBufferEntry entry;
+        int ret = comm_.queryRemoteBufferByNuma(remote_host_id, remote_tcp_addr,
+                                                remote_tcp_port, numa_node, entry);
+        py::dict result;
+        if (ret == 0) {
+            result["addr"] = entry.addr;
+            result["length"] = entry.length;
+            result["numa_node"] = entry.numa_node;
+            result["rkeys"] = entry.rkeys;
+        }
+        return result;
+    }
+
+    /**
+     * Query remote host's published buffer (backward compatible version)
+     * Returns first buffer info for backward compatibility
      * @param remote_host_id  Remote host identifier (must be connected)
      * @param remote_tcp_addr Remote TCP address
      * @param remote_tcp_port Remote TCP port
@@ -295,31 +410,28 @@ public:
     py::dict queryRemoteBuffer(const std::string &remote_host_id,
                                const std::string &remote_tcp_addr,
                                int remote_tcp_port) {
-        RemoteBufferInfo info;
-        int ret = comm_.queryRemoteBuffer(remote_host_id, remote_tcp_addr,
-                                          remote_tcp_port, info);
-        py::dict result;
-        if (ret == 0) {
-            result["host_id"] = info.host_id;
-            result["addr"] = info.addr;
-            result["length"] = info.length;
-            result["rkeys"] = info.rkeys;
-        }
-        return result;
+        return queryRemoteBufferByNuma(remote_host_id, remote_tcp_addr, remote_tcp_port, -1);
     }
 
     /**
      * Get local published buffer info (for debugging/display)
-     * @return dict with buffer info: {'addr': int, 'length': int, 'rkeys': [int...]}
+     * @return dict with all published buffers: {'buffers': [{'addr': int, 'length': int, 'numa_node': int, 'rkeys': [int...]}]}
      *         or empty dict if not published
      */
     py::dict getPublishedBufferInfo() {
         py::dict result;
         const PublishedBufferInfo* info = comm_.getPublishedBufferInfo();
-        if (info) {
-            result["addr"] = info->addr;
-            result["length"] = info->length;
-            result["rkeys"] = info->rkeys;
+        if (info && !info->buffers.empty()) {
+            py::list buffers_list;
+            for (const auto &buf : info->buffers) {
+                py::dict buf_dict;
+                buf_dict["addr"] = buf.addr;
+                buf_dict["length"] = buf.length;
+                buf_dict["numa_node"] = buf.numa_node;
+                buf_dict["rkeys"] = buf.rkeys;
+                buffers_list.append(buf_dict);
+            }
+            result["buffers"] = buffers_list;
         }
         return result;
     }
@@ -341,7 +453,12 @@ PYBIND11_MODULE(mpcomm, m) {
         .value("ERR_TRANSFER", MPCOMM_ERR_TRANSFER)
         .value("ERR_TIMEOUT", MPCOMM_ERR_TIMEOUT)
         .value("ERR_INVALID_ARG", MPCOMM_ERR_INVALID_ARG)
+        .value("ERR_INVALID_HANDLE", MPCOMM_ERR_INVALID_HANDLE)
+        .value("ERR_PENDING", MPCOMM_ERR_PENDING)
         .export_values();
+
+    // Constants
+    m.attr("INVALID_TRANSFER_HANDLE") = INVALID_TRANSFER_HANDLE;
 
     // MPComm class
     py::class_<MPCommPy>(m, "MPComm")
@@ -380,28 +497,40 @@ PYBIND11_MODULE(mpcomm, m) {
         .def("get_all_rkeys", &MPCommPy::getAllRkeys,
              py::arg("addr"),
              "Get all rkeys for local memory region (one per NIC)")
-        .def("scatter", &MPCommPy::scatter,
+        // Async transfer API
+        .def("scatter_async", &MPCommPy::scatterAsync,
              py::arg("local_addr"),
              py::arg("host_list"),
              py::arg("remote_addrs"),
              py::arg("lengths"),
-             py::arg("num_threads") = 1,
-             "Scatter: distribute local data to multiple remote hosts (RDMA WRITE)")
-        .def("gather", &MPCommPy::gather,
+             "Start async scatter operation, returns handle immediately")
+        .def("gather_async", &MPCommPy::gatherAsync,
              py::arg("local_addr"),
              py::arg("host_list"),
              py::arg("remote_addrs"),
              py::arg("lengths"),
-             py::arg("num_threads") = 1,
-             "Gather: collect data from multiple remote hosts to local buffer (RDMA READ)")
-        .def("mp_replicate", &MPCommPy::mpReplicate,
+             "Start async gather operation, returns handle immediately")
+        .def("mp_replicate_async", &MPCommPy::mpReplicateAsync,
              py::arg("comm_type"),
              py::arg("host_list"),
              py::arg("local_addr"),
              py::arg("remote_addrs"),
              py::arg("lengths"),
-             py::arg("num_threads") = 1,
-             "Unified interface for scatter/gather operations")
+             "Unified async interface for scatter/gather operations")
+        .def("is_transfer_complete", &MPCommPy::isTransferComplete,
+             py::arg("handle"),
+             "Check if async transfer is complete (non-blocking)")
+        .def("wait_transfer", &MPCommPy::waitTransfer,
+             py::arg("handle"),
+             py::arg("timeout_ms") = -1,
+             "Wait for async transfer to complete with optional timeout")
+        .def("get_transfer_result", &MPCommPy::getTransferResult,
+             py::arg("handle"),
+             "Get result of completed async transfer")
+        .def("release_transfer", &MPCommPy::releaseTransfer,
+             py::arg("handle"),
+             "Release async transfer handle and resources")
+        // End async transfer API
         .def("get_num_nics", &MPCommPy::getNumNics,
              "Get number of available NICs")
         .def("get_local_host_id", &MPCommPy::getLocalHostId,
@@ -434,15 +563,31 @@ PYBIND11_MODULE(mpcomm, m) {
         .def("publish_buffer", &MPCommPy::publishBuffer,
              py::arg("addr"),
              py::arg("length"),
-             "Publish a local buffer for remote access via TCP metadata exchange")
+             py::arg("numa_node") = -1,
+             "Publish a local buffer for remote access (supports multiple buffers with NUMA info)")
         .def("unpublish_buffer", &MPCommPy::unpublishBuffer,
              py::arg("addr"),
              "Unpublish a previously published buffer")
+        .def("unpublish_all_buffers", &MPCommPy::unpublishAllBuffers,
+             "Unpublish all published buffers")
+        .def("get_published_buffer_count", &MPCommPy::getPublishedBufferCount,
+             "Get number of published buffers")
+        .def("query_remote_buffers", &MPCommPy::queryRemoteBuffers,
+             py::arg("remote_host_id"),
+             py::arg("remote_tcp_addr"),
+             py::arg("remote_tcp_port"),
+             "Query all remote host's published buffers with NUMA info")
+        .def("query_remote_buffer_by_numa", &MPCommPy::queryRemoteBufferByNuma,
+             py::arg("remote_host_id"),
+             py::arg("remote_tcp_addr"),
+             py::arg("remote_tcp_port"),
+             py::arg("numa_node") = -1,
+             "Query remote host's buffer by NUMA node")
         .def("query_remote_buffer", &MPCommPy::queryRemoteBuffer,
              py::arg("remote_host_id"),
              py::arg("remote_tcp_addr"),
              py::arg("remote_tcp_port"),
-             "Query remote host's published buffer information via TCP")
+             "Query remote host's first published buffer (backward compatible)")
         .def("get_published_buffer_info", &MPCommPy::getPublishedBufferInfo,
              "Get local published buffer info");
 }

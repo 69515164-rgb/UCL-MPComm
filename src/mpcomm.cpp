@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <numaif.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
@@ -27,6 +28,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -412,6 +416,10 @@ int MPComm::init(const std::string &local_host_id,
     printf("MPComm: Created thread pool with %zu workers (cpu_bind=%s, cpu_base_offset=%d)\n",
            pool_size, bind_cpu ? "true" : "false", cpu_base_offset);
     
+    // Discover NUMA topology and print results
+    discoverTopology();
+    printTopologyInfo();
+    
     printf("MPComm: Initialized with %zu NICs, TCP port %d\n",
            nic_contexts_.size(), tcp_port_);
     
@@ -678,6 +686,14 @@ int MPComm::registerMemory(void *addr, size_t length) {
     int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                        IBV_ACCESS_REMOTE_WRITE;
 
+    // Detect NUMA node for this memory region using move_pages()
+    int numa_node = -1;
+    int status = -1;
+    void* pages[1] = { addr };
+    if (move_pages(0, 1, pages, nullptr, &status, 0) == 0 && status >= 0) {
+        numa_node = status;
+    }
+
     // Register on all NICs
     for (size_t i = 0; i < nic_contexts_.size(); ++i) {
         auto &ctx = *nic_contexts_[i];
@@ -708,12 +724,13 @@ int MPComm::registerMemory(void *addr, size_t length) {
         info.mr = mr;
         info.lkey = mr->lkey;
         info.rkey = mr->rkey;
+        info.numa_node = numa_node;
 
         std::lock_guard<std::mutex> lock(ctx.mr_mutex);
         ctx.memory_regions.push_back(info);
     }
 
-    printf("MPComm: Registered memory %p, length %zu\n", addr, length);
+    printf("MPComm: Registered memory %p, length %zu, NUMA node %d\n", addr, length, numa_node);
     return MPCOMM_SUCCESS;
 }
 
@@ -859,39 +876,358 @@ size_t getQpsPerConnection() {
 }
 
 // ============================================================================
-// Buffer Publishing and Query
+// NUMA Topology Discovery
 // ============================================================================
 
-int MPComm::publishBuffer(void *addr, size_t length) {
+// Extract trailing numeric suffix from NIC name (e.g., "mlx5_bond_0" -> 0, "mlx5_2" -> 2)
+// Returns -1 if no numeric suffix found
+static int extractNicSuffix(const std::string& nic_name) {
+    if (nic_name.empty()) return -1;
+    
+    // Find the last sequence of digits
+    size_t end = nic_name.length();
+    size_t start = end;
+    
+    // Scan backwards to find digits
+    while (start > 0 && std::isdigit(nic_name[start - 1])) {
+        --start;
+    }
+    
+    if (start == end) {
+        return -1;  // No digits found
+    }
+    
+    // Extract the number
+    std::string num_str = nic_name.substr(start, end - start);
+    return std::stoi(num_str);
+}
+
+// Get the number of NUMA nodes in the system
+int MPComm::getNumaNodeCount() {
+    int count = 0;
+    for (int i = 0; i < 256; i++) {
+        std::string path = "/sys/devices/system/node/node" + std::to_string(i);
+        if (access(path.c_str(), F_OK) == 0) {
+            count = i + 1;
+        } else {
+            break;
+        }
+    }
+    return std::max(1, count);
+}
+
+// Read the NUMA node of a NIC from sysfs
+int MPComm::readNicNumaNode(const std::string& nic_name) {
+    std::string path = "/sys/class/infiniband/" + nic_name + "/device/numa_node";
+    std::ifstream file(path);
+    if (file.is_open()) {
+        int numa_node;
+        file >> numa_node;
+        return numa_node;  // May return -1 if unknown
+    }
+    return -1;  // Failed to read
+}
+
+// Get candidate NICs (either from MPCOMM_NIC_FILTER or all available)
+std::vector<std::string> MPComm::getCandidateNics() {
+    std::vector<std::string> candidates;
+    
+    // Check MPCOMM_NIC_FILTER environment variable
+    const char* filter = std::getenv(kNicFilterEnvVar);
+    if (filter && strlen(filter) > 0) {
+        // Parse comma-separated list
+        std::istringstream iss(filter);
+        std::string token;
+        while (std::getline(iss, token, ',')) {
+            // Trim whitespace
+            size_t start = token.find_first_not_of(" \t");
+            size_t end = token.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos) {
+                candidates.push_back(token.substr(start, end - start + 1));
+            }
+        }
+    } else {
+        // Get all available RDMA NICs
+        int num_devices = 0;
+        struct ibv_device **devices = ibv_get_device_list(&num_devices);
+        if (devices) {
+            for (int i = 0; i < num_devices; i++) {
+                candidates.push_back(ibv_get_device_name(devices[i]));
+            }
+            ibv_free_device_list(devices);
+        }
+    }
+    return candidates;
+}
+
+// Discover NUMA topology and build NIC-to-NUMA mappings
+void MPComm::discoverTopology() {
+    int numa_count = getNumaNodeCount();
+    std::vector<std::string> candidates = getCandidateNics();
+    
+    // Initialize NUMA topology for each node
+    numa_topology_.resize(numa_count);
+    for (int i = 0; i < numa_count; i++) {
+        numa_topology_[i].numa_node = i;
+    }
+    
+    // Build NIC topology info and assign NICs to NUMA nodes
+    nic_topology_.clear();
+    nic_topology_.reserve(candidates.size());
+    
+    for (const auto& nic : candidates) {
+        int numa_node = readNicNumaNode(nic);
+        
+        // Store NIC topology info
+        NicTopologyInfo info;
+        info.nic_name = nic;
+        info.numa_node = numa_node;
+        nic_topology_.push_back(info);
+        
+        // Assign NIC to appropriate NUMA node
+        if (numa_node >= 0 && numa_node < numa_count) {
+            // NIC is local to this NUMA node
+            numa_topology_[numa_node].local_nics.push_back(nic);
+        } else {
+            // NUMA node unknown (-1), add to all NUMA nodes as remote
+            for (int i = 0; i < numa_count; i++) {
+                numa_topology_[i].remote_nics.push_back(nic);
+            }
+        }
+    }
+    
+    // For NUMA nodes without local NICs, populate remote_nics as fallback
+    for (int i = 0; i < numa_count; i++) {
+        if (numa_topology_[i].local_nics.empty()) {
+            // No local NICs, add all NICs from other NUMA nodes as remote
+            for (const auto& info : nic_topology_) {
+                if (info.numa_node != i && info.numa_node >= 0) {
+                    numa_topology_[i].remote_nics.push_back(info.nic_name);
+                }
+            }
+        }
+    }
+}
+
+// Print topology discovery results
+void MPComm::printTopologyInfo() {
+    printf("\n================== MPCOMM Topology Discovery ==================\n");
+    printf("System: %zu NUMA nodes, %zu candidate NICs\n", 
+           numa_topology_.size(), nic_topology_.size());
+    
+    // Print NIC Filter setting
+    const char* filter = std::getenv(kNicFilterEnvVar);
+    if (filter && strlen(filter) > 0) {
+        printf("NIC Filter: %s\n", filter);
+    } else {
+        printf("NIC Filter: (none, using all available NICs)\n");
+    }
+    printf("\n");
+    
+    // Print NUMA topology
+    for (const auto& topo : numa_topology_) {
+        printf("NUMA Node %d:\n", topo.numa_node);
+        
+        if (!topo.local_nics.empty()) {
+            printf("  Local NICs (optimal): ");
+            for (size_t i = 0; i < topo.local_nics.size(); i++) {
+                printf("%s%s", topo.local_nics[i].c_str(), 
+                       (i < topo.local_nics.size() - 1) ? ", " : "");
+            }
+            printf(" (%zu NICs)\n", topo.local_nics.size());
+        } else {
+            printf("  Local NICs: (none)\n");
+        }
+        
+        if (!topo.remote_nics.empty() && topo.local_nics.empty()) {
+            printf("  Fallback NICs (cross-NUMA): ");
+            for (size_t i = 0; i < topo.remote_nics.size(); i++) {
+                printf("%s%s", topo.remote_nics[i].c_str(),
+                       (i < topo.remote_nics.size() - 1) ? ", " : "");
+            }
+            printf("\n");
+        }
+        printf("\n");
+    }
+    
+    // Print NIC-to-NUMA mapping
+    printf("NIC -> NUMA Mapping:\n");
+    for (const auto& info : nic_topology_) {
+        if (info.numa_node >= 0) {
+            printf("  %s -> NUMA %d\n", info.nic_name.c_str(), info.numa_node);
+        } else {
+            printf("  %s -> NUMA unknown\n", info.nic_name.c_str());
+        }
+    }
+    printf("================================================================\n\n");
+}
+
+// Get NUMA topology information
+const std::vector<NumaTopology>& MPComm::getNumaTopology() const {
+    return numa_topology_;
+}
+
+// Get NIC topology information
+const std::vector<NicTopologyInfo>& MPComm::getNicTopology() const {
+    return nic_topology_;
+}
+
+// Get the NUMA node for a specific NIC
+int MPComm::getNicNumaNode(const std::string& nic_name) const {
+    for (const auto& info : nic_topology_) {
+        if (info.nic_name == nic_name) {
+            return info.numa_node;
+        }
+    }
+    return -1;
+}
+
+// Get local NICs for a specific NUMA node
+std::vector<std::string> MPComm::getLocalNicsForNuma(int numa_node) const {
+    if (numa_node >= 0 && static_cast<size_t>(numa_node) < numa_topology_.size()) {
+        return numa_topology_[numa_node].local_nics;
+    }
+    return {};
+}
+
+// Get NUMA node for a given memory address (check registered memory regions)
+int MPComm::getNumaNodeForAddr(void* addr) const {
+    if (!addr || nic_contexts_.empty()) return -1;
+    
+    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    
+    // Check the first NIC's memory regions (all NICs share the same regions)
+    const auto& ctx = *nic_contexts_[0];
+    for (const auto& mr : ctx.memory_regions) {
+        uintptr_t start = reinterpret_cast<uintptr_t>(mr.addr);
+        uintptr_t end = start + mr.length;
+        if (target >= start && target < end) {
+            return mr.numa_node;
+        }
+    }
+    return -1;  // Not found in registered regions
+}
+
+// Get local NIC indices for a specific NUMA node
+std::vector<size_t> MPComm::getLocalNicIndicesForNuma(int numa_node) const {
+    std::vector<size_t> indices;
+    
+    // If numa_node is invalid, return empty (will fallback to all NICs)
+    if (numa_node < 0) {
+        return indices;
+    }
+    
+    // Find NIC indices that belong to this NUMA node
+    for (size_t i = 0; i < nic_contexts_.size(); ++i) {
+        const auto& device_name = nic_contexts_[i]->device_name;
+        for (const auto& topo : nic_topology_) {
+            if (topo.nic_name == device_name && topo.numa_node == numa_node) {
+                indices.push_back(i);
+                break;
+            }
+        }
+    }
+    
+    return indices;
+}
+
+// Get remote NIC indices for a specific remote NUMA node
+std::vector<size_t> MPComm::getRemoteNicIndicesForNuma(const std::string& remote_host_id,
+                                                       int remote_numa_node) const {
+    std::vector<size_t> indices;
+    
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    auto it = connections_.find(remote_host_id);
+    if (it == connections_.end()) {
+        return indices;  // Host not found
+    }
+    
+    const auto& conn = it->second;
+    if (remote_numa_node < 0) {
+        return indices;  // Invalid NUMA node
+    }
+    
+    // Find remote NIC indices that belong to the specified NUMA node
+    for (size_t i = 0; i < conn.remote_nic_numa_nodes.size(); ++i) {
+        if (conn.remote_nic_numa_nodes[i] == remote_numa_node) {
+            indices.push_back(i);
+        }
+    }
+    
+    return indices;
+}
+
+// Get NUMA node for a specific remote NIC
+int MPComm::getRemoteNicNumaNode(const std::string& remote_host_id, size_t nic_index) const {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    auto it = connections_.find(remote_host_id);
+    if (it == connections_.end()) {
+        return -1;  // Host not found
+    }
+    
+    const auto& conn = it->second;
+    if (nic_index >= conn.remote_nic_numa_nodes.size()) {
+        return -1;  // Invalid NIC index
+    }
+    
+    return conn.remote_nic_numa_nodes[nic_index];
+}
+
+// ============================================================================
+// Buffer Publishing and Query (Multi-buffer with NUMA support)
+// ============================================================================
+
+int MPComm::publishBuffer(void *addr, size_t length, int numa_node) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
     if (!addr || length == 0) return MPCOMM_ERR_INVALID_ARG;
 
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
     
-    // Create or update published buffer info
-    auto info = std::make_unique<PublishedBufferInfo>();
-    info->addr = reinterpret_cast<uint64_t>(addr);
-    info->length = length;
+    // Create published buffer info if not exists
+    if (!published_buffer_) {
+        published_buffer_ = std::make_unique<PublishedBufferInfo>();
+    }
+    
+    // Check if buffer already published (update if so)
+    uint64_t buf_addr = reinterpret_cast<uint64_t>(addr);
+    for (auto &entry : published_buffer_->buffers) {
+        if (entry.addr == buf_addr) {
+            // Update existing entry
+            entry.length = length;
+            entry.numa_node = (numa_node >= 0) ? numa_node : getNumaNodeForAddr(addr);
+            printf("MPComm: Updated published buffer addr=%p, length=%zu, numa=%d\n",
+                   addr, length, entry.numa_node);
+            return MPCOMM_SUCCESS;
+        }
+    }
+    
+    // Create new buffer entry
+    PublishedBufferEntry entry;
+    entry.addr = buf_addr;
+    entry.length = length;
+    entry.numa_node = (numa_node >= 0) ? numa_node : getNumaNodeForAddr(addr);
     
     // Get rkeys for all NICs
-    info->rkeys.reserve(nic_contexts_.size());
+    entry.rkeys.reserve(nic_contexts_.size());
     for (size_t i = 0; i < nic_contexts_.size(); ++i) {
         uint32_t rkey = getRkey(i, addr);
         if (rkey == 0) {
             fprintf(stderr, "MPComm: Buffer not registered on NIC %zu\n", i);
             return MPCOMM_ERR_MEMORY;
         }
-        info->rkeys.push_back(rkey);
+        entry.rkeys.push_back(rkey);
     }
     
-    published_buffer_ = std::move(info);
-    printf("MPComm: Published buffer addr=%p, length=%zu, rkeys=[",
-           addr, length);
-    for (size_t i = 0; i < published_buffer_->rkeys.size(); ++i) {
-        printf("%u%s", published_buffer_->rkeys[i],
-               i < published_buffer_->rkeys.size() - 1 ? "," : "");
+    published_buffer_->buffers.push_back(std::move(entry));
+    
+    const auto &added = published_buffer_->buffers.back();
+    printf("MPComm: Published buffer addr=%p, length=%zu, numa=%d, rkeys=[",
+           addr, length, added.numa_node);
+    for (size_t i = 0; i < added.rkeys.size(); ++i) {
+        printf("%u%s", added.rkeys[i],
+               i < added.rkeys.size() - 1 ? "," : "");
     }
-    printf("]\n");
+    printf("] (total %zu buffers)\n", published_buffer_->buffers.size());
     
     return MPCOMM_SUCCESS;
 }
@@ -901,14 +1237,39 @@ int MPComm::unpublishBuffer(void *addr) {
     
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
     
-    if (published_buffer_ && 
-        published_buffer_->addr == reinterpret_cast<uint64_t>(addr)) {
-        published_buffer_.reset();
-        printf("MPComm: Unpublished buffer addr=%p\n", addr);
-        return MPCOMM_SUCCESS;
+    if (!published_buffer_) {
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+    
+    uint64_t buf_addr = reinterpret_cast<uint64_t>(addr);
+    auto &buffers = published_buffer_->buffers;
+    
+    for (auto it = buffers.begin(); it != buffers.end(); ++it) {
+        if (it->addr == buf_addr) {
+            buffers.erase(it);
+            printf("MPComm: Unpublished buffer addr=%p (remaining %zu buffers)\n",
+                   addr, buffers.size());
+            return MPCOMM_SUCCESS;
+        }
     }
     
     return MPCOMM_ERR_INVALID_ARG;
+}
+
+void MPComm::unpublishAllBuffers() {
+    std::lock_guard<std::mutex> lock(published_buffer_mutex_);
+    
+    if (published_buffer_) {
+        size_t count = published_buffer_->buffers.size();
+        published_buffer_->buffers.clear();
+        printf("MPComm: Unpublished all %zu buffers\n", count);
+    }
+}
+
+size_t MPComm::getPublishedBufferCount() const {
+    // Note: Not fully thread-safe, but adequate for informational purposes
+    if (!published_buffer_) return 0;
+    return published_buffer_->buffers.size();
 }
 
 int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
@@ -917,7 +1278,7 @@ int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
                               RemoteBufferInfo &out_info) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
 
-    printf("MPComm: Querying buffer from %s at %s:%d\n",
+    printf("MPComm: Querying buffers from %s at %s:%d\n",
            remote_host_id.c_str(), remote_tcp_addr.c_str(), remote_tcp_port);
 
     // Create TCP connection
@@ -960,37 +1321,23 @@ int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
         return MPCOMM_ERR_CONNECTION;
     }
 
-    // Receive response: success flag
-    uint32_t success;
-    if (recv(sock_fd, &success, sizeof(success), MSG_WAITALL) != sizeof(success)) {
-        perror("MPComm: Failed to receive buffer query response");
+    // Receive response: number of buffers (0 = no published buffers)
+    uint32_t num_buffers;
+    if (recv(sock_fd, &num_buffers, sizeof(num_buffers), MSG_WAITALL) != sizeof(num_buffers)) {
+        perror("MPComm: Failed to receive buffer count");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
 
-    if (success == 0) {
-        fprintf(stderr, "MPComm: Remote host has no published buffer\n");
+    if (num_buffers == 0) {
+        fprintf(stderr, "MPComm: Remote host has no published buffers\n");
         close(sock_fd);
         return MPCOMM_ERR_INVALID_ARG;
     }
 
-    // Receive buffer address
-    uint64_t buf_addr;
-    if (recv(sock_fd, &buf_addr, sizeof(buf_addr), MSG_WAITALL) != sizeof(buf_addr)) {
-        perror("MPComm: Failed to receive buffer address");
-        close(sock_fd);
-        return MPCOMM_ERR_CONNECTION;
-    }
+    printf("MPComm: Remote has %u published buffer(s)\n", num_buffers);
 
-    // Receive buffer length
-    uint64_t buf_length;
-    if (recv(sock_fd, &buf_length, sizeof(buf_length), MSG_WAITALL) != sizeof(buf_length)) {
-        perror("MPComm: Failed to receive buffer length");
-        close(sock_fd);
-        return MPCOMM_ERR_CONNECTION;
-    }
-
-    // Receive number of NICs
+    // Receive number of NICs (same for all buffers)
     uint32_t num_nics;
     if (recv(sock_fd, &num_nics, sizeof(num_nics), MSG_WAITALL) != sizeof(num_nics)) {
         perror("MPComm: Failed to receive num_nics");
@@ -998,19 +1345,9 @@ int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
         return MPCOMM_ERR_CONNECTION;
     }
 
-    // Receive rkeys and GIDs, then match by GID
-    std::vector<uint32_t> remote_rkeys(num_nics);
+    // Receive GIDs for NIC matching (once, same for all buffers)
     std::vector<std::string> remote_gids(num_nics);
     for (uint32_t i = 0; i < num_nics; ++i) {
-        // Receive rkey
-        uint32_t rkey;
-        if (recv(sock_fd, &rkey, sizeof(rkey), MSG_WAITALL) != sizeof(rkey)) {
-            perror("MPComm: Failed to receive rkey");
-            close(sock_fd);
-            return MPCOMM_ERR_CONNECTION;
-        }
-        remote_rkeys[i] = rkey;
-        // Receive GID (64 bytes to match RemoteEndpointInfo.gid)
         char gid_buf[64];
         if (recv(sock_fd, gid_buf, sizeof(gid_buf), MSG_WAITALL) != sizeof(gid_buf)) {
             perror("MPComm: Failed to receive GID");
@@ -1018,54 +1355,162 @@ int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
             return MPCOMM_ERR_CONNECTION;
         }
         remote_gids[i] = std::string(gid_buf);
-        printf("MPComm: Received NIC %u: rkey=%u, GID=%s\n", i, rkey, gid_buf);
+    }
+
+    // Receive each buffer's info
+    out_info.host_id = remote_host_id;
+    out_info.buffers.clear();
+    out_info.buffers.reserve(num_buffers);
+
+    for (uint32_t buf_idx = 0; buf_idx < num_buffers; ++buf_idx) {
+        RemoteBufferEntry entry;
+
+        // Receive buffer address
+        if (recv(sock_fd, &entry.addr, sizeof(entry.addr), MSG_WAITALL) != sizeof(entry.addr)) {
+            perror("MPComm: Failed to receive buffer address");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+
+        // Receive buffer length
+        if (recv(sock_fd, &entry.length, sizeof(entry.length), MSG_WAITALL) != sizeof(entry.length)) {
+            perror("MPComm: Failed to receive buffer length");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+
+        // Receive NUMA node
+        int32_t numa_node;
+        if (recv(sock_fd, &numa_node, sizeof(numa_node), MSG_WAITALL) != sizeof(numa_node)) {
+            perror("MPComm: Failed to receive NUMA node");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+        entry.numa_node = numa_node;
+
+        // Receive rkeys for each NIC
+        entry.rkeys.resize(num_nics);
+        for (uint32_t nic_idx = 0; nic_idx < num_nics; ++nic_idx) {
+            uint32_t rkey;
+            if (recv(sock_fd, &rkey, sizeof(rkey), MSG_WAITALL) != sizeof(rkey)) {
+                perror("MPComm: Failed to receive rkey");
+                close(sock_fd);
+                return MPCOMM_ERR_CONNECTION;
+            }
+            entry.rkeys[nic_idx] = rkey;
+        }
+
+        printf("MPComm: Buffer %u: addr=0x%lx, length=%lu, numa=%d, rkeys=[",
+               buf_idx, entry.addr, entry.length, entry.numa_node);
+        for (size_t i = 0; i < entry.rkeys.size(); ++i) {
+            printf("%u%s", entry.rkeys[i], i < entry.rkeys.size() - 1 ? "," : "");
+        }
+        printf("]\n");
+
+        out_info.buffers.push_back(std::move(entry));
     }
 
     close(sock_fd);
 
-    // Match rkeys to connection endpoints by GID
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    auto conn_it = connections_.find(remote_host_id);
-    if (conn_it != connections_.end()) {
-        printf("MPComm: Matching rkeys for %zu endpoints\n", 
-               conn_it->second.nic_endpoints.size());
-        // For each NIC endpoint in the connection, find the matching rkey by GID
-        for (size_t ep_idx = 0; ep_idx < conn_it->second.nic_endpoints.size(); ++ep_idx) {
-            const std::string &ep_gid = conn_it->second.nic_endpoints[ep_idx].gid;
-            printf("MPComm: Endpoint %zu has stored GID=%s\n", ep_idx, ep_gid.c_str());
-            // Find matching remote GID
-            bool matched = false;
-            for (uint32_t remote_idx = 0; remote_idx < num_nics; ++remote_idx) {
-                if (remote_gids[remote_idx] == ep_gid) {
-                    conn_it->second.nic_endpoints[ep_idx].rkey = remote_rkeys[remote_idx];
-                    printf("MPComm: Matched endpoint %zu (GID=%s) -> rkey=%u\n",
-                           ep_idx, ep_gid.c_str(), remote_rkeys[remote_idx]);
-                    matched = true;
-                    break;
+    // Match rkeys to connection endpoints by GID (use first buffer's rkeys for connection)
+    // Also store all buffers in remote_buffers for multi-NUMA parallel access
+    if (!out_info.buffers.empty()) {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        auto conn_it = connections_.find(remote_host_id);
+        if (conn_it != connections_.end()) {
+            printf("MPComm: Matching rkeys for %zu endpoints\n", 
+                   conn_it->second.nic_endpoints.size());
+            
+            // Store all remote buffers for multi-NUMA parallel access
+            conn_it->second.remote_buffers.clear();
+            for (const auto &buf : out_info.buffers) {
+                // Map GID to local NIC index to get correct rkey order
+                RemoteBufferEntry reordered_entry;
+                reordered_entry.addr = buf.addr;
+                reordered_entry.length = buf.length;
+                reordered_entry.numa_node = buf.numa_node;
+                reordered_entry.rkeys.resize(conn_it->second.nic_endpoints.size());
+                
+                // Reorder rkeys to match local NIC endpoint indices
+                for (size_t ep_idx = 0; ep_idx < conn_it->second.nic_endpoints.size(); ++ep_idx) {
+                    const std::string &ep_gid = conn_it->second.nic_endpoints[ep_idx].gid;
+                    for (uint32_t remote_idx = 0; remote_idx < num_nics; ++remote_idx) {
+                        if (remote_gids[remote_idx] == ep_gid) {
+                            reordered_entry.rkeys[ep_idx] = buf.rkeys[remote_idx];
+                            break;
+                        }
+                    }
+                }
+                
+                conn_it->second.remote_buffers[buf.addr] = reordered_entry;
+                printf("MPComm: Stored remote buffer: addr=0x%lx, numa=%d, rkeys=[",
+                       buf.addr, buf.numa_node);
+                for (size_t i = 0; i < reordered_entry.rkeys.size(); ++i) {
+                    printf("%u%s", reordered_entry.rkeys[i], 
+                           i < reordered_entry.rkeys.size() - 1 ? "," : "");
+                }
+                printf("]\n");
+            }
+            
+            // Also update nic_endpoints with first buffer's rkeys for backward compatibility
+            const auto &first_buf = out_info.buffers[0];
+            for (size_t ep_idx = 0; ep_idx < conn_it->second.nic_endpoints.size(); ++ep_idx) {
+                const std::string &ep_gid = conn_it->second.nic_endpoints[ep_idx].gid;
+                bool matched = false;
+                for (uint32_t remote_idx = 0; remote_idx < num_nics; ++remote_idx) {
+                    if (remote_gids[remote_idx] == ep_gid) {
+                        conn_it->second.nic_endpoints[ep_idx].rkey = first_buf.rkeys[remote_idx];
+                        printf("MPComm: Matched endpoint %zu (GID=%s) -> rkey=%u\n",
+                               ep_idx, ep_gid.c_str(), first_buf.rkeys[remote_idx]);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    printf("MPComm: WARNING: No matching GID found for endpoint %zu\n", ep_idx);
                 }
             }
-            if (!matched) {
-                printf("MPComm: WARNING: No matching GID found for endpoint %zu\n", ep_idx);
-            }
         }
-    } else {
-        printf("MPComm: WARNING: Connection not found for %s\n", remote_host_id.c_str());
     }
 
-    // Fill output with raw remote info
-    out_info.host_id = remote_host_id;
-    out_info.addr = buf_addr;
-    out_info.length = buf_length;
-    out_info.rkeys = std::move(remote_rkeys);
+    printf("MPComm: Received %zu buffer(s) from %s\n",
+           out_info.buffers.size(), remote_host_id.c_str());
 
-    printf("MPComm: Received buffer info from %s: addr=0x%lx, length=%lu, rkeys=[",
-           remote_host_id.c_str(), out_info.addr, out_info.length);
-    for (size_t i = 0; i < out_info.rkeys.size(); ++i) {
-        printf("%u%s", out_info.rkeys[i],
-               i < out_info.rkeys.size() - 1 ? "," : "");
+    return MPCOMM_SUCCESS;
+}
+
+int MPComm::queryRemoteBufferByNuma(const std::string &remote_host_id,
+                                    const std::string &remote_tcp_addr,
+                                    int remote_tcp_port,
+                                    int numa_node,
+                                    RemoteBufferEntry &out_entry) {
+    RemoteBufferInfo all_buffers;
+    int ret = queryRemoteBuffer(remote_host_id, remote_tcp_addr, remote_tcp_port, all_buffers);
+    if (ret != MPCOMM_SUCCESS) {
+        return ret;
     }
-    printf("]\n");
 
+    if (all_buffers.buffers.empty()) {
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+
+    // If numa_node < 0, return first buffer
+    if (numa_node < 0) {
+        out_entry = all_buffers.buffers[0];
+        return MPCOMM_SUCCESS;
+    }
+
+    // Find buffer matching NUMA node
+    for (const auto &buf : all_buffers.buffers) {
+        if (buf.numa_node == numa_node) {
+            out_entry = buf;
+            return MPCOMM_SUCCESS;
+        }
+    }
+
+    // Not found, return first buffer as fallback
+    fprintf(stderr, "MPComm: No buffer found for NUMA node %d, using first buffer\n", numa_node);
+    out_entry = all_buffers.buffers[0];
     return MPCOMM_SUCCESS;
 }
 
@@ -1077,50 +1522,31 @@ const PublishedBufferInfo* MPComm::getPublishedBufferInfo() const {
 void MPComm::handleBufferQuery(int client_fd) {
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
     
-    if (!published_buffer_) {
-        uint32_t success = 0;
-        send(client_fd, &success, sizeof(success), 0);
+    // Check if any buffers are published
+    uint32_t num_buffers = 0;
+    if (published_buffer_) {
+        num_buffers = static_cast<uint32_t>(published_buffer_->buffers.size());
+    }
+
+    // Send number of buffers (0 = no published buffers)
+    if (send(client_fd, &num_buffers, sizeof(num_buffers), 0) != sizeof(num_buffers)) {
+        perror("MPComm: Failed to send buffer count");
         return;
     }
 
-    // Send success flag
-    uint32_t success = 1;
-    if (send(client_fd, &success, sizeof(success), 0) != sizeof(success)) {
-        perror("MPComm: Failed to send success flag");
+    if (num_buffers == 0) {
         return;
     }
 
-    // Send buffer address
-    uint64_t buf_addr = published_buffer_->addr;
-    if (send(client_fd, &buf_addr, sizeof(buf_addr), 0) != sizeof(buf_addr)) {
-        perror("MPComm: Failed to send buffer address");
-        return;
-    }
-
-    // Send buffer length
-    uint64_t buf_length = published_buffer_->length;
-    if (send(client_fd, &buf_length, sizeof(buf_length), 0) != sizeof(buf_length)) {
-        perror("MPComm: Failed to send buffer length");
-        return;
-    }
-
-    // Send number of NICs (rkeys and GIDs)
-    uint32_t num_nics = static_cast<uint32_t>(published_buffer_->rkeys.size());
+    // Send number of NICs (same for all buffers)
+    uint32_t num_nics = static_cast<uint32_t>(nic_contexts_.size());
     if (send(client_fd, &num_nics, sizeof(num_nics), 0) != sizeof(num_nics)) {
         perror("MPComm: Failed to send num_nics");
         return;
     }
 
-    // Send rkeys and corresponding GIDs for matching
+    // Send GIDs for all NICs (once, for NIC matching)
     for (uint32_t i = 0; i < num_nics; ++i) {
-        // Send rkey
-        uint32_t rkey = published_buffer_->rkeys[i];
-        if (send(client_fd, &rkey, sizeof(rkey), 0) != sizeof(rkey)) {
-            perror("MPComm: Failed to send rkey");
-            return;
-        }
-        // Send GID string (for matching NIC on remote side)
-        // Use same buffer size as RemoteEndpointInfo.gid (64 bytes)
         std::string gid_str = gidToString(nic_contexts_[i]->gid);
         char gid_buf[64];
         memset(gid_buf, 0, sizeof(gid_buf));
@@ -1129,11 +1555,45 @@ void MPComm::handleBufferQuery(int client_fd) {
             perror("MPComm: Failed to send GID");
             return;
         }
-        printf("MPComm: Sending NIC %u: rkey=%u, GID=%s\n", i, rkey, gid_buf);
     }
 
-    printf("MPComm: Sent buffer info to client: addr=0x%lx, length=%lu, num_nics=%u\n",
-           buf_addr, buf_length, num_nics);
+    // Send each buffer's info
+    for (uint32_t buf_idx = 0; buf_idx < num_buffers; ++buf_idx) {
+        const auto &entry = published_buffer_->buffers[buf_idx];
+
+        // Send buffer address
+        if (send(client_fd, &entry.addr, sizeof(entry.addr), 0) != sizeof(entry.addr)) {
+            perror("MPComm: Failed to send buffer address");
+            return;
+        }
+
+        // Send buffer length
+        if (send(client_fd, &entry.length, sizeof(entry.length), 0) != sizeof(entry.length)) {
+            perror("MPComm: Failed to send buffer length");
+            return;
+        }
+
+        // Send NUMA node
+        int32_t numa_node = entry.numa_node;
+        if (send(client_fd, &numa_node, sizeof(numa_node), 0) != sizeof(numa_node)) {
+            perror("MPComm: Failed to send NUMA node");
+            return;
+        }
+
+        // Send rkeys for each NIC
+        for (uint32_t nic_idx = 0; nic_idx < num_nics; ++nic_idx) {
+            uint32_t rkey = entry.rkeys[nic_idx];
+            if (send(client_fd, &rkey, sizeof(rkey), 0) != sizeof(rkey)) {
+                perror("MPComm: Failed to send rkey");
+                return;
+            }
+        }
+
+        printf("MPComm: Sent buffer %u: addr=0x%lx, length=%lu, numa=%d\n",
+               buf_idx, entry.addr, entry.length, entry.numa_node);
+    }
+
+    printf("MPComm: Sent %u buffer(s) to client\n", num_buffers);
 }
 
 // ============================================================================
@@ -1329,9 +1789,134 @@ int MPComm::connect(const std::string &remote_host_id,
     printf("MPComm: Local NICs=%u, Remote NICs=%u, QPs per connection=%zu\n",
            num_nics, remote_num_nics, qps_per_connection_);
 
-    // Exchange NIC info (min of local and remote NICs)
-    size_t exchange_count = std::min(num_nics, remote_num_nics);
-    conn_info.nic_endpoints.resize(exchange_count);
+    // Exchange NUMA topology information for NUMA-aware NIC selection
+    // Send local NUMA count and per-NIC NUMA node info
+    int32_t local_numa_count = static_cast<int32_t>(numa_topology_.size());
+    if (send(sock_fd, &local_numa_count, sizeof(local_numa_count), 0) != sizeof(local_numa_count)) {
+        perror("MPComm: Failed to send local_numa_count");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
+
+    // Send per-NIC NUMA node info
+    std::vector<int32_t> local_nic_numa(num_nics);
+    for (size_t i = 0; i < num_nics; ++i) {
+        local_nic_numa[i] = getNicNumaNode(nic_contexts_[i]->device_name);
+    }
+    if (send(sock_fd, local_nic_numa.data(), num_nics * sizeof(int32_t), 0) !=
+        static_cast<ssize_t>(num_nics * sizeof(int32_t))) {
+        perror("MPComm: Failed to send local_nic_numa");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
+
+    // Receive remote NUMA topology
+    int32_t remote_numa_count;
+    if (recv(sock_fd, &remote_numa_count, sizeof(remote_numa_count), MSG_WAITALL) !=
+        sizeof(remote_numa_count)) {
+        perror("MPComm: Failed to receive remote_numa_count");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
+
+    std::vector<int32_t> remote_nic_numa(remote_num_nics);
+    if (recv(sock_fd, remote_nic_numa.data(), remote_num_nics * sizeof(int32_t), MSG_WAITALL) !=
+        static_cast<ssize_t>(remote_num_nics * sizeof(int32_t))) {
+        perror("MPComm: Failed to receive remote_nic_numa");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
+
+    // Store remote NUMA topology in connection info
+    conn_info.remote_numa_count = remote_numa_count;
+    conn_info.remote_nic_numa_nodes.resize(remote_num_nics);
+    for (size_t i = 0; i < remote_num_nics; ++i) {
+        conn_info.remote_nic_numa_nodes[i] = remote_nic_numa[i];
+    }
+
+    printf("MPComm: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
+    for (size_t i = 0; i < remote_num_nics; ++i) {
+        printf("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
+               (i < remote_num_nics - 1) ? ", " : "\n");
+    }
+
+    // Exchange NIC names for name-based matching
+    // Send local NIC names (format: length-prefixed strings)
+    for (size_t i = 0; i < num_nics; ++i) {
+        const std::string& name = nic_contexts_[i]->device_name;
+        uint32_t name_len = static_cast<uint32_t>(name.size());
+        if (send(sock_fd, &name_len, sizeof(name_len), 0) != sizeof(name_len)) {
+            perror("MPComm: Failed to send nic_name length");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+        if (name_len > 0 && send(sock_fd, name.c_str(), name_len, 0) != static_cast<ssize_t>(name_len)) {
+            perror("MPComm: Failed to send nic_name");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+    }
+
+    // Receive remote NIC names
+    std::vector<std::string> remote_nic_names(remote_num_nics);
+    for (size_t i = 0; i < remote_num_nics; ++i) {
+        uint32_t name_len;
+        if (recv(sock_fd, &name_len, sizeof(name_len), MSG_WAITALL) != sizeof(name_len)) {
+            perror("MPComm: Failed to receive nic_name length");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+        if (name_len > 0) {
+            std::vector<char> buf(name_len + 1, 0);
+            if (recv(sock_fd, buf.data(), name_len, MSG_WAITALL) != static_cast<ssize_t>(name_len)) {
+                perror("MPComm: Failed to receive nic_name");
+                close(sock_fd);
+                return MPCOMM_ERR_CONNECTION;
+            }
+            remote_nic_names[i] = std::string(buf.data());
+        }
+    }
+    conn_info.remote_nic_names = remote_nic_names;
+
+    // Build suffix-to-index mapping for remote NICs
+    std::map<int, std::vector<size_t>> remote_suffix_to_nics;  // suffix -> list of remote NIC indices
+    for (size_t i = 0; i < remote_num_nics; ++i) {
+        int suffix = extractNicSuffix(remote_nic_names[i]);
+        if (suffix >= 0) {
+            remote_suffix_to_nics[suffix].push_back(i);
+        }
+    }
+
+    printf("MPComm: Remote NIC names: ");
+    for (size_t i = 0; i < remote_num_nics; ++i) {
+        int suffix = extractNicSuffix(remote_nic_names[i]);
+        printf("%s(suffix=%d)%s", remote_nic_names[i].c_str(), suffix,
+               (i < remote_num_nics - 1) ? ", " : "\n");
+    }
+
+    // Check how many distinct NUMA nodes the remote NICs actually span
+    // This is different from remote_numa_count (system NUMA count)
+    std::set<int> remote_nic_numa_set;
+    for (size_t i = 0; i < remote_num_nics; ++i) {
+        if (remote_nic_numa[i] >= 0) {
+            remote_nic_numa_set.insert(remote_nic_numa[i]);
+        }
+    }
+    size_t actual_remote_numa_count = remote_nic_numa_set.size();
+    
+    // Build per-NUMA NIC lists for remote side
+    std::map<int, std::vector<size_t>> remote_numa_to_nics;
+    for (size_t i = 0; i < remote_num_nics; ++i) {
+        int numa = remote_nic_numa[i];
+        if (numa >= 0) {
+            remote_numa_to_nics[numa].push_back(i);
+        }
+    }
+    
+    printf("MPComm: Remote NICs span %zu distinct NUMA node(s)\n", actual_remote_numa_count);
+    
+    // Store all remote endpoints (one per remote NIC)
+    conn_info.nic_endpoints.resize(remote_num_nics);
 
     // First, send number of QPs per connection
     uint32_t qps_per_conn = static_cast<uint32_t>(qps_per_connection_);
@@ -1354,106 +1939,202 @@ int MPComm::connect(const std::string &remote_host_id,
                                   static_cast<size_t>(remote_qps_per_conn));
     printf("MPComm: Using %zu QPs per NIC connection\n", actual_qps);
 
-    for (size_t i = 0; i < exchange_count; ++i) {
-        auto &ctx = *nic_contexts_[i];
-        std::string key = remote_host_id + ":" + std::to_string(i);
-        std::vector<struct ibv_qp *> qp_list;
-        qp_list.reserve(actual_qps);
-
-        // Create multiple QPs for this NIC connection
-        for (size_t qp_idx = 0; qp_idx < actual_qps; ++qp_idx) {
-            // Create QP for this connection
-            struct ibv_qp *qp = nullptr;
-            int ret = createQP(ctx, &qp);
-            if (ret != 0) {
-                // Cleanup already created QPs
-                for (auto *created_qp : qp_list) {
-                    destroyQP(created_qp);
+    // Name-based NUMA-aware connection strategy:
+    // - Match local and remote NICs by their name suffix (e.g., mlx5_bond_0 matches with mlx5_0)
+    // - If remote NICs span multiple NUMA nodes: connect to matching NIC AND 
+    //   corresponding NIC in other NUMA nodes with same suffix offset
+    //   Example: local aa0 connects to remote bb0 (same suffix) and bb4 (same position in NUMA1)
+    // - If all remote NICs are on the same NUMA node: simple suffix-based matching
+    
+    size_t total_connections = 0;
+    
+    // Determine if we need cross-NUMA connections
+    bool need_cross_numa = (actual_remote_numa_count > 1);
+    
+    if (need_cross_numa) {
+        printf("MPComm: Remote NICs span %zu NUMA nodes, enabling cross-NUMA connections\n", 
+               actual_remote_numa_count);
+    } else {
+        printf("MPComm: All remote NICs on same NUMA node, using simple suffix-based matching\n");
+    }
+    
+    for (size_t local_nic = 0; local_nic < num_nics; ++local_nic) {
+        auto &ctx = *nic_contexts_[local_nic];
+        const std::string& local_name = ctx.device_name;
+        int local_suffix = extractNicSuffix(local_name);
+        
+        // Calculate which remote NICs this local NIC should connect to
+        std::vector<size_t> target_remote_nics;
+        
+        // Primary: find remote NIC with same suffix
+        auto it = remote_suffix_to_nics.find(local_suffix);
+        if (it != remote_suffix_to_nics.end() && !it->second.empty()) {
+            // Use the first remote NIC with matching suffix as primary
+            size_t primary_remote = it->second[0];
+            target_remote_nics.push_back(primary_remote);
+            
+            // Secondary: only if remote NICs span multiple NUMA nodes
+            // Find remote NICs with same suffix in other NUMA nodes
+            if (need_cross_numa) {
+                int primary_numa = remote_nic_numa[primary_remote];
+                
+                // Find position within its NUMA group
+                size_t position_in_numa = 0;
+                if (primary_numa >= 0) {
+                    const auto& nics_in_numa = remote_numa_to_nics[primary_numa];
+                    for (size_t i = 0; i < nics_in_numa.size(); ++i) {
+                        if (nics_in_numa[i] == primary_remote) {
+                            position_in_numa = i;
+                            break;
+                        }
+                    }
                 }
-                close(sock_fd);
-                return ret;
-            }
-
-            ret = modifyQPToInit(ctx, qp);
-            if (ret != 0) {
-                destroyQP(qp);
-                for (auto *created_qp : qp_list) {
-                    destroyQP(created_qp);
+                
+                // Connect to corresponding position in each other NUMA node
+                for (const auto& kv : remote_numa_to_nics) {
+                    int numa = kv.first;
+                    if (numa == primary_numa) continue;  // Skip same NUMA
+                    
+                    const auto& nics_in_this_numa = kv.second;
+                    if (!nics_in_this_numa.empty()) {
+                        size_t idx = std::min(position_in_numa, nics_in_this_numa.size() - 1);
+                        size_t candidate_nic = nics_in_this_numa[idx];
+                        if (candidate_nic != primary_remote) {
+                            target_remote_nics.push_back(candidate_nic);
+                        }
+                    }
                 }
-                close(sock_fd);
-                return ret;
             }
-
-            // Prepare local info
-            RemoteEndpointInfo local_info;
-            memset(&local_info, 0, sizeof(local_info));
-            strncpy(local_info.gid, gidToString(ctx.gid).c_str(),
-                    sizeof(local_info.gid) - 1);
-            local_info.lid = ctx.lid;
-            local_info.qp_num = qp->qp_num;
-            // rkey will be filled when memory is registered
-
-            // Send local info
-            if (send(sock_fd, &local_info, sizeof(local_info), 0) !=
-                sizeof(local_info)) {
-                perror("MPComm: Failed to send local_info");
-                destroyQP(qp);
-                for (auto *created_qp : qp_list) {
-                    destroyQP(created_qp);
-                }
-                close(sock_fd);
-                return MPCOMM_ERR_CONNECTION;
-            }
-
-            // Receive remote info
-            RemoteEndpointInfo remote_info;
-            if (recv(sock_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) !=
-                sizeof(remote_info)) {
-                perror("MPComm: Failed to receive remote_info");
-                destroyQP(qp);
-                for (auto *created_qp : qp_list) {
-                    destroyQP(created_qp);
-                }
-                close(sock_fd);
-                return MPCOMM_ERR_CONNECTION;
-            }
-
-            printf("MPComm: NIC %zu QP[%zu]: Local QPN=%u, Remote QPN=%u\n",
-                   i, qp_idx, local_info.qp_num, remote_info.qp_num);
-
-            // Complete QP setup
-            ret = modifyQPToRTR(ctx, qp, remote_info);
-            if (ret != 0) {
-                destroyQP(qp);
-                for (auto *created_qp : qp_list) {
-                    destroyQP(created_qp);
-                }
-                close(sock_fd);
-                return ret;
-            }
-
-            ret = modifyQPToRTS(qp);
-            if (ret != 0) {
-                destroyQP(qp);
-                for (auto *created_qp : qp_list) {
-                    destroyQP(created_qp);
-                }
-                close(sock_fd);
-                return ret;
-            }
-
-            qp_list.push_back(qp);
-
-            // Store first remote_info for endpoint (all QPs connect to same remote)
-            if (qp_idx == 0) {
-                conn_info.nic_endpoints[i] = remote_info;
-            }
+        } else {
+            // No matching suffix found, skip this local NIC
+            printf("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC, skipping\n",
+                   local_nic, local_name.c_str(), local_suffix);
+            continue;
         }
+        
+        if (target_remote_nics.empty()) {
+            continue;  // No remote NICs to connect to
+        }
+        
+        printf("MPComm: Local NIC%zu (%s, suffix=%d) connecting to remote NICs: ", 
+               local_nic, local_name.c_str(), local_suffix);
+        for (size_t idx = 0; idx < target_remote_nics.size(); ++idx) {
+            size_t r = target_remote_nics[idx];
+            printf("%zu(%s)%s", r, remote_nic_names[r].c_str(),
+                   (idx < target_remote_nics.size() - 1) ? ", " : "\n");
+        }
+        
+        // Store the local-to-remote NIC mapping for later use in transfers
+        conn_info.local_to_remote_nic_map[local_nic] = target_remote_nics;
+        
+        // Create connections to each target remote NIC
+        for (size_t remote_nic : target_remote_nics) {
+            std::string key = remote_host_id + ":" + std::to_string(local_nic) + 
+                              ":" + std::to_string(remote_nic);
+            std::vector<struct ibv_qp *> qp_list;
+            qp_list.reserve(actual_qps);
 
-        // Store QP list
-        {
-            std::lock_guard<std::mutex> lock(ctx.qp_mutex);
-            ctx.qp_map[key] = std::move(qp_list);
+            // Create multiple QPs for this NIC connection
+            for (size_t qp_idx = 0; qp_idx < actual_qps; ++qp_idx) {
+                // Create QP for this connection
+                struct ibv_qp *qp = nullptr;
+                int ret = createQP(ctx, &qp);
+                if (ret != 0) {
+                    // Cleanup already created QPs
+                    for (auto *created_qp : qp_list) {
+                        destroyQP(created_qp);
+                    }
+                    close(sock_fd);
+                    return ret;
+                }
+
+                ret = modifyQPToInit(ctx, qp);
+                if (ret != 0) {
+                    destroyQP(qp);
+                    for (auto *created_qp : qp_list) {
+                        destroyQP(created_qp);
+                    }
+                    close(sock_fd);
+                    return ret;
+                }
+
+                // Prepare local info with target remote NIC index
+                RemoteEndpointInfo local_info;
+                memset(&local_info, 0, sizeof(local_info));
+                strncpy(local_info.gid, gidToString(ctx.gid).c_str(),
+                        sizeof(local_info.gid) - 1);
+                local_info.lid = ctx.lid;
+                local_info.qp_num = qp->qp_num;
+                // Encode target remote NIC in addr field for passive side to know
+                local_info.addr = remote_nic;
+                // Encode source local NIC in length field for passive side to track
+                local_info.length = local_nic;
+
+                // Send local info
+                if (send(sock_fd, &local_info, sizeof(local_info), 0) !=
+                    sizeof(local_info)) {
+                    perror("MPComm: Failed to send local_info");
+                    destroyQP(qp);
+                    for (auto *created_qp : qp_list) {
+                        destroyQP(created_qp);
+                    }
+                    close(sock_fd);
+                    return MPCOMM_ERR_CONNECTION;
+                }
+
+                // Receive remote info
+                RemoteEndpointInfo remote_info;
+                if (recv(sock_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) !=
+                    sizeof(remote_info)) {
+                    perror("MPComm: Failed to receive remote_info");
+                    destroyQP(qp);
+                    for (auto *created_qp : qp_list) {
+                        destroyQP(created_qp);
+                    }
+                    close(sock_fd);
+                    return MPCOMM_ERR_CONNECTION;
+                }
+
+                printf("MPComm: NIC %s->%s QP[%zu]: Local QPN=%u, Remote QPN=%u\n",
+                       nic_contexts_[local_nic]->device_name.c_str(),
+                       remote_nic_names[remote_nic].c_str(),
+                       qp_idx, local_info.qp_num, remote_info.qp_num);
+
+                // Complete QP setup
+                ret = modifyQPToRTR(ctx, qp, remote_info);
+                if (ret != 0) {
+                    destroyQP(qp);
+                    for (auto *created_qp : qp_list) {
+                        destroyQP(created_qp);
+                    }
+                    close(sock_fd);
+                    return ret;
+                }
+
+                ret = modifyQPToRTS(qp);
+                if (ret != 0) {
+                    destroyQP(qp);
+                    for (auto *created_qp : qp_list) {
+                        destroyQP(created_qp);
+                    }
+                    close(sock_fd);
+                    return ret;
+                }
+
+                qp_list.push_back(qp);
+
+                // Store remote endpoint info for this remote NIC
+                if (qp_idx == 0) {
+                    conn_info.nic_endpoints[remote_nic] = remote_info;
+                }
+            }
+
+            // Store QP list with new key format: "host:local_nic:remote_nic"
+            {
+                std::lock_guard<std::mutex> lock(ctx.qp_mutex);
+                ctx.qp_map[key] = std::move(qp_list);
+            }
+            total_connections++;
         }
     }
 
@@ -1465,8 +2146,8 @@ int MPComm::connect(const std::string &remote_host_id,
         connections_[remote_host_id] = conn_info;
     }
 
-    printf("MPComm: Connected to %s with %zu NICs, %zu QPs each\n",
-           remote_host_id.c_str(), exchange_count, actual_qps);
+    printf("MPComm: Connected to %s with %zu NIC connections (NUMA-aware), %zu QPs each\n",
+           remote_host_id.c_str(), total_connections, actual_qps);
     
     return MPCOMM_SUCCESS;
 }
@@ -1570,8 +2251,111 @@ void MPComm::acceptLoop() {
         conn_info.host_id = remote_host_id;
         conn_info.tcp_port = ntohs(client_addr.sin_port);
 
-        size_t exchange_count = std::min(num_nics, remote_num_nics);
-        conn_info.nic_endpoints.resize(exchange_count);
+        // Receive remote NUMA topology (part of new protocol)
+        int32_t remote_numa_count;
+        if (recv(client_fd, &remote_numa_count, sizeof(remote_numa_count), MSG_WAITALL) !=
+            sizeof(remote_numa_count)) {
+            perror("MPComm: Failed to receive remote_numa_count");
+            close(client_fd);
+            continue;
+        }
+
+        std::vector<int32_t> remote_nic_numa(remote_num_nics);
+        if (recv(client_fd, remote_nic_numa.data(), remote_num_nics * sizeof(int32_t), MSG_WAITALL) !=
+            static_cast<ssize_t>(remote_num_nics * sizeof(int32_t))) {
+            perror("MPComm: Failed to receive remote_nic_numa");
+            close(client_fd);
+            continue;
+        }
+
+        // Send local NUMA topology
+        int32_t local_numa_count = static_cast<int32_t>(numa_topology_.size());
+        if (send(client_fd, &local_numa_count, sizeof(local_numa_count), 0) !=
+            sizeof(local_numa_count)) {
+            perror("MPComm: Failed to send local_numa_count");
+            close(client_fd);
+            continue;
+        }
+
+        std::vector<int32_t> local_nic_numa(num_nics);
+        for (size_t i = 0; i < num_nics; ++i) {
+            local_nic_numa[i] = getNicNumaNode(nic_contexts_[i]->device_name);
+        }
+        if (send(client_fd, local_nic_numa.data(), num_nics * sizeof(int32_t), 0) !=
+            static_cast<ssize_t>(num_nics * sizeof(int32_t))) {
+            perror("MPComm: Failed to send local_nic_numa");
+            close(client_fd);
+            continue;
+        }
+
+        // Store remote NUMA topology
+        conn_info.remote_numa_count = remote_numa_count;
+        conn_info.remote_nic_numa_nodes.resize(remote_num_nics);
+        for (size_t i = 0; i < remote_num_nics; ++i) {
+            conn_info.remote_nic_numa_nodes[i] = remote_nic_numa[i];
+        }
+
+        printf("MPComm: Passive side: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
+        for (size_t i = 0; i < remote_num_nics; ++i) {
+            printf("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
+                   (i < remote_num_nics - 1) ? ", " : "\n");
+        }
+
+        // Receive remote NIC names (passive side receives first, then sends)
+        std::vector<std::string> remote_nic_names(remote_num_nics);
+        for (size_t i = 0; i < remote_num_nics; ++i) {
+            uint32_t name_len;
+            if (recv(client_fd, &name_len, sizeof(name_len), MSG_WAITALL) != sizeof(name_len)) {
+                perror("MPComm: Failed to receive nic_name length");
+                close(client_fd);
+                continue;
+            }
+            if (name_len > 0) {
+                std::vector<char> buf(name_len + 1, 0);
+                if (recv(client_fd, buf.data(), name_len, MSG_WAITALL) != static_cast<ssize_t>(name_len)) {
+                    perror("MPComm: Failed to receive nic_name");
+                    close(client_fd);
+                    continue;
+                }
+                remote_nic_names[i] = std::string(buf.data());
+            }
+        }
+        conn_info.remote_nic_names = remote_nic_names;
+
+        // Send local NIC names
+        for (size_t i = 0; i < num_nics; ++i) {
+            const std::string& name = nic_contexts_[i]->device_name;
+            uint32_t name_len = static_cast<uint32_t>(name.size());
+            if (send(client_fd, &name_len, sizeof(name_len), 0) != sizeof(name_len)) {
+                perror("MPComm: Failed to send nic_name length");
+                close(client_fd);
+                continue;
+            }
+            if (name_len > 0 && send(client_fd, name.c_str(), name_len, 0) != static_cast<ssize_t>(name_len)) {
+                perror("MPComm: Failed to send nic_name");
+                close(client_fd);
+                continue;
+            }
+        }
+
+        // Build suffix-to-index mapping for remote NICs
+        std::map<int, std::vector<size_t>> remote_suffix_to_nics;
+        for (size_t i = 0; i < remote_num_nics; ++i) {
+            int suffix = extractNicSuffix(remote_nic_names[i]);
+            if (suffix >= 0) {
+                remote_suffix_to_nics[suffix].push_back(i);
+            }
+        }
+
+        printf("MPComm: Passive side: Remote NIC names: ");
+        for (size_t i = 0; i < remote_num_nics; ++i) {
+            int suffix = extractNicSuffix(remote_nic_names[i]);
+            printf("%s(suffix=%d)%s", remote_nic_names[i].c_str(), suffix,
+                   (i < remote_num_nics - 1) ? ", " : "\n");
+        }
+
+        // Store all remote endpoints (one per remote NIC)
+        conn_info.nic_endpoints.resize(remote_num_nics);
 
         // Receive remote's QPs per connection
         uint32_t remote_qps_per_conn;
@@ -1595,21 +2379,156 @@ void MPComm::acceptLoop() {
                                       static_cast<size_t>(remote_qps_per_conn));
         printf("MPComm: Passive side: Using %zu QPs per NIC connection\n", actual_qps);
 
+        // Check how many distinct NUMA nodes the remote NICs actually span
+        // Must match the logic in connect() on active side
+        std::set<int> remote_nic_numa_set;
+        for (size_t i = 0; i < remote_num_nics; ++i) {
+            if (remote_nic_numa[i] >= 0) {
+                remote_nic_numa_set.insert(remote_nic_numa[i]);
+            }
+        }
+        size_t actual_remote_numa_count = remote_nic_numa_set.size();
+        
+        // Build per-NUMA NIC lists for remote side
+        std::map<int, std::vector<size_t>> remote_numa_to_nics;
+        for (size_t i = 0; i < remote_num_nics; ++i) {
+            int numa = remote_nic_numa[i];
+            if (numa >= 0) {
+                remote_numa_to_nics[numa].push_back(i);
+            }
+        }
+        
+        bool need_cross_numa = (actual_remote_numa_count > 1);
+        
+        printf("MPComm: Passive side: Remote NICs span %zu NUMA node(s), cross-NUMA=%s\n",
+               actual_remote_numa_count, need_cross_numa ? "yes" : "no");
+        
+        // Calculate expected number of connections (must match active side exactly)
+        // Active side iterates by local NIC and finds matching remote NICs by suffix
+        // On passive side, we need to calculate how many remote NICs will match our local NICs
+        size_t expected_connections = 0;
+        
+        // For each remote NIC (which is the active side's local NIC)
+        for (size_t remote_nic = 0; remote_nic < remote_num_nics; ++remote_nic) {
+            int remote_suffix = extractNicSuffix(remote_nic_names[remote_nic]);
+            
+            // Check if any local NIC has matching suffix
+            bool has_match = false;
+            for (size_t local_nic = 0; local_nic < num_nics; ++local_nic) {
+                int local_suffix = extractNicSuffix(nic_contexts_[local_nic]->device_name);
+                if (local_suffix == remote_suffix && remote_suffix >= 0) {
+                    has_match = true;
+                    break;
+                }
+            }
+            
+            if (!has_match) continue;  // No matching local NIC
+            
+            // Primary connection (same suffix)
+            expected_connections++;
+            
+            // Secondary connections only if need cross-NUMA
+            if (need_cross_numa) {
+                // Find matching local NIC index for this suffix
+                size_t matched_local_nic = SIZE_MAX;
+                for (size_t i = 0; i < num_nics; ++i) {
+                    if (extractNicSuffix(nic_contexts_[i]->device_name) == remote_suffix) {
+                        matched_local_nic = i;
+                        break;
+                    }
+                }
+                
+                if (matched_local_nic != SIZE_MAX) {
+                    int primary_numa = local_nic_numa[matched_local_nic];
+                    size_t position_in_numa = 0;
+                    
+                    // Build local per-NUMA NIC lists
+                    std::map<int, std::vector<size_t>> local_numa_to_nics;
+                    for (size_t i = 0; i < num_nics; ++i) {
+                        int numa = local_nic_numa[i];
+                        if (numa >= 0) {
+                            local_numa_to_nics[numa].push_back(i);
+                        }
+                    }
+                    
+                    if (primary_numa >= 0) {
+                        const auto& nics_in_numa = local_numa_to_nics[primary_numa];
+                        for (size_t i = 0; i < nics_in_numa.size(); ++i) {
+                            if (nics_in_numa[i] == matched_local_nic) {
+                                position_in_numa = i;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    for (const auto& kv : local_numa_to_nics) {
+                        int numa = kv.first;
+                        if (numa == primary_numa) continue;
+                        
+                        const auto& nics_in_this_numa = kv.second;
+                        if (!nics_in_this_numa.empty()) {
+                            size_t idx = std::min(position_in_numa, nics_in_this_numa.size() - 1);
+                            size_t candidate_nic = nics_in_this_numa[idx];
+                            if (candidate_nic != matched_local_nic) {
+                                expected_connections++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        printf("MPComm: Passive side: Expecting %zu connections\n", expected_connections);
+
         bool success = true;
-        for (size_t i = 0; i < exchange_count && success; ++i) {
-            auto &ctx = *nic_contexts_[i];
-            std::string key = remote_host_id + ":" + std::to_string(i);
+        size_t total_connections = 0;
+        
+        // Receive connections from active side - the active side determines which
+        // local NIC connects to which remote NIC (encoded in remote_info)
+        // remote_info.addr = target local NIC on passive side
+        // remote_info.length = source remote NIC (active side's local NIC)
+        while (total_connections < expected_connections && success) {
+            // Receive first QP info to determine connection mapping
+            RemoteEndpointInfo remote_info;
+            if (recv(client_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) !=
+                sizeof(remote_info)) {
+                perror("MPComm: Failed to receive remote_info");
+                success = false;
+                break;
+            }
+
+            // Decode: remote_info.addr contains the target local NIC index on passive side
+            size_t local_nic = static_cast<size_t>(remote_info.addr);
+            if (local_nic >= num_nics) {
+                fprintf(stderr, "MPComm: Invalid local NIC index %zu from active side\n", local_nic);
+                success = false;
+                break;
+            }
+
+            // Decode: remote_info.length contains the source remote NIC (active side's local NIC)
+            size_t remote_nic = static_cast<size_t>(remote_info.length);
+            if (remote_nic >= remote_num_nics) {
+                fprintf(stderr, "MPComm: Invalid remote NIC index %zu from active side\n", remote_nic);
+                success = false;
+                break;
+            }
+
+            auto &ctx = *nic_contexts_[local_nic];
+            std::string key = remote_host_id + ":" + std::to_string(local_nic) + 
+                              ":" + std::to_string(remote_nic);
             std::vector<struct ibv_qp *> qp_list;
             qp_list.reserve(actual_qps);
 
+            // Process first QP (already received remote_info)
             for (size_t qp_idx = 0; qp_idx < actual_qps && success; ++qp_idx) {
-                // Receive remote info first (passive side)
-                RemoteEndpointInfo remote_info;
-                if (recv(client_fd, &remote_info, sizeof(remote_info),
-                         MSG_WAITALL) != sizeof(remote_info)) {
-                    perror("MPComm: Failed to receive remote_info");
-                    success = false;
-                    break;
+                // For subsequent QPs, receive remote_info
+                if (qp_idx > 0) {
+                    if (recv(client_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) !=
+                        sizeof(remote_info)) {
+                        perror("MPComm: Failed to receive remote_info");
+                        success = false;
+                        break;
+                    }
                 }
 
                 // Create QP
@@ -1652,19 +2571,28 @@ void MPComm::acceptLoop() {
 
                 qp_list.push_back(qp);
 
-                // Store first remote_info for endpoint
+                // Store remote endpoint info
                 if (qp_idx == 0) {
-                    conn_info.nic_endpoints[i] = remote_info;
+                    // Clear the encoded local_nic from addr field
+                    remote_info.addr = 0;
+                    conn_info.nic_endpoints[remote_nic] = remote_info;
                 }
 
-                printf("MPComm: NIC %zu QP[%zu]: Passive side QPN=%u, Remote QPN=%u\n",
-                       i, qp_idx, local_info.qp_num, remote_info.qp_num);
+                printf("MPComm: Passive NIC %s<-%s QP[%zu]: Local QPN=%u, Remote QPN=%u\n",
+                       nic_contexts_[local_nic]->device_name.c_str(),
+                       remote_nic_names[remote_nic].c_str(),
+                       qp_idx, local_info.qp_num, remote_info.qp_num);
             }
 
             if (success) {
-                // Store QP list
+                // Store QP list with new key format
                 std::lock_guard<std::mutex> lock(ctx.qp_mutex);
                 ctx.qp_map[key] = std::move(qp_list);
+                total_connections++;
+                
+                // Store the local-to-remote NIC mapping
+                // On passive side: local_nic is our NIC, remote_nic is the active side's NIC
+                conn_info.local_to_remote_nic_map[local_nic].push_back(remote_nic);
             } else {
                 // Cleanup on failure
                 for (auto *qp : qp_list) {
@@ -1678,8 +2606,8 @@ void MPComm::acceptLoop() {
         if (success) {
             std::lock_guard<std::mutex> lock(connections_mutex_);
             connections_[remote_host_id] = conn_info;
-            printf("MPComm: Passive connection established with %s (%zu QPs per NIC)\n",
-                   remote_host_id.c_str(), actual_qps);
+            printf("MPComm: Passive connection established with %s (%zu NIC connections, NUMA-aware)\n",
+                   remote_host_id.c_str(), total_connections);
         }
     }
 }
@@ -1820,472 +2748,6 @@ int MPComm::pollCompletion(NicContext &ctx, int timeout_ms) {
         // Brief yield to avoid busy-waiting too aggressively
         std::this_thread::yield();
     }
-}
-
-// Background poll thread function
-void MPComm::asyncPollThreadFunc(AsyncRdmaContext *async_ctx) {
-    struct ibv_wc wc_array[32];
-    
-    while (!async_ctx->finished.load()) {
-        // Check if all chunks are completed
-        size_t total = async_ctx->total_chunks.load();
-        size_t completed = async_ctx->completed_chunks.load();
-        
-        if (total > 0 && completed >= total && async_ctx->post_finished.load()) {
-            async_ctx->finished.store(true);
-            break;
-        }
-        
-        // Poll CQ for completions
-        int n = ibv_poll_cq(async_ctx->cq, 32, wc_array);
-        if (n < 0) {
-            fprintf(stderr, "MPComm: ibv_poll_cq failed in poll thread\n");
-            async_ctx->error_code.store(MPCOMM_ERR_TRANSFER);
-            async_ctx->finished.store(true);
-            break;
-        }
-        
-        for (int i = 0; i < n; ++i) {
-            if (wc_array[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "MPComm: WC error in poll thread: status=%d, wr_id=%lu\n",
-                        wc_array[i].status, wc_array[i].wr_id);
-                async_ctx->error_code.store(MPCOMM_ERR_TRANSFER);
-                async_ctx->finished.store(true);
-                return;
-            }
-            
-            // Update per-QP completed counter if in multi-QP mode
-            // wr_id encoding: (qp_index << 56) | original_addr
-            if (async_ctx->num_qps > 0) {
-                size_t qp_index = (wc_array[i].wr_id >> 56) & 0xFF;
-                if (qp_index < AsyncRdmaContext::MAX_QPS) {
-                    async_ctx->per_qp_completed[qp_index].fetch_add(1);
-                }
-            }
-            
-            async_ctx->completed_chunks.fetch_add(1);
-        }
-        
-        // If no completions and not all posted yet, yield to let post thread work
-        if (n == 0) {
-            std::this_thread::yield();
-        }
-    }
-}
-
-int MPComm::postRdmaWriteAsync(NicContext &ctx, struct ibv_qp *qp,
-                               void *local_addr, uint32_t lkey,
-                               uint64_t remote_addr, uint32_t rkey,
-                               size_t length, AsyncRdmaContext &async_ctx) {
-    // Initialize async context
-    async_ctx.total_chunks.store(0);
-    async_ctx.posted_chunks.store(0);
-    async_ctx.completed_chunks.store(0);
-    async_ctx.error_code.store(0);
-    async_ctx.post_finished.store(false);
-    async_ctx.finished.store(false);
-    async_ctx.cq = ctx.cq;
-
-    // Calculate number of chunks needed
-    size_t num_chunks = (length + max_rdma_transfer_size_ - 1) / max_rdma_transfer_size_;
-    async_ctx.total_chunks.store(num_chunks);
-
-    // Start background poll thread
-    async_ctx.poll_thread = std::thread(asyncPollThreadFunc, &async_ctx);
-
-    // Flow control: max outstanding WRs (leave headroom from kMaxSendWR=512)
-    const size_t max_outstanding = 256;
-
-    // Post chunks with flow control
-    size_t offset = 0;
-    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-        // Flow control: wait if too many outstanding WRs
-        while (async_ctx.posted_chunks.load() - async_ctx.completed_chunks.load() >= max_outstanding) {
-            if (async_ctx.error_code.load() != 0) {
-                // Poll thread detected an error
-                async_ctx.post_finished.store(true);
-                if (async_ctx.poll_thread.joinable()) {
-                    async_ctx.poll_thread.join();
-                }
-                return async_ctx.error_code.load();
-            }
-            std::this_thread::yield();
-        }
-
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        wr.wr_id = reinterpret_cast<uint64_t>(chunk_local_addr);
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (WRITE async) failed: %d, "
-                    "chunk_idx=%zu, chunk_offset=%zu, chunk_size=%zu\n",
-                    ret, chunk_idx, offset, chunk_size);
-            async_ctx.error_code.store(MPCOMM_ERR_TRANSFER);
-            async_ctx.post_finished.store(true);
-            async_ctx.finished.store(true);
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return MPCOMM_ERR_TRANSFER;
-        }
-
-        async_ctx.posted_chunks.fetch_add(1);
-        offset += chunk_size;
-    }
-
-    // All chunks posted
-    async_ctx.post_finished.store(true);
-    return MPCOMM_SUCCESS;
-}
-
-int MPComm::postRdmaReadAsync(NicContext &ctx, struct ibv_qp *qp,
-                              void *local_addr, uint32_t lkey,
-                              uint64_t remote_addr, uint32_t rkey,
-                              size_t length, AsyncRdmaContext &async_ctx) {
-    // Initialize async context
-    async_ctx.total_chunks.store(0);
-    async_ctx.posted_chunks.store(0);
-    async_ctx.completed_chunks.store(0);
-    async_ctx.error_code.store(0);
-    async_ctx.post_finished.store(false);
-    async_ctx.finished.store(false);
-    async_ctx.cq = ctx.cq;
-
-    // Calculate number of chunks needed
-    size_t num_chunks = (length + max_rdma_transfer_size_ - 1) / max_rdma_transfer_size_;
-    async_ctx.total_chunks.store(num_chunks);
-
-    // Start background poll thread
-    async_ctx.poll_thread = std::thread(asyncPollThreadFunc, &async_ctx);
-
-    // Flow control: max outstanding WRs (leave headroom from kMaxSendWR=512)
-    const size_t max_outstanding = 256;
-
-    // Post chunks with flow control
-    size_t offset = 0;
-    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-        // Flow control: wait if too many outstanding WRs
-        while (async_ctx.posted_chunks.load() - async_ctx.completed_chunks.load() >= max_outstanding) {
-            if (async_ctx.error_code.load() != 0) {
-                // Poll thread detected an error
-                async_ctx.post_finished.store(true);
-                if (async_ctx.poll_thread.joinable()) {
-                    async_ctx.poll_thread.join();
-                }
-                return async_ctx.error_code.load();
-            }
-            std::this_thread::yield();
-        }
-
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        wr.wr_id = reinterpret_cast<uint64_t>(chunk_local_addr);
-        wr.opcode = IBV_WR_RDMA_READ;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (READ async) failed: %d, "
-                    "chunk_idx=%zu, chunk_offset=%zu, chunk_size=%zu\n",
-                    ret, chunk_idx, offset, chunk_size);
-            async_ctx.error_code.store(MPCOMM_ERR_TRANSFER);
-            async_ctx.post_finished.store(true);
-            async_ctx.finished.store(true);
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return MPCOMM_ERR_TRANSFER;
-        }
-
-        async_ctx.posted_chunks.fetch_add(1);
-        offset += chunk_size;
-    }
-
-    // All chunks posted
-    async_ctx.post_finished.store(true);
-    return MPCOMM_SUCCESS;
-}
-
-int MPComm::postRdmaWriteAsyncMultiQP(NicContext &ctx, const std::string &host_id,
-                                      size_t nic_index, void *local_addr, uint32_t lkey,
-                                      uint64_t remote_addr, uint32_t rkey,
-                                      size_t length, AsyncRdmaContext &async_ctx) {
-    // Initialize async context
-    async_ctx.total_chunks.store(0);
-    async_ctx.posted_chunks.store(0);
-    async_ctx.completed_chunks.store(0);
-    async_ctx.error_code.store(0);
-    async_ctx.post_finished.store(false);
-    async_ctx.finished.store(false);
-    async_ctx.cq = ctx.cq;
-    
-    // Enable multi-QP mode with per-QP tracking
-    async_ctx.num_qps = qps_per_connection_;
-    for (size_t i = 0; i < AsyncRdmaContext::MAX_QPS; ++i) {
-        async_ctx.per_qp_completed[i].store(0);
-    }
-
-    // Calculate number of chunks needed
-    size_t num_chunks = (length + max_rdma_transfer_size_ - 1) / max_rdma_transfer_size_;
-    async_ctx.total_chunks.store(num_chunks);
-
-    // Start background poll thread
-    async_ctx.poll_thread = std::thread(asyncPollThreadFunc, &async_ctx);
-
-    // Flow control: max outstanding WRs per QP (leave headroom from kMaxSendWR=512)
-    // kMaxSendWR is 512 in createQP, so we use 256 to leave headroom
-    const size_t max_outstanding_per_qp = 256;
-    
-    // Per-QP posted counters for proper flow control
-    // Now using accurate per-QP completed counters from poll thread (via wr_id encoding)
-    std::vector<size_t> per_qp_posted(qps_per_connection_, 0);
-
-    // Post chunks with flow control, rotating across all QPs for this NIC
-    size_t offset = 0;
-    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-        // Round-robin QP selection for each chunk/slice
-        size_t qp_index = chunk_idx % qps_per_connection_;
-        
-        // Per-QP flow control using accurate per-QP completed counters
-        size_t qp_completed = async_ctx.per_qp_completed[qp_index].load();
-        size_t qp_outstanding = per_qp_posted[qp_index] > qp_completed ? 
-                                per_qp_posted[qp_index] - qp_completed : 0;
-        
-        // Wait if this specific QP has too many outstanding WRs
-        while (qp_outstanding >= max_outstanding_per_qp) {
-            if (async_ctx.error_code.load() != 0) {
-                async_ctx.post_finished.store(true);
-                if (async_ctx.poll_thread.joinable()) {
-                    async_ctx.poll_thread.join();
-                }
-                return async_ctx.error_code.load();
-            }
-            std::this_thread::yield();
-            
-            // Re-read accurate per-QP completed counter after yield
-            qp_completed = async_ctx.per_qp_completed[qp_index].load();
-            qp_outstanding = per_qp_posted[qp_index] > qp_completed ? 
-                             per_qp_posted[qp_index] - qp_completed : 0;
-        }
-        struct ibv_qp *qp = getOrCreateQP(nic_index, host_id, nic_index, qp_index);
-        if (!qp) {
-            fprintf(stderr, "MPComm: No QP for %s on NIC %zu (qp_index=%zu)\n",
-                    host_id.c_str(), nic_index, qp_index);
-            async_ctx.error_code.store(MPCOMM_ERR_CONNECTION);
-            async_ctx.post_finished.store(true);
-            async_ctx.finished.store(true);
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return MPCOMM_ERR_CONNECTION;
-        }
-
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        // Encode qp_index in upper 8 bits of wr_id for poll thread to track per-QP completions
-        // wr_id = (qp_index << 56) | (addr & 0x00FFFFFFFFFFFFFF)
-        uint64_t addr_part = reinterpret_cast<uint64_t>(chunk_local_addr) & 0x00FFFFFFFFFFFFFFULL;
-        wr.wr_id = (static_cast<uint64_t>(qp_index) << 56) | addr_part;
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (WRITE async multi-QP) failed: %d, "
-                    "chunk_idx=%zu, qp_index=%zu, chunk_offset=%zu, chunk_size=%zu\n",
-                    ret, chunk_idx, qp_index, offset, chunk_size);
-            async_ctx.error_code.store(MPCOMM_ERR_TRANSFER);
-            async_ctx.post_finished.store(true);
-            async_ctx.finished.store(true);
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return MPCOMM_ERR_TRANSFER;
-        }
-
-        per_qp_posted[qp_index]++;
-        async_ctx.posted_chunks.fetch_add(1);
-        offset += chunk_size;
-    }
-
-    // All chunks posted
-    async_ctx.post_finished.store(true);
-    return MPCOMM_SUCCESS;
-}
-
-int MPComm::postRdmaReadAsyncMultiQP(NicContext &ctx, const std::string &host_id,
-                                     size_t nic_index, void *local_addr, uint32_t lkey,
-                                     uint64_t remote_addr, uint32_t rkey,
-                                     size_t length, AsyncRdmaContext &async_ctx) {
-    // Initialize async context
-    async_ctx.total_chunks.store(0);
-    async_ctx.posted_chunks.store(0);
-    async_ctx.completed_chunks.store(0);
-    async_ctx.error_code.store(0);
-    async_ctx.post_finished.store(false);
-    async_ctx.finished.store(false);
-    async_ctx.cq = ctx.cq;
-    
-    // Enable multi-QP mode with per-QP tracking
-    async_ctx.num_qps = qps_per_connection_;
-    for (size_t i = 0; i < AsyncRdmaContext::MAX_QPS; ++i) {
-        async_ctx.per_qp_completed[i].store(0);
-    }
-
-    // Calculate number of chunks needed
-    size_t num_chunks = (length + max_rdma_transfer_size_ - 1) / max_rdma_transfer_size_;
-    async_ctx.total_chunks.store(num_chunks);
-
-    // Start background poll thread
-    async_ctx.poll_thread = std::thread(asyncPollThreadFunc, &async_ctx);
-
-    // Flow control: max outstanding WRs per QP (leave headroom from kMaxSendWR=512)
-    // kMaxSendWR is 512 in createQP, so we use 256 to leave headroom
-    const size_t max_outstanding_per_qp = 256;
-    
-    // Per-QP posted counters for proper flow control
-    // Now using accurate per-QP completed counters from poll thread (via wr_id encoding)
-    std::vector<size_t> per_qp_posted(qps_per_connection_, 0);
-
-    // Post chunks with flow control, rotating across all QPs for this NIC
-    size_t offset = 0;
-    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-        // Round-robin QP selection for each chunk/slice
-        size_t qp_index = chunk_idx % qps_per_connection_;
-        
-        // Per-QP flow control using accurate per-QP completed counters
-        size_t qp_completed = async_ctx.per_qp_completed[qp_index].load();
-        size_t qp_outstanding = per_qp_posted[qp_index] > qp_completed ? 
-                                per_qp_posted[qp_index] - qp_completed : 0;
-        
-        // Wait if this specific QP has too many outstanding WRs
-        while (qp_outstanding >= max_outstanding_per_qp) {
-            if (async_ctx.error_code.load() != 0) {
-                async_ctx.post_finished.store(true);
-                if (async_ctx.poll_thread.joinable()) {
-                    async_ctx.poll_thread.join();
-                }
-                return async_ctx.error_code.load();
-            }
-            std::this_thread::yield();
-            
-            // Re-read accurate per-QP completed counter after yield
-            qp_completed = async_ctx.per_qp_completed[qp_index].load();
-            qp_outstanding = per_qp_posted[qp_index] > qp_completed ? 
-                             per_qp_posted[qp_index] - qp_completed : 0;
-        }
-
-        struct ibv_qp *qp = getOrCreateQP(nic_index, host_id, nic_index, qp_index);
-        if (!qp) {
-            fprintf(stderr, "MPComm: No QP for %s on NIC %zu (qp_index=%zu)\n",
-                    host_id.c_str(), nic_index, qp_index);
-            async_ctx.error_code.store(MPCOMM_ERR_CONNECTION);
-            async_ctx.post_finished.store(true);
-            async_ctx.finished.store(true);
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return MPCOMM_ERR_CONNECTION;
-        }
-
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        // Encode qp_index in upper 8 bits of wr_id for poll thread to track per-QP completions
-        // wr_id = (qp_index << 56) | (addr & 0x00FFFFFFFFFFFFFF)
-        uint64_t addr_part = reinterpret_cast<uint64_t>(chunk_local_addr) & 0x00FFFFFFFFFFFFFFULL;
-        wr.wr_id = (static_cast<uint64_t>(qp_index) << 56) | addr_part;
-        wr.opcode = IBV_WR_RDMA_READ;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (READ async multi-QP) failed: %d, "
-                    "chunk_idx=%zu, qp_index=%zu, chunk_offset=%zu, chunk_size=%zu\n",
-                    ret, chunk_idx, qp_index, offset, chunk_size);
-            async_ctx.error_code.store(MPCOMM_ERR_TRANSFER);
-            async_ctx.post_finished.store(true);
-            async_ctx.finished.store(true);
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return MPCOMM_ERR_TRANSFER;
-        }
-
-        per_qp_posted[qp_index]++;
-        async_ctx.posted_chunks.fetch_add(1);
-        offset += chunk_size;
-    }
-
-    // All chunks posted
-    async_ctx.post_finished.store(true);
-    return MPCOMM_SUCCESS;
 }
 
 // ============================================================================
@@ -2519,90 +2981,6 @@ int MPComm::rdmaReadSyncMultiQP(NicContext &ctx, const std::string &host_id,
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::pollAsyncCompletion(NicContext &ctx, AsyncRdmaContext &async_ctx) {
-    (void)ctx;  // Poll thread already polls the CQ
-    
-    if (async_ctx.finished.load()) {
-        // Join poll thread if not already joined
-        if (async_ctx.poll_thread.joinable()) {
-            async_ctx.poll_thread.join();
-        }
-        return async_ctx.error_code.load();
-    }
-
-    // Check if all chunks completed
-    if (async_ctx.completed_chunks.load() >= async_ctx.total_chunks.load() &&
-        async_ctx.post_finished.load()) {
-        async_ctx.finished.store(true);
-        if (async_ctx.poll_thread.joinable()) {
-            async_ctx.poll_thread.join();
-        }
-        return MPCOMM_SUCCESS;
-    }
-
-    // Still in progress
-    return MPCOMM_ERR_TIMEOUT;
-}
-
-int MPComm::waitAsyncCompletion(NicContext &ctx, AsyncRdmaContext &async_ctx,
-                                int timeout_ms) {
-    (void)ctx;  // Poll thread already polls the CQ
-    
-    if (async_ctx.finished.load()) {
-        if (async_ctx.poll_thread.joinable()) {
-            async_ctx.poll_thread.join();
-        }
-        return async_ctx.error_code.load();
-    }
-
-    auto start = std::chrono::steady_clock::now();
-
-    while (!async_ctx.finished.load()) {
-        // Check if all chunks completed
-        if (async_ctx.completed_chunks.load() >= async_ctx.total_chunks.load() &&
-            async_ctx.post_finished.load()) {
-            async_ctx.finished.store(true);
-            break;
-        }
-
-        // Check for errors
-        int err = async_ctx.error_code.load();
-        if (err != 0) {
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return err;
-        }
-
-        // Check timeout
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - start).count();
-        if (elapsed >= timeout_ms) {
-            fprintf(stderr, "MPComm: Async wait timeout after %dms, "
-                    "completed=%zu/%zu, posted=%zu\n",
-                    timeout_ms, async_ctx.completed_chunks.load(),
-                    async_ctx.total_chunks.load(), async_ctx.posted_chunks.load());
-            async_ctx.error_code.store(MPCOMM_ERR_TIMEOUT);
-            async_ctx.finished.store(true);
-            if (async_ctx.poll_thread.joinable()) {
-                async_ctx.poll_thread.join();
-            }
-            return MPCOMM_ERR_TIMEOUT;
-        }
-
-        // Brief yield
-        std::this_thread::yield();
-    }
-
-    // Join poll thread
-    if (async_ctx.poll_thread.joinable()) {
-        async_ctx.poll_thread.join();
-    }
-
-    return async_ctx.error_code.load();
-}
-
 struct ibv_qp *MPComm::getOrCreateQP(size_t local_nic_index,
                                      const std::string &remote_host_id,
                                      size_t remote_nic_index,
@@ -2612,7 +2990,9 @@ struct ibv_qp *MPComm::getOrCreateQP(size_t local_nic_index,
     }
 
     auto &ctx = *nic_contexts_[local_nic_index];
-    std::string key = remote_host_id + ":" + std::to_string(remote_nic_index);
+    // New key format: "host_id:local_nic:remote_nic" for NUMA-aware connections
+    std::string key = remote_host_id + ":" + std::to_string(local_nic_index) + 
+                      ":" + std::to_string(remote_nic_index);
 
     std::lock_guard<std::mutex> lock(ctx.qp_mutex);
     auto it = ctx.qp_map.find(key);
@@ -2630,309 +3010,67 @@ struct ibv_qp *MPComm::getOrCreateQP(size_t local_nic_index,
     return nullptr;  // QP should be created during connect()
 }
 
-// ============================================================================
-// Scatter / Gather Implementation
-// ============================================================================
+// ==================== Async Transfer Implementation ====================
 
-int MPComm::transferImpl(uintptr_t local_addr,
-                         const std::vector<std::string> &host_list,
-                         const std::vector<uintptr_t> &remote_addrs,
-                         const std::vector<size_t> &lengths,
-                         int num_threads,
-                         TransferDirection direction) {
-    // Transfer operation name for logging
-    const char* op_name = (direction == TransferDirection::SCATTER) ? "Scatter" : "Gather";
-    
-    // Timing: function entry
-    auto t_start = std::chrono::steady_clock::now();
-    
-    if (!initialized_) return MPCOMM_ERR_CONTEXT;
-    
-    size_t host_count = host_list.size();
-    if (host_count == 0 || remote_addrs.size() != host_count ||
-        lengths.size() != host_count) {
-        return MPCOMM_ERR_INVALID_ARG;
-    }
-
-    // Timing: after validation
-    auto t_after_validation = std::chrono::steady_clock::now();
-
-    // Thread count: use user-specified value, default to NIC count
-    size_t num_nics = nic_contexts_.size();
-    size_t actual_num_threads = (num_threads > 0) ? static_cast<size_t>(num_threads) : num_nics;
-    
-    // Each thread is assigned a NIC in round-robin fashion:
-    // thread 0 -> NIC 0, thread 1 -> NIC 1, thread 2 -> NIC 0, ...
-    auto getThreadNic = [num_nics](size_t thread_id) -> size_t {
-        return thread_id % num_nics;
-    };
-
-    // Prepare transfer sub-tasks: each host transfer is split across all threads
-    // Each thread handles a portion of the data using its assigned NIC
-    struct TransferSubTask {
-        std::string host_id;
-        uintptr_t local_chunk_addr;
-        uintptr_t remote_addr;
-        size_t length;
-        size_t thread_id;   // Which thread handles this sub-task
-        size_t nic_index;   // Which NIC to use (derived from thread_id)
-    };
-
-    // Create sub-tasks: for each host, split data across all threads
-    std::vector<TransferSubTask> tasks;
-    tasks.reserve(host_count * actual_num_threads);
-
-    size_t local_offset = 0;
-    for (size_t i = 0; i < host_count; ++i) {
-        size_t total_len = lengths[i];
-        size_t per_thread_len = total_len / actual_num_threads;
-        size_t remainder = total_len % actual_num_threads;
-        
-        size_t host_local_offset = 0;
-        for (size_t tid = 0; tid < actual_num_threads; ++tid) {
-            TransferSubTask task;
-            task.host_id = host_list[i];
-            // Distribute remainder to first threads
-            size_t this_len = per_thread_len + (tid < remainder ? 1 : 0);
-            if (this_len == 0) continue;  // Skip if no data for this thread
-            
-            task.local_chunk_addr = local_addr + local_offset + host_local_offset;
-            task.remote_addr = remote_addrs[i] + host_local_offset;
-            task.length = this_len;
-            task.thread_id = tid;
-            task.nic_index = getThreadNic(tid);
-            tasks.push_back(std::move(task));
-            host_local_offset += this_len;
-        }
-        local_offset += lengths[i];
-    }
-
-    // Timing: after task preparation
-    auto t_after_task_prep = std::chrono::steady_clock::now();
-
-    // Get remote rkey (from connection info)
-    auto getRkey = [this](const std::string &host_id, size_t nic_index) -> uint32_t {
-        std::lock_guard<std::mutex> lock(connections_mutex_);
-        auto it = connections_.find(host_id);
-        if (it == connections_.end()) return 0;
-        if (nic_index >= it->second.nic_endpoints.size()) return 0;
-        return it->second.nic_endpoints[nic_index].rkey;
-    };
-
-    // Atomic error flag
-    std::atomic<int> global_error{0};
-
-    // Per-thread statistics
-    struct ThreadStats {
-        size_t thread_id;
-        std::string nic_name;
-        size_t total_bytes;
-        double elapsed_ms;
-        double bandwidth_gbps;
-    };
-    std::vector<ThreadStats> thread_stats(actual_num_threads);
-    std::mutex stats_mutex;
-
-    // Worker function: each thread handles all sub-tasks assigned to it
-    // Using synchronous Post-Poll loop (no separate poll thread)
-    auto workerFunc = [this, &tasks, &global_error, &getRkey, &thread_stats,
-                       &stats_mutex, actual_num_threads, &getThreadNic, direction, op_name](size_t thread_id) {
-        // Record start time
-        auto start_time = std::chrono::steady_clock::now();
-        size_t nic_index = getThreadNic(thread_id);
-        std::string nic_name = nic_contexts_[nic_index]->device_name;
-        size_t total_bytes = 0;
-
-        for (size_t i = 0; i < tasks.size() && global_error == 0; ++i) {
-            auto &task = tasks[i];
-            // Each thread only handles sub-tasks assigned to it
-            if (task.thread_id != thread_id) continue;
-            
-            nic_index = task.nic_index;
-            auto &ctx = *nic_contexts_[nic_index];
-
-            // Get lkey
-            uint32_t lkey = getLkey(nic_index,
-                                    reinterpret_cast<void *>(task.local_chunk_addr));
-            if (lkey == 0) {
-                fprintf(stderr, "MPComm: No lkey for address %p\n",
-                        reinterpret_cast<void *>(task.local_chunk_addr));
-                global_error = MPCOMM_ERR_MEMORY;
-                return;
-            }
-
-            // Get rkey
-            uint32_t rkey = getRkey(task.host_id, nic_index);
-            if (rkey == 0) {
-                fprintf(stderr, "MPComm: No rkey for %s\n",
-                        task.host_id.c_str());
-                global_error = MPCOMM_ERR_CONNECTION;
-                return;
-            }
-
-            printf("MPComm: %s sub-task %zu: host=%s, thread=%zu, nic=%zu, "
-                   "local=%p, remote=0x%lx, len=%zu, lkey=%u, rkey=%u\n",
-                   op_name, i, task.host_id.c_str(), thread_id, nic_index,
-                   reinterpret_cast<void *>(task.local_chunk_addr),
-                   task.remote_addr, task.length, lkey, rkey);
-
-            // Synchronous RDMA operation with Post-Poll loop
-            int ret;
-            if (direction == TransferDirection::SCATTER) {
-                ret = rdmaWriteSyncMultiQP(ctx, task.host_id, nic_index,
-                                           reinterpret_cast<void *>(task.local_chunk_addr),
-                                           lkey, task.remote_addr, rkey, task.length);
-            } else {
-                ret = rdmaReadSyncMultiQP(ctx, task.host_id, nic_index,
-                                          reinterpret_cast<void *>(task.local_chunk_addr),
-                                          lkey, task.remote_addr, rkey, task.length);
-            }
-            if (ret != 0) {
-                global_error = ret;
-                return;
-            }
-            total_bytes += task.length;
-        }
-
-        // Record end time and calculate statistics
-        auto end_time = std::chrono::steady_clock::now();
-        double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-        double bandwidth_gbps = (total_bytes * 8.0) / (elapsed_ms * 1e6);  // Gbps
-
-        // Store stats
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex);
-            thread_stats[thread_id].thread_id = thread_id;
-            thread_stats[thread_id].nic_name = nic_name;
-            thread_stats[thread_id].total_bytes = total_bytes;
-            thread_stats[thread_id].elapsed_ms = elapsed_ms;
-            thread_stats[thread_id].bandwidth_gbps = bandwidth_gbps;
-        }
-    };
-
-    // Timing: after lambda definitions
-    auto t_after_lambda = std::chrono::steady_clock::now();
-
-    // Submit tasks to thread pool
-    size_t pool_size = thread_pool_->size();
-    for (size_t tid = 0; tid < actual_num_threads; ++tid) {
-        size_t worker_id = tid % pool_size;
-        thread_pool_->submitToThread(worker_id, [&workerFunc, tid]() {
-            workerFunc(tid);
-        });
-    }
-
-    // Timing: after submit
-    auto t_after_submit = std::chrono::steady_clock::now();
-
-    // Wait for all tasks to complete
-    thread_pool_->waitAll();
-
-    // Timing: after wait
-    auto t_after_wait = std::chrono::steady_clock::now();
-
-    // Print per-thread statistics
-    printf("\n========== %s Statistics ==========\n", op_name);
-    printf("%-8s %-20s %15s %12s %12s\n", 
-           "Thread", "NIC", "Bytes", "Time(ms)", "BW(Gbps)");
-    printf("--------------------------------------------------------\n");
-    size_t total_bytes_all = 0;
-    double max_elapsed_ms = 0.0;
-    for (const auto &stat : thread_stats) {
-        printf("%-8zu %-20s %15zu %12.2f %12.2f\n",
-               stat.thread_id, stat.nic_name.c_str(), stat.total_bytes,
-               stat.elapsed_ms, stat.bandwidth_gbps);
-        total_bytes_all += stat.total_bytes;
-        if (stat.elapsed_ms > max_elapsed_ms) {
-            max_elapsed_ms = stat.elapsed_ms;
-        }
-    }
-    double total_bandwidth_gbps = (total_bytes_all * 8.0) / (max_elapsed_ms * 1e6);
-    printf("--------------------------------------------------------\n");
-    printf("%-8s %-20s %15zu %12.2f %12.2f\n",
-           "Total", "-", total_bytes_all, max_elapsed_ms, total_bandwidth_gbps);
-    printf("=========================================\n\n");
-
-    // Timing: after print stats
-    auto t_end = std::chrono::steady_clock::now();
-
-    // Print overhead timing (in microseconds)
-    auto us = [](auto start, auto end) {
-        return std::chrono::duration<double, std::micro>(end - start).count();
-    };
-    printf("========== %s Overhead (us) ==========\n", op_name);
-    printf("  Validation:        %10.2f us\n", us(t_start, t_after_validation));
-    printf("  Task preparation:  %10.2f us\n", us(t_after_validation, t_after_task_prep));
-    printf("  Lambda definition: %10.2f us\n", us(t_after_task_prep, t_after_lambda));
-    printf("  Thread pool submit:%10.2f us\n", us(t_after_lambda, t_after_submit));
-    printf("  Worker execution:  %10.2f us\n", us(t_after_submit, t_after_wait));
-    printf("  Print stats:       %10.2f us\n", us(t_after_wait, t_end));
-    printf("  -----------------------------------\n");
-    printf("  Total overhead:    %10.2f us (excl. worker)\n", 
-           us(t_start, t_after_submit) + us(t_after_wait, t_end));
-    printf("  Total function:    %10.2f us\n", us(t_start, t_end));
-    printf("===========================================\n\n");
-
-    return global_error.load();
+TransferHandle MPComm::scatterAsync(uintptr_t local_addr,
+                                    const std::vector<std::string> &host_list,
+                                    const std::vector<uintptr_t> &remote_addrs,
+                                    const std::vector<size_t> &lengths) {
+    return transferAsyncStart(local_addr, host_list, remote_addrs, lengths,
+                              TransferDirection::SCATTER);
 }
 
-int MPComm::transferImplDynamic(uintptr_t local_addr,
-                                const std::vector<std::string> &host_list,
-                                const std::vector<uintptr_t> &remote_addrs,
-                                const std::vector<size_t> &lengths,
-                                TransferDirection direction) {
-    // Transfer operation name for logging
-    const char* op_name = (direction == TransferDirection::SCATTER) ? "ScatterDynamic" : "GatherDynamic";
+TransferHandle MPComm::gatherAsync(uintptr_t local_addr,
+                                   const std::vector<std::string> &host_list,
+                                   const std::vector<uintptr_t> &remote_addrs,
+                                   const std::vector<size_t> &lengths) {
+    return transferAsyncStart(local_addr, host_list, remote_addrs, lengths,
+                              TransferDirection::GATHER);
+}
+
+TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
+                                          const std::vector<std::string> &host_list,
+                                          const std::vector<uintptr_t> &remote_addrs,
+                                          const std::vector<size_t> &lengths,
+                                          TransferDirection direction) {
+    const char* op_name = (direction == TransferDirection::SCATTER) ? "ScatterAsync" : "GatherAsync";
     
-    // Timing: function entry
-    auto t_start = std::chrono::steady_clock::now();
-    
-    if (!initialized_) return MPCOMM_ERR_CONTEXT;
+    // Validation
+    if (!initialized_) {
+        fprintf(stderr, "MPComm: %s failed - not initialized\n", op_name);
+        return INVALID_TRANSFER_HANDLE;
+    }
     
     size_t host_count = host_list.size();
     if (host_count == 0 || remote_addrs.size() != host_count ||
         lengths.size() != host_count) {
-        return MPCOMM_ERR_INVALID_ARG;
+        fprintf(stderr, "MPComm: %s failed - invalid arguments\n", op_name);
+        return INVALID_TRANSFER_HANDLE;
     }
 
     size_t num_nics = nic_contexts_.size();
     if (num_nics == 0) {
-        return MPCOMM_ERR_DEVICE;
+        fprintf(stderr, "MPComm: %s failed - no NICs available\n", op_name);
+        return INVALID_TRANSFER_HANDLE;
     }
 
-    // Timing: after validation
-    auto t_after_validation = std::chrono::steady_clock::now();
-
-    // Get remote rkey (from connection info)
-    auto getRkey = [this](const std::string &host_id, size_t nic_index) -> uint32_t {
-        std::lock_guard<std::mutex> lock(connections_mutex_);
-        auto it = connections_.find(host_id);
-        if (it == connections_.end()) return 0;
-        if (nic_index >= it->second.nic_endpoints.size()) return 0;
-        return it->second.nic_endpoints[nic_index].rkey;
-    };
-
-    // Prepare all chunks from all hosts
-    // Optimized: use host_idx instead of string copy, direct index assignment
-    struct ChunkTask {
-        size_t host_idx;        // Index into host_list (avoid string copy)
-        uintptr_t local_addr;
-        uintptr_t remote_addr;
-        size_t length;
-    };
+    // Create transfer context
+    auto ctx = std::make_unique<TransferContext>();
+    ctx->handle = next_transfer_handle_.fetch_add(1);
+    ctx->local_addr = local_addr;
+    ctx->host_list = host_list;
+    ctx->remote_addrs = remote_addrs;
+    ctx->lengths = lengths;
+    ctx->is_scatter = (direction == TransferDirection::SCATTER);
+    ctx->start_time = std::chrono::steady_clock::now();
     
-    // Pre-calculate total number of chunks and per-host chunk start indices
+    // Prepare all chunks (same logic as transferImplDynamic)
     const size_t max_chunk_size = max_rdma_transfer_size_;
     size_t total_chunks = 0;
     
-    // Fast path: pre-compute chunk counts and local offsets per host
-    // Use stack allocation for small host counts to avoid heap allocation
-    constexpr size_t STACK_THRESHOLD = 64;
-    size_t stack_chunk_starts[STACK_THRESHOLD];
-    size_t stack_local_offsets[STACK_THRESHOLD];
-    
-    size_t* host_chunk_starts = (host_count <= STACK_THRESHOLD) ? stack_chunk_starts : new size_t[host_count];
-    size_t* host_local_offsets = (host_count <= STACK_THRESHOLD) ? stack_local_offsets : new size_t[host_count];
+    // Calculate total chunks and local offsets
+    std::vector<size_t> host_chunk_starts(host_count);
+    std::vector<size_t> host_local_offsets(host_count);
     
     size_t running_local_offset = 0;
     for (size_t i = 0; i < host_count; ++i) {
@@ -2942,20 +3080,33 @@ int MPComm::transferImplDynamic(uintptr_t local_addr,
         running_local_offset += lengths[i];
     }
     
-    // Allocate chunk array and fill directly by index (no push_back overhead)
-    std::vector<ChunkTask> all_chunks(total_chunks);  // Default construct all at once
+    // Handle empty transfer
+    if (total_chunks == 0) {
+        ctx->total_chunks.store(0);
+        ctx->total_completed.store(0);
+        ctx->finished.store(true);
+        ctx->error_code.store(MPCOMM_SUCCESS);
+        ctx->end_time = std::chrono::steady_clock::now();
+        
+        TransferHandle handle = ctx->handle;
+        {
+            std::lock_guard<std::mutex> lock(transfers_mutex_);
+            active_transfers_[handle] = std::move(ctx);
+        }
+        return handle;
+    }
     
-    // Fill chunks using direct index assignment (cache-friendly linear write)
+    // Fill chunks
+    ctx->all_chunks.resize(total_chunks);
     for (size_t host_idx = 0; host_idx < host_count; ++host_idx) {
         const size_t host_len = lengths[host_idx];
         const uintptr_t base_local = local_addr + host_local_offsets[host_idx];
         const uintptr_t base_remote = remote_addrs[host_idx];
         size_t chunk_idx = host_chunk_starts[host_idx];
         
-        // Process full chunks (no min calculation needed)
         size_t full_chunks = host_len / max_chunk_size;
         for (size_t i = 0; i < full_chunks; ++i) {
-            all_chunks[chunk_idx++] = {
+            ctx->all_chunks[chunk_idx++] = {
                 host_idx,
                 base_local + i * max_chunk_size,
                 base_remote + i * max_chunk_size,
@@ -2963,10 +3114,9 @@ int MPComm::transferImplDynamic(uintptr_t local_addr,
             };
         }
         
-        // Process remainder chunk if any
         size_t remainder = host_len % max_chunk_size;
         if (remainder > 0) {
-            all_chunks[chunk_idx] = {
+            ctx->all_chunks[chunk_idx] = {
                 host_idx,
                 base_local + full_chunks * max_chunk_size,
                 base_remote + full_chunks * max_chunk_size,
@@ -2975,301 +3125,487 @@ int MPComm::transferImplDynamic(uintptr_t local_addr,
         }
     }
     
-    // Clean up heap allocation if used
-    if (host_count > STACK_THRESHOLD) {
-        delete[] host_chunk_starts;
-        delete[] host_local_offsets;
-    }
-    if (total_chunks == 0) {
-        return MPCOMM_SUCCESS;
-    }
-
-    // Timing: after chunk preparation
-    auto t_after_chunk_prep = std::chrono::steady_clock::now();
-
-    printf("MPComm: %s with %zu chunks across %zu NICs (dynamic load balancing)\n",
-           op_name, total_chunks, num_nics);
-
-    // Per-NIC flow control state
-    // Flow control parameters
-    const size_t max_outstanding_per_nic = 256 * qps_per_connection_;  // Total outstanding per NIC
-    const int poll_batch_size = 32;
+    ctx->total_chunks.store(total_chunks);
+    ctx->next_chunk_idx.store(0);
     
-    std::vector<size_t> per_nic_posted(num_nics, 0);
-    std::vector<size_t> per_nic_completed(num_nics, 0);
-    std::vector<size_t> per_nic_bytes(num_nics, 0);  // For statistics
+    // NUMA-aware NIC selection
+    int memory_numa_node = getNumaNodeForAddr(reinterpret_cast<void*>(local_addr));
+    ctx->candidate_nic_indices = getLocalNicIndicesForNuma(memory_numa_node);
     
-    // Per-NIC per-QP counters for proper QP flow control
-    // per_nic_qp_posted[nic][qp] = number of WRs posted to that QP
-    std::vector<std::vector<size_t>> per_nic_qp_posted(num_nics);
-    std::vector<std::vector<size_t>> per_nic_qp_completed(num_nics);
+    if (ctx->candidate_nic_indices.empty()) {
+        ctx->candidate_nic_indices.reserve(num_nics);
+        for (size_t i = 0; i < num_nics; ++i) {
+            ctx->candidate_nic_indices.push_back(i);
+        }
+    }
+    
+    // Initialize per-NIC flow control state
+    ctx->per_nic_posted.resize(num_nics, 0);
+    ctx->per_nic_completed.resize(num_nics, 0);
+    ctx->per_nic_bytes.resize(num_nics, 0);
+    ctx->per_nic_qp_posted.resize(num_nics);
+    ctx->per_nic_qp_completed.resize(num_nics);
     for (size_t nic = 0; nic < num_nics; ++nic) {
-        per_nic_qp_posted[nic].resize(qps_per_connection_, 0);
-        per_nic_qp_completed[nic].resize(qps_per_connection_, 0);
+        ctx->per_nic_qp_posted[nic].resize(qps_per_connection_, 0);
+        ctx->per_nic_qp_completed[nic].resize(qps_per_connection_, 0);
     }
     
-    // Work completion array for polling
-    struct ibv_wc wc_array[32];
+    printf("MPComm: %s started with %zu chunks across %zu candidate NICs (handle=%lu)\n",
+           op_name, total_chunks, ctx->candidate_nic_indices.size(), ctx->handle);
     
-    // Track total completions
-    size_t total_completed = 0;
+    // Post initial chunks (synchronously post all, then return)
+    // This is "Mode A": sync post + async poll
+    TransferHandle handle = ctx->handle;
+    TransferContext* ctx_ptr = ctx.get();  // Keep raw pointer before moving
     
-    // Timing: start of transfer
-    auto t_transfer_start = std::chrono::steady_clock::now();
+    // Store context first so progress can access it
+    {
+        std::lock_guard<std::mutex> lock(transfers_mutex_);
+        active_transfers_[handle] = std::move(ctx);
+    }
     
-    // Dynamic NIC selection: choose NIC that can accept work AND has highest throughput
-    // Strategy: Among NICs with available slots, prefer the one with highest completion rate
-    // (i.e., completed more chunks relative to posted). This naturally favors faster NICs.
-    size_t rr_nic_index = 0;  // Round-robin fallback index
+    // Post all chunks now (blocking post, but fast)
+    // The actual transfer happens in the background via RDMA
+    // NOTE: Must not hold transfers_mutex_ while calling transferAsyncProgress
+    //       because it calls pollAllNicsForAsync which may need to acquire the lock
+    int ret = transferAsyncProgress(*ctx_ptr);
+    // If error during initial post, mark as finished with error
+    if (ret != MPCOMM_SUCCESS && ret != MPCOMM_ERR_PENDING) {
+        ctx_ptr->error_code.store(ret);
+        ctx_ptr->finished.store(true);
+    }
     
-    auto selectBestNic = [&]() -> size_t {
-        size_t best_nic = num_nics;  // Invalid initially
-        size_t max_available = 0;
+    return handle;
+}
+
+size_t MPComm::selectBestNicForAsync(TransferContext& ctx) {
+    size_t num_nics = nic_contexts_.size();
+    size_t num_candidate_nics = ctx.candidate_nic_indices.size();
+    const size_t max_outstanding_per_nic = 256 * qps_per_connection_;
+    
+    size_t best_nic = num_nics;  // Invalid initially
+    size_t min_outstanding = SIZE_MAX;
+    
+    for (size_t idx = 0; idx < num_candidate_nics; ++idx) {
+        size_t nic = ctx.candidate_nic_indices[idx];
+        size_t outstanding = ctx.per_nic_posted[nic] - ctx.per_nic_completed[nic];
         
-        for (size_t nic = 0; nic < num_nics; ++nic) {
-            size_t outstanding = per_nic_posted[nic] - per_nic_completed[nic];
-            
-            // Skip NICs that are full
-            if (outstanding >= max_outstanding_per_nic) {
-                continue;
-            }
-            
-            // Select NIC with most available slots
-            size_t available = max_outstanding_per_nic - outstanding;
-            if (available > max_available) {
-                max_available = available;
+        if (outstanding >= max_outstanding_per_nic) {
+            continue;
+        }
+        
+        if (outstanding < min_outstanding) {
+            min_outstanding = outstanding;
+            best_nic = nic;
+        } else if (outstanding == min_outstanding) {
+            if (idx == (ctx.rr_nic_index % num_candidate_nics)) {
                 best_nic = nic;
             }
         }
-        
-        // Fallback to round-robin if no NIC found (all full)
-        if (best_nic == num_nics) {
-            best_nic = rr_nic_index % num_nics;
-            rr_nic_index++;
-        }
-        
-        return best_nic;
-    };
+    }
     
-    // Poll all NICs for completions
-    auto pollAllNics = [&]() -> int {
-        for (size_t nic = 0; nic < num_nics; ++nic) {
-            auto &ctx = *nic_contexts_[nic];
-            int n = ibv_poll_cq(ctx.cq, poll_batch_size, wc_array);
-            if (n < 0) {
-                fprintf(stderr, "MPComm: ibv_poll_cq failed on NIC %zu in %s\n", nic, op_name);
-                return MPCOMM_ERR_TRANSFER;
-            }
-            for (int i = 0; i < n; ++i) {
-                if (wc_array[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "MPComm: WC error on NIC %zu in %s: status=%d, wr_id=0x%lx\n",
-                            nic, op_name, wc_array[i].status, wc_array[i].wr_id);
+    ctx.rr_nic_index++;
+    
+    if (best_nic == num_nics) {
+        best_nic = ctx.candidate_nic_indices[(ctx.rr_nic_index - 1) % num_candidate_nics];
+    }
+    
+    return best_nic;
+}
+
+int MPComm::pollAllNicsForAsync(TransferContext& ctx) {
+    // Poll only candidate NICs for better performance in single-transfer scenarios
+    // When parallel transfers share the same NICs, completions will still be properly routed
+    // because we poll CQs (shared per NIC) and decode the transfer handle from wr_id
+    const int poll_batch_size = 64;  // Increased batch size for better efficiency
+    struct ibv_wc wc_array[64];
+    size_t num_nics = nic_contexts_.size();
+    size_t num_candidate_nics = ctx.candidate_nic_indices.size();
+    
+    // Poll only candidate NICs for better performance
+    for (size_t idx = 0; idx < num_candidate_nics; ++idx) {
+        size_t nic = ctx.candidate_nic_indices[idx];
+        auto &nic_ctx = *nic_contexts_[nic];
+        int n = ibv_poll_cq(nic_ctx.cq, poll_batch_size, wc_array);
+        if (n < 0) {
+            fprintf(stderr, "MPComm: ibv_poll_cq failed on NIC %zu in async transfer\n", nic);
+            return MPCOMM_ERR_TRANSFER;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (wc_array[i].status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "MPComm: WC error on NIC %zu in async transfer: status=%d, wr_id=0x%lx\n",
+                        nic, wc_array[i].status, wc_array[i].wr_id);
+                // Mark error on the transfer that owns this completion
+                TransferHandle wc_handle = WrIdEncoding::decodeHandle(wc_array[i].wr_id);
+                if (wc_handle == ctx.handle) {
                     return MPCOMM_ERR_TRANSFER;
                 }
-                // Decode nic_index and qp_index from wr_id
-                // wr_id format: (nic_index << 56) | (qp_index << 48) | addr_part
-                size_t completed_nic = (wc_array[i].wr_id >> 56) & 0xFF;
-                size_t completed_qp = (wc_array[i].wr_id >> 48) & 0xFF;
-                
+                // Error belongs to another transfer, mark it there
+                std::lock_guard<std::mutex> lock(transfers_mutex_);
+                auto it = active_transfers_.find(wc_handle);
+                if (it != active_transfers_.end()) {
+                    it->second->error_code.store(MPCOMM_ERR_TRANSFER);
+                    it->second->finished.store(true);
+                }
+                continue;
+            }
+            
+            // Decode nic_index, qp_index, and transfer_handle from wr_id
+            size_t completed_nic = WrIdEncoding::decodeNic(wc_array[i].wr_id);
+            size_t completed_qp = WrIdEncoding::decodeQp(wc_array[i].wr_id);
+            TransferHandle wc_handle = WrIdEncoding::decodeHandle(wc_array[i].wr_id);
+            
+            // Route completion to the correct TransferContext
+            if (wc_handle == ctx.handle) {
+                // Completion belongs to current context
                 if (completed_nic < num_nics) {
-                    per_nic_completed[completed_nic]++;
+                    ctx.per_nic_completed[completed_nic]++;
                     if (completed_qp < qps_per_connection_) {
-                        per_nic_qp_completed[completed_nic][completed_qp]++;
+                        ctx.per_nic_qp_completed[completed_nic][completed_qp]++;
                     }
                 }
-                total_completed++;
+                ctx.total_completed.fetch_add(1);
+            } else {
+                // Completion belongs to another transfer - route it there
+                std::lock_guard<std::mutex> lock(transfers_mutex_);
+                auto it = active_transfers_.find(wc_handle);
+                if (it != active_transfers_.end()) {
+                    TransferContext* other_ctx = it->second.get();
+                    if (completed_nic < num_nics) {
+                        other_ctx->per_nic_completed[completed_nic]++;
+                        if (completed_qp < qps_per_connection_) {
+                            other_ctx->per_nic_qp_completed[completed_nic][completed_qp]++;
+                        }
+                    }
+                    other_ctx->total_completed.fetch_add(1);
+                }
+                // If transfer not found, completion is orphaned (transfer already released)
+                // This is OK - just ignore it
             }
         }
-        return MPCOMM_SUCCESS;
-    };
-
-    // Variables for proactive polling
-    size_t posts_since_last_poll = 0;  // Counter for proactive poll interval
-    size_t prev_completed = 0;         // For detecting progress in blocking wait
-
-    // Post all chunks with dynamic NIC selection
-    for (size_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
-        auto &chunk = all_chunks[chunk_idx];
-        
-        // Poll to make room if all NICs are full
-        while (true) {
-            // Try to find a NIC with available slots
-            size_t best_nic = selectBestNic();
-            size_t outstanding = per_nic_posted[best_nic] - per_nic_completed[best_nic];
-            
-            if (outstanding < max_outstanding_per_nic) {
-                // Found a NIC with available slots
-                // Select QP using round-robin within this NIC
-                size_t qp_index = per_nic_posted[best_nic] % qps_per_connection_;
-                
-                // Get lkey for this NIC
-                uint32_t lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
-                if (lkey == 0) {
-                    fprintf(stderr, "MPComm: No lkey for address %p on NIC %zu\n",
-                            reinterpret_cast<void *>(chunk.local_addr), best_nic);
-                    return MPCOMM_ERR_MEMORY;
-                }
-                
-                // Get rkey for this NIC
-                const std::string& host_id = host_list[chunk.host_idx];
-                uint32_t rkey = getRkey(host_id, best_nic);
-                if (rkey == 0) {
-                    fprintf(stderr, "MPComm: No rkey for %s on NIC %zu\n",
-                            host_id.c_str(), best_nic);
-                    return MPCOMM_ERR_CONNECTION;
-                }
-                
-                // Get QP
-                struct ibv_qp *qp = getOrCreateQP(best_nic, host_id, best_nic, qp_index);
-                if (!qp) {
-                    fprintf(stderr, "MPComm: No QP for %s on NIC %zu (qp_index=%zu)\n",
-                            host_id.c_str(), best_nic, qp_index);
-                    return MPCOMM_ERR_CONNECTION;
-                }
-                
-                // Prepare SGE and WR
-                struct ibv_sge sge;
-                memset(&sge, 0, sizeof(sge));
-                sge.addr = chunk.local_addr;
-                sge.length = static_cast<uint32_t>(chunk.length);
-                sge.lkey = lkey;
-                
-                struct ibv_send_wr wr;
-                memset(&wr, 0, sizeof(wr));
-                // Encode nic_index and qp_index in wr_id for completion tracking
-                // wr_id format: (nic_index << 56) | (qp_index << 48) | addr_part
-                uint64_t addr_part = chunk.local_addr & 0x0000FFFFFFFFFFFFULL;
-                wr.wr_id = (static_cast<uint64_t>(best_nic) << 56) | 
-                           (static_cast<uint64_t>(qp_index) << 48) | addr_part;
-                wr.opcode = (direction == TransferDirection::SCATTER) ? 
-                            IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
-                wr.sg_list = &sge;
-                wr.num_sge = 1;
-                wr.send_flags = IBV_SEND_SIGNALED;
-                wr.wr.rdma.remote_addr = chunk.remote_addr;
-                wr.wr.rdma.rkey = rkey;
-                
-                struct ibv_send_wr *bad_wr = nullptr;
-                int ret = ibv_post_send(qp, &wr, &bad_wr);
-                if (ret != 0) {
-                    fprintf(stderr, "MPComm: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
-                    return MPCOMM_ERR_TRANSFER;
-                }
-                
-                per_nic_posted[best_nic]++;
-                per_nic_qp_posted[best_nic][qp_index]++;
-                per_nic_bytes[best_nic] += chunk.length;
-                posts_since_last_poll++;
-                
-                // Proactive polling: poll after every N posts to release slots early
-                // This improves throughput by keeping the pipeline full
-                constexpr size_t POLL_INTERVAL = 16;  // Poll every 16 posts
-                if (posts_since_last_poll >= POLL_INTERVAL) {
-                    pollAllNics();  // Non-blocking poll, ignore return for proactive polling
-                    posts_since_last_poll = 0;
-                }
-                
-                break;  // Chunk posted successfully, move to next chunk
-            }
-            
-            // All NICs are full, must poll for completions (blocking wait)
-            int poll_ret = pollAllNics();
-            if (poll_ret != MPCOMM_SUCCESS) {
-                return poll_ret;
-            }
-            
-            // If no completions found, yield and retry
-            if (total_completed == prev_completed) {
-                std::this_thread::yield();
-            }
-            prev_completed = total_completed;
-        }
     }
-    
-    // Drain remaining completions
-    while (total_completed < total_chunks) {
-        int poll_ret = pollAllNics();
-        if (poll_ret != MPCOMM_SUCCESS) {
-            return poll_ret;
-        }
-        if (total_completed < total_chunks) {
-            std::this_thread::yield();
-        }
-    }
-    
-    // Timing: end of transfer
-    auto t_transfer_end = std::chrono::steady_clock::now();
-    
-    // Calculate statistics
-    double transfer_ms = std::chrono::duration<double, std::milli>(
-        t_transfer_end - t_transfer_start).count();
-    
-    size_t total_bytes = 0;
-    for (size_t nic = 0; nic < num_nics; ++nic) {
-        total_bytes += per_nic_bytes[nic];
-    }
-    double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
-    
-    // Print per-NIC statistics
-    printf("\n========== %s Statistics (Dynamic Load Balancing) ==========\n", op_name);
-    printf("%-20s %15s %12s %12s %12s\n", 
-           "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
-    printf("------------------------------------------------------------------------\n");
-    for (size_t nic = 0; nic < num_nics; ++nic) {
-        double share_pct = (total_bytes > 0) ? 
-                           (100.0 * per_nic_bytes[nic] / total_bytes) : 0.0;
-        double nic_bandwidth_gbps = (per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
-        printf("%-20s %15zu %12zu %11.1f%% %12.2f\n",
-               nic_contexts_[nic]->device_name.c_str(),
-               per_nic_bytes[nic], per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
-    }
-    printf("------------------------------------------------------------------------\n");
-    printf("%-20s %15zu %12zu %12s %12.2f\n",
-           "Total", total_bytes, total_chunks, "-", total_bandwidth_gbps);
-    printf("Time: %.2f ms\n", transfer_ms);
-    printf("==============================================================\n\n");
-
-    // Timing: after print stats
-    auto t_end = std::chrono::steady_clock::now();
-
-    // Print overhead timing (in microseconds)
-    auto us = [](auto start, auto end) {
-        return std::chrono::duration<double, std::micro>(end - start).count();
-    };
-    printf("========== %s Overhead (us) ==========\n", op_name);
-    printf("  Validation:        %10.2f us\n", us(t_start, t_after_validation));
-    printf("  Chunk preparation: %10.2f us\n", us(t_after_validation, t_after_chunk_prep));
-    printf("  Transfer:          %10.2f us\n", us(t_transfer_start, t_transfer_end));
-    printf("  Print stats:       %10.2f us\n", us(t_transfer_end, t_end));
-    printf("  -----------------------------------\n");
-    printf("  Total function:    %10.2f us\n", us(t_start, t_end));
-    printf("===========================================\n\n");
-
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::scatter(uintptr_t local_addr,
-                    const std::vector<std::string> &host_list,
-                    const std::vector<uintptr_t> &remote_addrs,
-                    const std::vector<size_t> &lengths,
-                    int num_threads) {
-    // Use dynamic load balancing implementation for better performance
-    // num_threads parameter is kept for API compatibility but ignored
-    (void)num_threads;
-    return transferImplDynamic(local_addr, host_list, remote_addrs, lengths,
-                               TransferDirection::SCATTER);
+int MPComm::transferAsyncProgress(TransferContext& ctx) {
+    if (ctx.finished.load()) {
+        return ctx.error_code.load();
+    }
+    
+    const size_t max_outstanding_per_nic = 256 * qps_per_connection_;
+    constexpr size_t kMaxOutstandingPerQP = 256;
+    constexpr size_t kPollInterval = 64;  // Poll after every N posts for better batching
+    
+    size_t total_chunks = ctx.total_chunks.load();
+    size_t posts_since_last_poll = 0;
+    
+    // Cache connection info to avoid repeated lock acquisitions
+    // This is safe because connection info doesn't change during transfer
+    struct NicConnInfo {
+        size_t remote_nic;
+        uint32_t rkey;
+    };
+    std::unordered_map<size_t, NicConnInfo> nic_conn_cache;  // local_nic -> cached info
+    const std::string& host_id = ctx.host_list[0];  // All chunks go to same host in single-target case
+    
+    // Pre-cache connection info for all candidate NICs
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        auto conn_it = connections_.find(host_id);
+        if (conn_it != connections_.end()) {
+            for (size_t local_nic : ctx.candidate_nic_indices) {
+                NicConnInfo info;
+                info.remote_nic = local_nic;  // Default: same index
+                const auto& nic_map = conn_it->second.local_to_remote_nic_map;
+                auto map_it = nic_map.find(local_nic);
+                if (map_it != nic_map.end() && !map_it->second.empty()) {
+                    info.remote_nic = map_it->second[0];
+                }
+                // Get rkey for the first chunk's remote_addr (all chunks share same buffer)
+                info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[0], info.remote_nic);
+                nic_conn_cache[local_nic] = info;
+            }
+        }
+    }
+    
+    // Post remaining chunks
+    while (ctx.next_chunk_idx.load() < total_chunks) {
+        size_t chunk_idx = ctx.next_chunk_idx.load();
+        auto &chunk = ctx.all_chunks[chunk_idx];
+        
+        // Try to find a NIC with available slots (without polling first)
+        size_t best_nic = selectBestNicForAsync(ctx);
+        size_t outstanding = ctx.per_nic_posted[best_nic] - ctx.per_nic_completed[best_nic];
+        
+        // Only poll when NICs are getting full
+        if (outstanding >= max_outstanding_per_nic) {
+            // Poll to make room
+            int poll_ret = pollAllNicsForAsync(ctx);
+            if (poll_ret != MPCOMM_SUCCESS) {
+                return poll_ret;
+            }
+            continue;  // Re-select NIC after polling
+        }
+        
+        // Select QP with lowest outstanding within this NIC
+        size_t qp_index = 0;
+        size_t min_qp_outstanding = SIZE_MAX;
+        bool found_available_qp = false;
+        
+        for (size_t qp = 0; qp < qps_per_connection_; ++qp) {
+            size_t qp_outstanding = ctx.per_nic_qp_posted[best_nic][qp] - 
+                                    ctx.per_nic_qp_completed[best_nic][qp];
+            if (qp_outstanding < kMaxOutstandingPerQP && qp_outstanding < min_qp_outstanding) {
+                min_qp_outstanding = qp_outstanding;
+                qp_index = qp;
+                found_available_qp = true;
+            }
+        }
+        
+        if (!found_available_qp) {
+            // All QPs full, poll and retry
+            pollAllNicsForAsync(ctx);
+            continue;
+        }
+        
+        // Get lkey for this NIC
+        uint32_t lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
+        if (lkey == 0) {
+            fprintf(stderr, "MPComm: No lkey for address %p on NIC %zu\n",
+                    reinterpret_cast<void *>(chunk.local_addr), best_nic);
+            return MPCOMM_ERR_MEMORY;
+        }
+        
+        // Use cached connection info (fast path)
+        auto cache_it = nic_conn_cache.find(best_nic);
+        size_t remote_nic;
+        uint32_t rkey;
+        
+        if (cache_it != nic_conn_cache.end()) {
+            // Fast path: use cached info
+            remote_nic = cache_it->second.remote_nic;
+            rkey = cache_it->second.rkey;
+        } else {
+            // Slow path: lookup from connection (for multi-host case)
+            const std::string& chunk_host_id = ctx.host_list[chunk.host_idx];
+            remote_nic = best_nic;
+            
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                auto it = connections_.find(chunk_host_id);
+                if (it != connections_.end()) {
+                    const auto& nic_map = it->second.local_to_remote_nic_map;
+                    auto map_it = nic_map.find(best_nic);
+                    if (map_it != nic_map.end() && !map_it->second.empty()) {
+                        remote_nic = map_it->second[0];
+                    }
+                    rkey = it->second.getRkeyForAddr(chunk.remote_addr, remote_nic);
+                } else {
+                    rkey = 0;
+                }
+            }
+        }
+        
+        if (rkey == 0) {
+            fprintf(stderr, "MPComm: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
+                    remote_nic, chunk.remote_addr);
+            return MPCOMM_ERR_CONNECTION;
+        }
+        
+        struct ibv_qp *qp = getOrCreateQP(best_nic, host_id, remote_nic, qp_index);
+        if (!qp) {
+            fprintf(stderr, "MPComm: No QP for local NIC %zu -> remote NIC %zu\n",
+                    best_nic, remote_nic);
+            return MPCOMM_ERR_CONNECTION;
+        }
+        
+        // Prepare SGE and WR
+        struct ibv_sge sge;
+        memset(&sge, 0, sizeof(sge));
+        sge.addr = chunk.local_addr;
+        sge.length = static_cast<uint32_t>(chunk.length);
+        sge.lkey = lkey;
+        
+        struct ibv_send_wr wr;
+        memset(&wr, 0, sizeof(wr));
+        // Encode nic_index, qp_index, transfer_handle, and chunk_index in wr_id
+        // This enables routing completions to the correct TransferContext
+        wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
+        wr.opcode = ctx.is_scatter ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = chunk.remote_addr;
+        wr.wr.rdma.rkey = rkey;
+        
+        struct ibv_send_wr *bad_wr = nullptr;
+        int ret = ibv_post_send(qp, &wr, &bad_wr);
+        if (ret != 0) {
+            fprintf(stderr, "MPComm: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
+            return MPCOMM_ERR_TRANSFER;
+        }
+        
+        ctx.per_nic_posted[best_nic]++;
+        ctx.per_nic_qp_posted[best_nic][qp_index]++;
+        ctx.per_nic_bytes[best_nic] += chunk.length;
+        ctx.next_chunk_idx.fetch_add(1);
+        posts_since_last_poll++;
+        
+        // Proactive polling to release slots early (improves pipeline efficiency)
+        if (posts_since_last_poll >= kPollInterval) {
+            pollAllNicsForAsync(ctx);
+            posts_since_last_poll = 0;
+        }
+    }
+    
+    // Check if all completions received
+    if (ctx.total_completed.load() >= total_chunks) {
+        ctx.finished.store(true);
+        ctx.error_code.store(MPCOMM_SUCCESS);
+        ctx.end_time = std::chrono::steady_clock::now();
+        return MPCOMM_SUCCESS;
+    }
+    
+    return MPCOMM_ERR_PENDING;
 }
 
-int MPComm::gather(uintptr_t local_addr,
-                   const std::vector<std::string> &host_list,
-                   const std::vector<uintptr_t> &remote_addrs,
-                   const std::vector<size_t> &lengths,
-                   int num_threads) {
-    // Use dynamic load balancing implementation for better performance
-    // num_threads parameter is kept for API compatibility but ignored
-    (void)num_threads;
-    return transferImplDynamic(local_addr, host_list, remote_addrs, lengths,
-                               TransferDirection::GATHER);
+bool MPComm::isTransferComplete(TransferHandle handle) {
+    TransferContext* ctx_ptr = nullptr;
+    
+    // First, quickly check if transfer exists and get pointer (with lock)
+    {
+        std::lock_guard<std::mutex> lock(transfers_mutex_);
+        auto it = active_transfers_.find(handle);
+        if (it == active_transfers_.end()) {
+            return true;  // Invalid handle is considered "complete"
+        }
+        ctx_ptr = it->second.get();
+        
+        // If already finished, return immediately (still under lock)
+        if (ctx_ptr->finished.load()) {
+            return true;
+        }
+    }
+    // Lock released here - safe to call pollAllNicsForAsync
+    
+    TransferContext& ctx = *ctx_ptr;
+    
+    // Poll for completions (without holding transfers_mutex_)
+    int ret = pollAllNicsForAsync(ctx);
+    if (ret != MPCOMM_SUCCESS) {
+        ctx.error_code.store(ret);
+        ctx.finished.store(true);
+        ctx.end_time = std::chrono::steady_clock::now();
+        return true;
+    }
+    
+    // Check if all completions received
+    size_t total_chunks = ctx.total_chunks.load();
+    if (ctx.total_completed.load() >= total_chunks) {
+        ctx.finished.store(true);
+        ctx.error_code.store(MPCOMM_SUCCESS);
+        ctx.end_time = std::chrono::steady_clock::now();
+        return true;
+    }
+    
+    return false;
 }
+
+int MPComm::waitTransfer(TransferHandle handle, int timeout_ms) {
+    auto start_time = std::chrono::steady_clock::now();
+    
+    while (true) {
+        if (isTransferComplete(handle)) {
+            // Get the error code
+            std::lock_guard<std::mutex> lock(transfers_mutex_);
+            auto it = active_transfers_.find(handle);
+            if (it == active_transfers_.end()) {
+                return MPCOMM_ERR_INVALID_HANDLE;
+            }
+            return it->second->error_code.load();
+        }
+        
+        // Check timeout
+        if (timeout_ms >= 0) {
+            auto elapsed = std::chrono::steady_clock::now() - start_time;
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+            if (elapsed_ms >= timeout_ms) {
+                return MPCOMM_ERR_TIMEOUT;
+            }
+        }
+        
+        // Yield to avoid busy spinning
+        std::this_thread::yield();
+    }
+}
+
+TransferResult MPComm::getTransferResult(TransferHandle handle) {
+    TransferResult result = {MPCOMM_ERR_INVALID_HANDLE, 0, 0.0};
+    
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    auto it = active_transfers_.find(handle);
+    if (it == active_transfers_.end()) {
+        return result;
+    }
+    
+    TransferContext& ctx = *it->second;
+    result.error_code = ctx.error_code.load();
+    
+    // Calculate bytes transferred
+    size_t total_bytes = 0;
+    for (size_t bytes : ctx.per_nic_bytes) {
+        total_bytes += bytes;
+    }
+    result.bytes_transferred = total_bytes;
+    
+    // Calculate elapsed time
+    auto end = ctx.finished.load() ? ctx.end_time : std::chrono::steady_clock::now();
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(end - ctx.start_time).count();
+    
+    return result;
+}
+
+void MPComm::releaseTransfer(TransferHandle handle) {
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    auto it = active_transfers_.find(handle);
+    if (it != active_transfers_.end()) {
+        // Print statistics if transfer was completed
+        TransferContext& ctx = *it->second;
+        if (ctx.finished.load() && ctx.error_code.load() == MPCOMM_SUCCESS) {
+            const char* op_name = ctx.is_scatter ? "ScatterAsync" : "GatherAsync";
+            double transfer_ms = std::chrono::duration<double, std::milli>(
+                ctx.end_time - ctx.start_time).count();
+            
+            size_t total_bytes = 0;
+            for (size_t bytes : ctx.per_nic_bytes) {
+                total_bytes += bytes;
+            }
+            double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
+            
+            printf("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
+            printf("%-20s %15s %12s %12s %12s\n", 
+                   "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
+            printf("------------------------------------------------------------------------\n");
+            size_t num_nics = nic_contexts_.size();
+            for (size_t nic = 0; nic < num_nics; ++nic) {
+                double share_pct = (total_bytes > 0) ? 
+                                   (100.0 * ctx.per_nic_bytes[nic] / total_bytes) : 0.0;
+                double nic_bandwidth_gbps = (ctx.per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
+                printf("%-20s %15zu %12zu %11.1f%% %12.2f\n",
+                       nic_contexts_[nic]->device_name.c_str(),
+                       ctx.per_nic_bytes[nic], ctx.per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
+            }
+            printf("------------------------------------------------------------------------\n");
+            printf("%-20s %15zu %12zu %12s %12.2f\n",
+                   "Total", total_bytes, ctx.total_chunks.load(), "-", total_bandwidth_gbps);
+            printf("Time: %.2f ms\n", transfer_ms);
+            printf("==============================================================\n\n");
+        }
+        
+        active_transfers_.erase(it);
+    }
+}
+
+// ==================== End Async Transfer Implementation ====================
 
 }  // namespace mpcomm

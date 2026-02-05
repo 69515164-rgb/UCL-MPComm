@@ -1948,15 +1948,12 @@ int MPComm::connect(const std::string &remote_host_id,
     
     size_t total_connections = 0;
     
-    // Determine if we need cross-NUMA connections
-    bool need_cross_numa = (actual_remote_numa_count > 1);
+    // Simple suffix-based matching strategy:
+    // Local NIC with suffix N connects to remote NIC with suffix N and N+4 (if they exist)
+    // Example: local mlx5_bond_1 -> remote mlx5_bond_1 + mlx5_bond_5
+    //          local mlx5_bond_2 -> remote mlx5_bond_2 + mlx5_bond_6
     
-    if (need_cross_numa) {
-        printf("MPComm: Remote NICs span %zu NUMA nodes, enabling cross-NUMA connections\n", 
-               actual_remote_numa_count);
-    } else {
-        printf("MPComm: All remote NICs on same NUMA node, using simple suffix-based matching\n");
-    }
+    printf("MPComm: Using suffix-based matching (N -> N and N+4)\n");
     
     for (size_t local_nic = 0; local_nic < num_nics; ++local_nic) {
         auto &ctx = *nic_contexts_[local_nic];
@@ -1966,49 +1963,23 @@ int MPComm::connect(const std::string &remote_host_id,
         // Calculate which remote NICs this local NIC should connect to
         std::vector<size_t> target_remote_nics;
         
-        // Primary: find remote NIC with same suffix
+        // Primary: find remote NIC with same suffix N
         auto it = remote_suffix_to_nics.find(local_suffix);
         if (it != remote_suffix_to_nics.end() && !it->second.empty()) {
-            // Use the first remote NIC with matching suffix as primary
-            size_t primary_remote = it->second[0];
-            target_remote_nics.push_back(primary_remote);
-            
-            // Secondary: only if remote NICs span multiple NUMA nodes
-            // Find remote NICs with same suffix in other NUMA nodes
-            if (need_cross_numa) {
-                int primary_numa = remote_nic_numa[primary_remote];
-                
-                // Find position within its NUMA group
-                size_t position_in_numa = 0;
-                if (primary_numa >= 0) {
-                    const auto& nics_in_numa = remote_numa_to_nics[primary_numa];
-                    for (size_t i = 0; i < nics_in_numa.size(); ++i) {
-                        if (nics_in_numa[i] == primary_remote) {
-                            position_in_numa = i;
-                            break;
-                        }
-                    }
-                }
-                
-                // Connect to corresponding position in each other NUMA node
-                for (const auto& kv : remote_numa_to_nics) {
-                    int numa = kv.first;
-                    if (numa == primary_numa) continue;  // Skip same NUMA
-                    
-                    const auto& nics_in_this_numa = kv.second;
-                    if (!nics_in_this_numa.empty()) {
-                        size_t idx = std::min(position_in_numa, nics_in_this_numa.size() - 1);
-                        size_t candidate_nic = nics_in_this_numa[idx];
-                        if (candidate_nic != primary_remote) {
-                            target_remote_nics.push_back(candidate_nic);
-                        }
-                    }
-                }
-            }
-        } else {
+            target_remote_nics.push_back(it->second[0]);
+        }
+        
+        // Secondary: find remote NIC with suffix N+4
+        int paired_suffix = local_suffix + 4;
+        auto it2 = remote_suffix_to_nics.find(paired_suffix);
+        if (it2 != remote_suffix_to_nics.end() && !it2->second.empty()) {
+            target_remote_nics.push_back(it2->second[0]);
+        }
+        
+        if (target_remote_nics.empty()) {
             // No matching suffix found, skip this local NIC
-            printf("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC, skipping\n",
-                   local_nic, local_name.c_str(), local_suffix);
+            printf("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC (checked %d and %d), skipping\n",
+                   local_nic, local_name.c_str(), local_suffix, local_suffix, paired_suffix);
             continue;
         }
         
@@ -2387,7 +2358,6 @@ void MPComm::acceptLoop() {
                 remote_nic_numa_set.insert(remote_nic_numa[i]);
             }
         }
-        size_t actual_remote_numa_count = remote_nic_numa_set.size();
         
         // Build per-NUMA NIC lists for remote side
         std::map<int, std::vector<size_t>> remote_numa_to_nics;
@@ -2398,83 +2368,36 @@ void MPComm::acceptLoop() {
             }
         }
         
-        bool need_cross_numa = (actual_remote_numa_count > 1);
+        // Build suffix to local NIC mapping for quick lookup
+        std::map<int, size_t> local_suffix_to_nic;
+        for (size_t i = 0; i < num_nics; ++i) {
+            int suffix = extractNicSuffix(nic_contexts_[i]->device_name);
+            if (suffix >= 0) {
+                local_suffix_to_nic[suffix] = i;
+            }
+        }
         
-        printf("MPComm: Passive side: Remote NICs span %zu NUMA node(s), cross-NUMA=%s\n",
-               actual_remote_numa_count, need_cross_numa ? "yes" : "no");
+        printf("MPComm: Passive side: Using suffix-based matching (N -> N and N+4)\n");
         
         // Calculate expected number of connections (must match active side exactly)
-        // Active side iterates by local NIC and finds matching remote NICs by suffix
-        // On passive side, we need to calculate how many remote NICs will match our local NICs
+        // Active side: for each local NIC with suffix N, connects to remote NICs with suffix N and N+4
+        // On passive side, we need to calculate how many remote NICs will connect to us
         size_t expected_connections = 0;
         
         // For each remote NIC (which is the active side's local NIC)
         for (size_t remote_nic = 0; remote_nic < remote_num_nics; ++remote_nic) {
             int remote_suffix = extractNicSuffix(remote_nic_names[remote_nic]);
             
-            // Check if any local NIC has matching suffix
-            bool has_match = false;
-            for (size_t local_nic = 0; local_nic < num_nics; ++local_nic) {
-                int local_suffix = extractNicSuffix(nic_contexts_[local_nic]->device_name);
-                if (local_suffix == remote_suffix && remote_suffix >= 0) {
-                    has_match = true;
-                    break;
-                }
+            // Active side with suffix N will try to connect to local NICs with suffix N and N+4
+            // Count connections where we have matching suffix N (same as remote)
+            if (local_suffix_to_nic.count(remote_suffix) > 0) {
+                expected_connections++;  // Primary: N -> N
             }
             
-            if (!has_match) continue;  // No matching local NIC
-            
-            // Primary connection (same suffix)
-            expected_connections++;
-            
-            // Secondary connections only if need cross-NUMA
-            if (need_cross_numa) {
-                // Find matching local NIC index for this suffix
-                size_t matched_local_nic = SIZE_MAX;
-                for (size_t i = 0; i < num_nics; ++i) {
-                    if (extractNicSuffix(nic_contexts_[i]->device_name) == remote_suffix) {
-                        matched_local_nic = i;
-                        break;
-                    }
-                }
-                
-                if (matched_local_nic != SIZE_MAX) {
-                    int primary_numa = local_nic_numa[matched_local_nic];
-                    size_t position_in_numa = 0;
-                    
-                    // Build local per-NUMA NIC lists
-                    std::map<int, std::vector<size_t>> local_numa_to_nics;
-                    for (size_t i = 0; i < num_nics; ++i) {
-                        int numa = local_nic_numa[i];
-                        if (numa >= 0) {
-                            local_numa_to_nics[numa].push_back(i);
-                        }
-                    }
-                    
-                    if (primary_numa >= 0) {
-                        const auto& nics_in_numa = local_numa_to_nics[primary_numa];
-                        for (size_t i = 0; i < nics_in_numa.size(); ++i) {
-                            if (nics_in_numa[i] == matched_local_nic) {
-                                position_in_numa = i;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    for (const auto& kv : local_numa_to_nics) {
-                        int numa = kv.first;
-                        if (numa == primary_numa) continue;
-                        
-                        const auto& nics_in_this_numa = kv.second;
-                        if (!nics_in_this_numa.empty()) {
-                            size_t idx = std::min(position_in_numa, nics_in_this_numa.size() - 1);
-                            size_t candidate_nic = nics_in_this_numa[idx];
-                            if (candidate_nic != matched_local_nic) {
-                                expected_connections++;
-                            }
-                        }
-                    }
-                }
+            // Count connections where we have suffix N+4 (remote N connects to our N+4)
+            int paired_suffix = remote_suffix + 4;
+            if (local_suffix_to_nic.count(paired_suffix) > 0) {
+                expected_connections++;  // Secondary: N -> N+4
             }
         }
         
@@ -3301,29 +3224,33 @@ int MPComm::transferAsyncProgress(TransferContext& ctx) {
     
     // Cache connection info to avoid repeated lock acquisitions
     // This is safe because connection info doesn't change during transfer
+    // Key: (host_idx << 16) | local_nic, supports multi-host with up to 65536 NICs per host
     struct NicConnInfo {
         size_t remote_nic;
         uint32_t rkey;
     };
-    std::unordered_map<size_t, NicConnInfo> nic_conn_cache;  // local_nic -> cached info
-    const std::string& host_id = ctx.host_list[0];  // All chunks go to same host in single-target case
+    std::unordered_map<uint64_t, NicConnInfo> nic_conn_cache;  // (host_idx, local_nic) -> cached info
     
-    // Pre-cache connection info for all candidate NICs
+    // Pre-cache connection info for all hosts and all candidate NICs
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
-        auto conn_it = connections_.find(host_id);
-        if (conn_it != connections_.end()) {
-            for (size_t local_nic : ctx.candidate_nic_indices) {
-                NicConnInfo info;
-                info.remote_nic = local_nic;  // Default: same index
-                const auto& nic_map = conn_it->second.local_to_remote_nic_map;
-                auto map_it = nic_map.find(local_nic);
-                if (map_it != nic_map.end() && !map_it->second.empty()) {
-                    info.remote_nic = map_it->second[0];
+        for (size_t host_idx = 0; host_idx < ctx.host_list.size(); ++host_idx) {
+            const std::string& host_id = ctx.host_list[host_idx];
+            auto conn_it = connections_.find(host_id);
+            if (conn_it != connections_.end()) {
+                for (size_t local_nic : ctx.candidate_nic_indices) {
+                    NicConnInfo info;
+                    info.remote_nic = local_nic;  // Default: same index
+                    const auto& nic_map = conn_it->second.local_to_remote_nic_map;
+                    auto map_it = nic_map.find(local_nic);
+                    if (map_it != nic_map.end() && !map_it->second.empty()) {
+                        info.remote_nic = map_it->second[0];
+                    }
+                    // Get rkey for this host's remote_addr
+                    info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[host_idx], info.remote_nic);
+                    uint64_t cache_key = (static_cast<uint64_t>(host_idx) << 16) | local_nic;
+                    nic_conn_cache[cache_key] = info;
                 }
-                // Get rkey for the first chunk's remote_addr (all chunks share same buffer)
-                info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[0], info.remote_nic);
-                nic_conn_cache[local_nic] = info;
             }
         }
     }
@@ -3377,7 +3304,9 @@ int MPComm::transferAsyncProgress(TransferContext& ctx) {
         }
         
         // Use cached connection info (fast path)
-        auto cache_it = nic_conn_cache.find(best_nic);
+        size_t host_idx_for_qp = chunk.host_idx;
+        uint64_t cache_key = (static_cast<uint64_t>(host_idx_for_qp) << 16) | best_nic;
+        auto cache_it = nic_conn_cache.find(cache_key);
         size_t remote_nic;
         uint32_t rkey;
         
@@ -3386,8 +3315,8 @@ int MPComm::transferAsyncProgress(TransferContext& ctx) {
             remote_nic = cache_it->second.remote_nic;
             rkey = cache_it->second.rkey;
         } else {
-            // Slow path: lookup from connection (for multi-host case)
-            const std::string& chunk_host_id = ctx.host_list[chunk.host_idx];
+            // Slow path: lookup from connection (cache miss)
+            const std::string& chunk_host_id = ctx.host_list[host_idx_for_qp];
             remote_nic = best_nic;
             
             {
@@ -3412,7 +3341,7 @@ int MPComm::transferAsyncProgress(TransferContext& ctx) {
             return MPCOMM_ERR_CONNECTION;
         }
         
-        struct ibv_qp *qp = getOrCreateQP(best_nic, host_id, remote_nic, qp_index);
+        struct ibv_qp *qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
         if (!qp) {
             fprintf(stderr, "MPComm: No QP for local NIC %zu -> remote NIC %zu\n",
                     best_nic, remote_nic);

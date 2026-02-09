@@ -108,12 +108,6 @@ static constexpr size_t MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE = 1ULL << 30;  // 
 // Higher values can improve throughput by utilizing more hardware parallelism
 static constexpr size_t MPCOMM_DEFAULT_QPS_PER_CONNECTION = 1;
 
-// Get the number of QPs per connection (reads from env var or uses default)
-size_t getQpsPerConnection();
-
-// Get the actual max RDMA transfer size (reads from env var or uses default)
-size_t getMaxRdmaTransferSize();
-
 // NUMA topology information for a single NUMA node
 struct NumaTopology {
     int numa_node;                              // NUMA node ID
@@ -230,15 +224,6 @@ struct ConnectionInfo {
         return 0;
     }
     
-    // Helper: find remote buffer by NUMA node
-    const RemoteBufferEntry* getBufferByNuma(int numa_node) const {
-        for (const auto& [addr, entry] : remote_buffers) {
-            if (entry.numa_node == numa_node) {
-                return &entry;
-            }
-        }
-        return nullptr;
-    }
 };
 
 // Published buffer information (for metadata exchange)
@@ -255,47 +240,10 @@ struct PublishedBufferInfo {
     std::vector<PublishedBufferEntry> buffers;  // All published buffers
 };
 
-// Forward declaration for thread pool
-class ThreadPool;
-
 // Remote buffer info received from peer (all buffers)
 struct RemoteBufferInfo {
     std::string host_id;        // Remote host identifier
     std::vector<RemoteBufferEntry> buffers;  // All remote buffers with NUMA info
-};
-
-// Async RDMA operation context
-// Used to track the state of an asynchronous RDMA transfer
-struct AsyncRdmaContext {
-    std::atomic<size_t> total_chunks;      // Total number of chunks to post
-    std::atomic<size_t> posted_chunks;     // Number of chunks posted so far
-    std::atomic<size_t> completed_chunks;  // Number of chunks completed
-    std::atomic<int> error_code;           // Error code (0 if no error)
-    std::atomic<bool> post_finished;       // True when all chunks are posted
-    std::atomic<bool> finished;            // True when all chunks completed or error
-    struct ibv_cq *cq;                     // CQ for poll thread to poll
-    std::thread poll_thread;               // Background poll thread
-    
-    // Per-QP completed counters for multi-QP flow control
-    // wr_id encoding: (qp_index << 56) | original_addr
-    // This allows poll thread to accurately track completions per QP
-    static constexpr size_t MAX_QPS = 16;
-    std::atomic<size_t> per_qp_completed[MAX_QPS];
-    size_t num_qps;                        // Number of QPs in use (0 for single-QP mode)
-
-    AsyncRdmaContext() : total_chunks(0), posted_chunks(0), completed_chunks(0),
-                         error_code(0), post_finished(false), finished(false), 
-                         cq(nullptr), num_qps(0) {
-        for (size_t i = 0; i < MAX_QPS; ++i) {
-            per_qp_completed[i].store(0);
-        }
-    }
-    
-    // Disable copy, enable move
-    AsyncRdmaContext(const AsyncRdmaContext&) = delete;
-    AsyncRdmaContext& operator=(const AsyncRdmaContext&) = delete;
-    AsyncRdmaContext(AsyncRdmaContext&&) = default;
-    AsyncRdmaContext& operator=(AsyncRdmaContext&&) = default;
 };
 
 // Chunk task for transfer operations
@@ -388,7 +336,7 @@ struct TransferContext {
 };
 
 /**
- * MPComm - Multi-Path Communication using native ibverbs
+ * MPComm - Memory Pooling Communication using native ibverbs
  * 
  * This class implements scatter/gather operations across multiple hosts
  * using multiple NICs, without depending on mooncake's TransferEngine.
@@ -550,14 +498,6 @@ public:
      * @return rkey, or 0 if not found
      */
     uint32_t getRkey(size_t nic_index, void *addr) const;
-
-    /**
-     * Get rkey for remote memory region (for exchanging with remote)
-     * @param remote_host_id  Remote host identifier
-     * @param remote_addr     Remote memory address
-     * @return rkey, or 0 if not found
-     */
-    uint32_t getRkeyForRemoteAddr(const std::string &remote_host_id, uint64_t remote_addr) const;
 
     // ==================== Async Transfer API ====================
     
@@ -724,12 +664,6 @@ public:
     static const char* getNicFilterEnvVarName();
 
     /**
-     * Get the max RDMA transfer size environment variable name
-     * @return Environment variable name ("MPCOMM_MAX_RDMA_TRANSFER_SIZE")
-     */
-    static const char* getMaxRdmaTransferSizeEnvVarName();
-
-    /**
      * Get the current max RDMA transfer size
      * @return Max transfer size in bytes
      */
@@ -767,13 +701,6 @@ public:
     int getNicNumaNode(const std::string& nic_name) const;
 
     /**
-     * Get local NICs for a specific NUMA node
-     * @param numa_node  NUMA node ID
-     * @return Vector of local NIC names (optimal NICs for this NUMA node)
-     */
-    std::vector<std::string> getLocalNicsForNuma(int numa_node) const;
-
-    /**
      * Get NUMA node for a given memory address (check registered memory regions)
      * For GPU memory, returns the NUMA node of the GPU's PCIe-affine CPU socket
      * @param addr  Memory address
@@ -782,37 +709,11 @@ public:
     int getNumaNodeForAddr(void* addr) const;
 
     /**
-     * Check if a memory address belongs to a GPU device
-     * @param addr  Memory address
-     * @return GPU device ID if GPU memory, -1 if CPU memory or not registered
-     */
-    int getGpuDeviceForAddr(void* addr) const;
-
-    /**
      * Get local NIC indices for a specific NUMA node
      * @param numa_node  NUMA node ID
      * @return Vector of local NIC indices (optimal NICs for this NUMA node)
      */
     std::vector<size_t> getLocalNicIndicesForNuma(int numa_node) const;
-
-    /**
-     * Get remote NIC indices for a specific remote NUMA node
-     * Used for NUMA-aware data transfer - select remote NICs that are local
-     * to the destination memory's NUMA node
-     * @param remote_host_id  Remote host identifier
-     * @param remote_numa_node  Remote NUMA node ID
-     * @return Vector of remote NIC indices that belong to the specified NUMA node
-     */
-    std::vector<size_t> getRemoteNicIndicesForNuma(const std::string& remote_host_id, 
-                                                   int remote_numa_node) const;
-
-    /**
-     * Get NUMA node for a specific remote NIC
-     * @param remote_host_id  Remote host identifier
-     * @param nic_index  Remote NIC index
-     * @return NUMA node ID, or -1 if unknown
-     */
-    int getRemoteNicNumaNode(const std::string& remote_host_id, size_t nic_index) const;
 
     /**
      * Get the NUMA node for a specific GPU device (from topology discovery)
@@ -854,31 +755,6 @@ private:
                       const RemoteEndpointInfo &remote);
     int modifyQPToRTS(struct ibv_qp *qp);
     void destroyQP(struct ibv_qp *qp);
-
-    int doHandshake(int sock_fd, size_t nic_index,
-                    RemoteEndpointInfo &local_info,
-                    RemoteEndpointInfo &remote_info);
-    
-    // Post RDMA WRITE/READ (synchronous - posts all chunks and waits)
-    int postRdmaWrite(NicContext &ctx, struct ibv_qp *qp,
-                      void *local_addr, uint32_t lkey,
-                      uint64_t remote_addr, uint32_t rkey,
-                      size_t length);
-    int postRdmaRead(NicContext &ctx, struct ibv_qp *qp,
-                     void *local_addr, uint32_t lkey,
-                     uint64_t remote_addr, uint32_t rkey,
-                     size_t length);
-
-    // Synchronous RDMA operations with multi-QP rotation - Post-Poll loop in single thread
-    // No separate poll thread, better efficiency for scatter/gather
-    int rdmaWriteSyncMultiQP(NicContext &ctx, const std::string &host_id,
-                             size_t nic_index, void *local_addr, uint32_t lkey,
-                             uint64_t remote_addr, uint32_t rkey, size_t length);
-    int rdmaReadSyncMultiQP(NicContext &ctx, const std::string &host_id,
-                            size_t nic_index, void *local_addr, uint32_t lkey,
-                            uint64_t remote_addr, uint32_t rkey, size_t length);
-
-    int pollCompletion(NicContext &ctx, int timeout_ms = 5000);
 
     // Get lkey for a registered memory address on a specific NIC
     uint32_t getLkey(size_t nic_index, void *addr) const;
@@ -1019,9 +895,11 @@ private:
     // Select a worker within a NUMA node (round-robin)
     size_t selectWorkerForNuma(int numa_id);
 
-    // Thread pool for scatter/gather operations
-    std::unique_ptr<ThreadPool> thread_pool_;
-    size_t thread_pool_size_;  // Configurable via env var
+    // Flow control tuning parameters (configurable via env vars)
+    size_t poll_batch_size_;    // Max WCs per ibv_poll_cq call (MPCOMM_POLL_BATCH_SIZE)
+    size_t max_idle_spins_;     // Worker idle spins before yield (MPCOMM_MAX_IDLE_SPINS)
+    int max_send_wr_;           // QP send queue depth (MPCOMM_MAX_SEND_WR)
+    size_t max_outstanding_per_qp_; // Max outstanding WRs per QP (MPCOMM_MAX_OUTSTANDING_PER_QP)
 
     bool initialized_;
 

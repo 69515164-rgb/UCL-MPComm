@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -43,168 +44,8 @@
 namespace mpcomm {
 
 // ============================================================================
-// ThreadPool Implementation
-// A simple, efficient thread pool that supports:
-// - Fixed number of worker threads with CPU affinity
-// - Task submission with thread-specific routing
-// - Barrier synchronization for batch operations
-// ============================================================================
-
-// Environment variable name for thread pool size
-static const char* kThreadPoolSizeEnvVar = "MPCOMM_THREAD_POOL_SIZE";
-
-class ThreadPool {
-public:
-    // Create a thread pool with the specified number of worker threads
-    // If bind_cpu is true, each worker will be bound to its corresponding CPU core
-    explicit ThreadPool(size_t num_threads, bool bind_cpu = false, int cpu_base_offset = 0)
-        : stop_(false), bind_cpu_(bind_cpu), cpu_base_offset_(cpu_base_offset) {
-        workers_.reserve(num_threads);
-        for (size_t i = 0; i < num_threads; ++i) {
-            workers_.emplace_back(&ThreadPool::workerLoop, this, i);
-        }
-    }
-
-    ~ThreadPool() {
-        shutdown();
-    }
-
-    // Disable copy
-    ThreadPool(const ThreadPool&) = delete;
-    ThreadPool& operator=(const ThreadPool&) = delete;
-
-    // Submit a task to be executed by a specific worker thread
-    // thread_id: the worker thread that should execute this task (0 to num_threads-1)
-    void submitToThread(size_t thread_id, std::function<void()> task) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stop_) return;
-            task_queues_[thread_id].push(std::move(task));
-        }
-        cv_.notify_all();
-    }
-
-    // Wait for all submitted tasks to complete
-    // Call this after submitting a batch of tasks
-    void waitAll() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        done_cv_.wait(lock, [this] {
-            if (stop_) return true;
-            // Check if all queues are empty and no tasks are running
-            for (const auto& q : task_queues_) {
-                if (!q.second.empty()) return false;
-            }
-            return active_tasks_ == 0;
-        });
-    }
-
-    // Get the number of worker threads
-    size_t size() const { return workers_.size(); }
-
-    // Shutdown the thread pool
-    void shutdown() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stop_) return;
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-
-private:
-    void workerLoop(size_t thread_id) {
-        // Bind to CPU if enabled
-        if (bind_cpu_) {
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(static_cast<int>(thread_id) + cpu_base_offset_, &cpuset);
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-        }
-
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this, thread_id] {
-                    return stop_ || !task_queues_[thread_id].empty();
-                });
-
-                if (stop_ && task_queues_[thread_id].empty()) {
-                    return;
-                }
-
-                if (!task_queues_[thread_id].empty()) {
-                    task = std::move(task_queues_[thread_id].front());
-                    task_queues_[thread_id].pop();
-                    ++active_tasks_;
-                }
-            }
-
-            if (task) {
-                task();
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    --active_tasks_;
-                }
-                done_cv_.notify_all();
-            }
-        }
-    }
-
-    std::vector<std::thread> workers_;
-    std::unordered_map<size_t, std::queue<std::function<void()>>> task_queues_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::condition_variable done_cv_;
-    std::atomic<size_t> active_tasks_{0};
-    bool stop_;
-    bool bind_cpu_;
-    int cpu_base_offset_;
-};
-
-// ============================================================================
 // Environment Variables and Helper Functions
 // ============================================================================
-
-// Environment variable name for CPU binding enable/disable
-static const char* kCpuBindEnabledEnvVar = "MPCOMM_CPU_BIND_ENABLED";
-// Environment variable name for CPU base offset
-static const char* kCpuBaseOffsetEnvVar = "MPCOMM_CPU_BASE_OFFSET";
-
-// Helper function to check if CPU binding is enabled
-// Returns true if MPCOMM_CPU_BIND_ENABLED is set to "1" or "true" (case-insensitive)
-// Default: disabled (false)
-static bool isCpuBindEnabled() {
-    const char* env_val = getenv(kCpuBindEnabledEnvVar);
-    if (env_val == nullptr) {
-        return false;  // Default: disabled
-    }
-    // Check for "1" or "true" (case-insensitive)
-    if (strcmp(env_val, "1") == 0) {
-        return true;
-    }
-    if (strcasecmp(env_val, "true") == 0) {
-        return true;
-    }
-    return false;
-}
-
-// Helper function to get CPU base offset from environment variable
-static int getCpuBaseOffset() {
-    const char* env_val = getenv(kCpuBaseOffsetEnvVar);
-    if (env_val != nullptr) {
-        int offset = atoi(env_val);
-        if (offset >= 0) {
-            return offset;
-        }
-    }
-    return 0;  // Default: no offset
-}
 
 // Environment variable name for NIC filtering
 static const char* kNicFilterEnvVar = "MPCOMM_NIC_FILTER";
@@ -212,13 +53,17 @@ static const char* kNicFilterEnvVar = "MPCOMM_NIC_FILTER";
 static const char* kMaxRdmaTransferSizeEnvVar = "MPCOMM_MAX_RDMA_TRANSFER_SIZE";
 // Environment variable name for QPs per connection
 static const char* kQpsPerConnectionEnvVar = "MPCOMM_QPS_PER_CONNECTION";
+// Environment variable names for flow control tuning
+static const char* kPollBatchSizeEnvVar = "MPCOMM_POLL_BATCH_SIZE";
+static const char* kMaxIdleSpinsEnvVar = "MPCOMM_MAX_IDLE_SPINS";
+static const char* kMaxSendWREnvVar = "MPCOMM_MAX_SEND_WR";
+static const char* kMaxOutstandingPerQPEnvVar = "MPCOMM_MAX_OUTSTANDING_PER_QP";
 
 // Constants for QP setup
 static const uint8_t kMaxHopLimit = 16;
 static const uint8_t kTimeout = 14;
 static const uint8_t kRetryCnt = 7;
 static const int kMaxCQE = 1024;
-static const int kMaxSendWR = 512;
 static const int kMaxRecvWR = 128;
 static const int kMaxSGE = 1;
 
@@ -288,7 +133,10 @@ MPComm::MPComm()
       accept_running_(false),
       num_numa_nodes_(0),
       total_workers_(0),
-      thread_pool_size_(0),  // 0 means auto-detect based on NIC count
+      poll_batch_size_(64),
+      max_idle_spins_(10000),
+      max_send_wr_(512),
+      max_outstanding_per_qp_(256),
       initialized_(false) {
     // Read max RDMA transfer size from environment variable
     const char* env_val = std::getenv(kMaxRdmaTransferSizeEnvVar);
@@ -322,18 +170,63 @@ MPComm::MPComm()
         }
     }
 
-    // Read thread pool size from environment variable
-    env_val = std::getenv(kThreadPoolSizeEnvVar);
+    // Read poll batch size from environment variable
+    env_val = std::getenv(kPollBatchSizeEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
         unsigned long val = strtoul(env_val, &endptr, 10);
-        if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 128) {
-            thread_pool_size_ = static_cast<size_t>(val);
-            printf("MPComm: Using thread pool size from %s: %zu\n",
-                   kThreadPoolSizeEnvVar, thread_pool_size_);
+        if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 256) {
+            poll_batch_size_ = static_cast<size_t>(val);
+            printf("MPComm: Using poll batch size from %s: %zu\n",
+                   kPollBatchSizeEnvVar, poll_batch_size_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-128), using auto-detect\n",
-                    kThreadPoolSizeEnvVar, env_val);
+            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-256), using default %zu\n",
+                    kPollBatchSizeEnvVar, env_val, poll_batch_size_);
+        }
+    }
+
+    // Read max send WR from environment variable
+    env_val = std::getenv(kMaxSendWREnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        unsigned long val = strtoul(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 8192) {
+            max_send_wr_ = static_cast<int>(val);
+            printf("MPComm: Using max send WR from %s: %d\n",
+                   kMaxSendWREnvVar, max_send_wr_);
+        } else {
+            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-8192), using default %d\n",
+                    kMaxSendWREnvVar, env_val, max_send_wr_);
+        }
+    }
+
+    // Read max outstanding per QP from environment variable
+    env_val = std::getenv(kMaxOutstandingPerQPEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        unsigned long val = strtoul(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 8192) {
+            max_outstanding_per_qp_ = static_cast<size_t>(val);
+            printf("MPComm: Using max outstanding per QP from %s: %zu\n",
+                   kMaxOutstandingPerQPEnvVar, max_outstanding_per_qp_);
+        } else {
+            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-8192), using default %zu\n",
+                    kMaxOutstandingPerQPEnvVar, env_val, max_outstanding_per_qp_);
+        }
+    }
+
+    // Read max idle spins from environment variable
+    env_val = std::getenv(kMaxIdleSpinsEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        unsigned long val = strtoul(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 10000000) {
+            max_idle_spins_ = static_cast<size_t>(val);
+            printf("MPComm: Using max idle spins from %s: %zu\n",
+                   kMaxIdleSpinsEnvVar, max_idle_spins_);
+        } else {
+            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-10000000), using default %zu\n",
+                    kMaxIdleSpinsEnvVar, env_val, max_idle_spins_);
         }
     }
 }
@@ -407,22 +300,6 @@ int MPComm::init(const std::string &local_host_id,
     }
 
     initialized_ = true;
-    
-    // Create thread pool
-    // Default size: 2 * NIC count (for post and wait threads)
-    // Can be overridden via MPCOMM_THREAD_POOL_SIZE environment variable
-    size_t pool_size = thread_pool_size_;
-    if (pool_size == 0) {
-        pool_size = nic_contexts_.size() * 2;  // Default: 2x NIC count
-    }
-    
-    // Get CPU binding settings
-    bool bind_cpu = isCpuBindEnabled();
-    int cpu_base_offset = getCpuBaseOffset();
-    
-    thread_pool_ = std::make_unique<ThreadPool>(pool_size, bind_cpu, cpu_base_offset);
-    printf("MPComm: Created thread pool with %zu workers (cpu_bind=%s, cpu_base_offset=%d)\n",
-           pool_size, bind_cpu ? "true" : "false", cpu_base_offset);
     
     // Discover NUMA topology and print results
     discoverTopology();
@@ -525,12 +402,6 @@ void MPComm::shutdown() {
         worker_queues_.clear();
         numa_worker_rr_.clear();
         printf("MPComm: All %zu worker threads stopped\n", total_workers_);
-    }
-
-    // Shutdown thread pool (before cleaning up NIC contexts)
-    if (thread_pool_) {
-        thread_pool_->shutdown();
-        thread_pool_.reset();
     }
 
     if (listen_fd_ >= 0) {
@@ -968,10 +839,6 @@ const char* MPComm::getNicFilterEnvVarName() {
     return kNicFilterEnvVar;
 }
 
-const char* MPComm::getMaxRdmaTransferSizeEnvVarName() {
-    return kMaxRdmaTransferSizeEnvVar;
-}
-
 size_t MPComm::getMaxRdmaTransferSize() const {
     return max_rdma_transfer_size_;
 }
@@ -982,32 +849,6 @@ const char* MPComm::getQpsPerConnectionEnvVarName() {
 
 size_t MPComm::getQpsPerConnection() const {
     return qps_per_connection_;
-}
-
-// Global helper function for header - max RDMA transfer size
-size_t getMaxRdmaTransferSize() {
-    const char* env_val = std::getenv(kMaxRdmaTransferSizeEnvVar);
-    if (env_val && env_val[0] != '\0') {
-        char* endptr = nullptr;
-        unsigned long long val = strtoull(env_val, &endptr, 10);
-        if (endptr != env_val && *endptr == '\0' && val > 0) {
-            return static_cast<size_t>(val);
-        }
-    }
-    return MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE;
-}
-
-// Global helper function for header - QPs per connection
-size_t getQpsPerConnection() {
-    const char* env_val = std::getenv(kQpsPerConnectionEnvVar);
-    if (env_val && env_val[0] != '\0') {
-        char* endptr = nullptr;
-        unsigned long val = strtoul(env_val, &endptr, 10);
-        if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 64) {
-            return static_cast<size_t>(val);
-        }
-    }
-    return MPCOMM_DEFAULT_QPS_PER_CONNECTION;
 }
 
 // ============================================================================
@@ -1217,14 +1058,6 @@ int MPComm::getNicNumaNode(const std::string& nic_name) const {
     return -1;
 }
 
-// Get local NICs for a specific NUMA node
-std::vector<std::string> MPComm::getLocalNicsForNuma(int numa_node) const {
-    if (numa_node >= 0 && static_cast<size_t>(numa_node) < numa_topology_.size()) {
-        return numa_topology_[numa_node].local_nics;
-    }
-    return {};
-}
-
 // Get NUMA node for a given memory address (check registered memory regions)
 int MPComm::getNumaNodeForAddr(void* addr) const {
     if (!addr || nic_contexts_.empty()) return -1;
@@ -1264,48 +1097,6 @@ std::vector<size_t> MPComm::getLocalNicIndicesForNuma(int numa_node) const {
     }
     
     return indices;
-}
-
-// Get remote NIC indices for a specific remote NUMA node
-std::vector<size_t> MPComm::getRemoteNicIndicesForNuma(const std::string& remote_host_id,
-                                                       int remote_numa_node) const {
-    std::vector<size_t> indices;
-    
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    auto it = connections_.find(remote_host_id);
-    if (it == connections_.end()) {
-        return indices;  // Host not found
-    }
-    
-    const auto& conn = it->second;
-    if (remote_numa_node < 0) {
-        return indices;  // Invalid NUMA node
-    }
-    
-    // Find remote NIC indices that belong to the specified NUMA node
-    for (size_t i = 0; i < conn.remote_nic_numa_nodes.size(); ++i) {
-        if (conn.remote_nic_numa_nodes[i] == remote_numa_node) {
-            indices.push_back(i);
-        }
-    }
-    
-    return indices;
-}
-
-// Get NUMA node for a specific remote NIC
-int MPComm::getRemoteNicNumaNode(const std::string& remote_host_id, size_t nic_index) const {
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    auto it = connections_.find(remote_host_id);
-    if (it == connections_.end()) {
-        return -1;  // Host not found
-    }
-    
-    const auto& conn = it->second;
-    if (nic_index >= conn.remote_nic_numa_nodes.size()) {
-        return -1;  // Invalid NIC index
-    }
-    
-    return conn.remote_nic_numa_nodes[nic_index];
 }
 
 // Detect if an address is GPU memory using CUDA driver API
@@ -1374,23 +1165,6 @@ int MPComm::detectGpuDevice(void* addr) const {
     (void)addr;
     return -1;  // No CUDA support compiled in
 #endif
-}
-
-// Get GPU device ID for a registered memory address
-int MPComm::getGpuDeviceForAddr(void* addr) const {
-    if (!addr || nic_contexts_.empty()) return -1;
-
-    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
-
-    const auto& ctx = *nic_contexts_[0];
-    for (const auto& mr : ctx.memory_regions) {
-        uintptr_t start = reinterpret_cast<uintptr_t>(mr.addr);
-        uintptr_t end = start + mr.length;
-        if (target >= start && target < end) {
-            return mr.gpu_device_id;
-        }
-    }
-    return -1;
 }
 
 // Get the NUMA node for a specific GPU device (delegates to TopologyManager via cached topology)
@@ -1984,7 +1758,7 @@ int MPComm::createQP(NicContext &ctx, struct ibv_qp **qp) {
     init_attr.recv_cq = ctx.cq;
     init_attr.qp_type = IBV_QPT_RC;
     init_attr.sq_sig_all = 0;
-    init_attr.cap.max_send_wr = kMaxSendWR;
+    init_attr.cap.max_send_wr = max_send_wr_;
     init_attr.cap.max_recv_wr = kMaxRecvWR;
     init_attr.cap.max_send_sge = kMaxSGE;
     init_attr.cap.max_recv_sge = kMaxSGE;
@@ -2916,375 +2690,6 @@ void MPComm::acceptLoop() {
     }
 }
 
-// ============================================================================
-// RDMA Operations
-// ============================================================================
-
-int MPComm::postRdmaWrite(NicContext &ctx, struct ibv_qp *qp,
-                          void *local_addr, uint32_t lkey,
-                          uint64_t remote_addr, uint32_t rkey,
-                          size_t length) {
-    // For large transfers, split into chunks <= max_rdma_transfer_size_
-    // Each chunk is posted and completed before the next one
-    size_t offset = 0;
-    while (offset < length) {
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        wr.wr_id = reinterpret_cast<uint64_t>(chunk_local_addr);
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (WRITE) failed: %d, "
-                    "chunk_offset=%zu, chunk_size=%zu\n", ret, offset, chunk_size);
-            return MPCOMM_ERR_TRANSFER;
-        }
-
-        // Wait for this chunk to complete before posting the next one
-        ret = pollCompletion(ctx);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: WRITE completion failed at offset=%zu\n", offset);
-            return ret;
-        }
-
-        offset += chunk_size;
-    }
-
-    return MPCOMM_SUCCESS;
-}
-
-int MPComm::postRdmaRead(NicContext &ctx, struct ibv_qp *qp,
-                         void *local_addr, uint32_t lkey,
-                         uint64_t remote_addr, uint32_t rkey,
-                         size_t length) {
-    // For large transfers, split into chunks <= max_rdma_transfer_size_
-    // Each chunk is posted and completed before the next one
-    size_t offset = 0;
-    while (offset < length) {
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        wr.wr_id = reinterpret_cast<uint64_t>(chunk_local_addr);
-        wr.opcode = IBV_WR_RDMA_READ;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (READ) failed: %d, "
-                    "chunk_offset=%zu, chunk_size=%zu\n", ret, offset, chunk_size);
-            return MPCOMM_ERR_TRANSFER;
-        }
-
-        // Wait for this chunk to complete before posting the next one
-        ret = pollCompletion(ctx);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: READ completion failed at offset=%zu\n", offset);
-            return ret;
-        }
-
-        offset += chunk_size;
-    }
-
-    return MPCOMM_SUCCESS;
-}
-
-int MPComm::pollCompletion(NicContext &ctx, int timeout_ms) {
-    struct ibv_wc wc;
-    auto start = std::chrono::steady_clock::now();
-
-    while (true) {
-        int n = ibv_poll_cq(ctx.cq, 1, &wc);
-        if (n < 0) {
-            fprintf(stderr, "MPComm: ibv_poll_cq failed\n");
-            return MPCOMM_ERR_TRANSFER;
-        }
-        
-        if (n > 0) {
-            if (wc.status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "MPComm: WC error: status=%d, wr_id=%lu\n",
-                        wc.status, wc.wr_id);
-                return MPCOMM_ERR_TRANSFER;
-            }
-            return MPCOMM_SUCCESS;
-        }
-
-        // Check timeout
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - start).count();
-        if (elapsed >= timeout_ms) {
-            fprintf(stderr, "MPComm: Poll timeout after %dms\n", timeout_ms);
-            return MPCOMM_ERR_TIMEOUT;
-        }
-
-        // Brief yield to avoid busy-waiting too aggressively
-        std::this_thread::yield();
-    }
-}
-
-// ============================================================================
-// Synchronous Post-Poll RDMA functions (no separate poll thread)
-// These functions perform Post-Poll loop in a single thread for better efficiency
-// ============================================================================
-
-int MPComm::rdmaWriteSyncMultiQP(NicContext &ctx, const std::string &host_id,
-                                 size_t nic_index, void *local_addr, uint32_t lkey,
-                                 uint64_t remote_addr, uint32_t rkey, size_t length) {
-    // Flow control parameters
-    const size_t max_outstanding_per_qp = 256;
-    const int poll_batch_size = 32;
-    
-    // Calculate number of chunks
-    size_t num_chunks = (length + max_rdma_transfer_size_ - 1) / max_rdma_transfer_size_;
-    if (num_chunks == 0) return MPCOMM_SUCCESS;
-    
-    // Per-QP counters for flow control
-    std::vector<size_t> per_qp_posted(qps_per_connection_, 0);
-    std::vector<size_t> per_qp_completed(qps_per_connection_, 0);
-    
-    struct ibv_wc wc_array[32];
-    size_t total_completed = 0;
-    size_t offset = 0;
-    
-    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-        // Round-robin QP selection
-        size_t qp_index = chunk_idx % qps_per_connection_;
-        
-        // Flow control: poll CQ if this QP has too many outstanding WRs
-        while (per_qp_posted[qp_index] - per_qp_completed[qp_index] >= max_outstanding_per_qp) {
-            int n = ibv_poll_cq(ctx.cq, poll_batch_size, wc_array);
-            if (n < 0) {
-                fprintf(stderr, "MPComm: ibv_poll_cq failed in rdmaWriteSyncMultiQP\n");
-                return MPCOMM_ERR_TRANSFER;
-            }
-            for (int i = 0; i < n; ++i) {
-                if (wc_array[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "MPComm: WC error in rdmaWriteSyncMultiQP: status=%d\n",
-                            wc_array[i].status);
-                    return MPCOMM_ERR_TRANSFER;
-                }
-                // Decode qp_index from wr_id
-                size_t completed_qp = (wc_array[i].wr_id >> 56) & 0xFF;
-                if (completed_qp < qps_per_connection_) {
-                    per_qp_completed[completed_qp]++;
-                }
-                total_completed++;
-            }
-            if (n == 0) {
-                std::this_thread::yield();
-            }
-        }
-        
-        // Get QP
-        struct ibv_qp *qp = getOrCreateQP(nic_index, host_id, nic_index, qp_index);
-        if (!qp) {
-            fprintf(stderr, "MPComm: No QP for %s on NIC %zu (qp_index=%zu)\n",
-                    host_id.c_str(), nic_index, qp_index);
-            return MPCOMM_ERR_CONNECTION;
-        }
-        
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-        
-        // Prepare SGE and WR
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-        
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        // Encode qp_index in upper 8 bits of wr_id
-        uint64_t addr_part = reinterpret_cast<uint64_t>(chunk_local_addr) & 0x00FFFFFFFFFFFFFFULL;
-        wr.wr_id = (static_cast<uint64_t>(qp_index) << 56) | addr_part;
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-        
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (WRITE sync) failed: %d\n", ret);
-            return MPCOMM_ERR_TRANSFER;
-        }
-        
-        per_qp_posted[qp_index]++;
-        offset += chunk_size;
-    }
-    
-    // Drain remaining completions
-    while (total_completed < num_chunks) {
-        int n = ibv_poll_cq(ctx.cq, poll_batch_size, wc_array);
-        if (n < 0) {
-            fprintf(stderr, "MPComm: ibv_poll_cq failed in rdmaWriteSyncMultiQP (drain)\n");
-            return MPCOMM_ERR_TRANSFER;
-        }
-        for (int i = 0; i < n; ++i) {
-            if (wc_array[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "MPComm: WC error in rdmaWriteSyncMultiQP (drain): status=%d\n",
-                        wc_array[i].status);
-                return MPCOMM_ERR_TRANSFER;
-            }
-            total_completed++;
-        }
-        if (n == 0) {
-            std::this_thread::yield();
-        }
-    }
-    
-    return MPCOMM_SUCCESS;
-}
-
-int MPComm::rdmaReadSyncMultiQP(NicContext &ctx, const std::string &host_id,
-                                size_t nic_index, void *local_addr, uint32_t lkey,
-                                uint64_t remote_addr, uint32_t rkey, size_t length) {
-    // Flow control parameters
-    const size_t max_outstanding_per_qp = 256;
-    const int poll_batch_size = 32;
-    
-    // Calculate number of chunks
-    size_t num_chunks = (length + max_rdma_transfer_size_ - 1) / max_rdma_transfer_size_;
-    if (num_chunks == 0) return MPCOMM_SUCCESS;
-    
-    // Per-QP counters for flow control
-    std::vector<size_t> per_qp_posted(qps_per_connection_, 0);
-    std::vector<size_t> per_qp_completed(qps_per_connection_, 0);
-    
-    struct ibv_wc wc_array[32];
-    size_t total_completed = 0;
-    size_t offset = 0;
-    
-    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-        // Round-robin QP selection
-        size_t qp_index = chunk_idx % qps_per_connection_;
-        
-        // Flow control: poll CQ if this QP has too many outstanding WRs
-        while (per_qp_posted[qp_index] - per_qp_completed[qp_index] >= max_outstanding_per_qp) {
-            int n = ibv_poll_cq(ctx.cq, poll_batch_size, wc_array);
-            if (n < 0) {
-                fprintf(stderr, "MPComm: ibv_poll_cq failed in rdmaReadSyncMultiQP\n");
-                return MPCOMM_ERR_TRANSFER;
-            }
-            for (int i = 0; i < n; ++i) {
-                if (wc_array[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "MPComm: WC error in rdmaReadSyncMultiQP: status=%d\n",
-                            wc_array[i].status);
-                    return MPCOMM_ERR_TRANSFER;
-                }
-                // Decode qp_index from wr_id
-                size_t completed_qp = (wc_array[i].wr_id >> 56) & 0xFF;
-                if (completed_qp < qps_per_connection_) {
-                    per_qp_completed[completed_qp]++;
-                }
-                total_completed++;
-            }
-            if (n == 0) {
-                std::this_thread::yield();
-            }
-        }
-        
-        // Get QP
-        struct ibv_qp *qp = getOrCreateQP(nic_index, host_id, nic_index, qp_index);
-        if (!qp) {
-            fprintf(stderr, "MPComm: No QP for %s on NIC %zu (qp_index=%zu)\n",
-                    host_id.c_str(), nic_index, qp_index);
-            return MPCOMM_ERR_CONNECTION;
-        }
-        
-        size_t chunk_size = std::min(length - offset, max_rdma_transfer_size_);
-        uint8_t *chunk_local_addr = reinterpret_cast<uint8_t *>(local_addr) + offset;
-        uint64_t chunk_remote_addr = remote_addr + offset;
-        
-        // Prepare SGE and WR
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = reinterpret_cast<uint64_t>(chunk_local_addr);
-        sge.length = static_cast<uint32_t>(chunk_size);
-        sge.lkey = lkey;
-        
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        // Encode qp_index in upper 8 bits of wr_id
-        uint64_t addr_part = reinterpret_cast<uint64_t>(chunk_local_addr) & 0x00FFFFFFFFFFFFFFULL;
-        wr.wr_id = (static_cast<uint64_t>(qp_index) << 56) | addr_part;
-        wr.opcode = IBV_WR_RDMA_READ;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk_remote_addr;
-        wr.wr.rdma.rkey = rkey;
-        
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send (READ sync) failed: %d\n", ret);
-            return MPCOMM_ERR_TRANSFER;
-        }
-        
-        per_qp_posted[qp_index]++;
-        offset += chunk_size;
-    }
-    
-    // Drain remaining completions
-    while (total_completed < num_chunks) {
-        int n = ibv_poll_cq(ctx.cq, poll_batch_size, wc_array);
-        if (n < 0) {
-            fprintf(stderr, "MPComm: ibv_poll_cq failed in rdmaReadSyncMultiQP (drain)\n");
-            return MPCOMM_ERR_TRANSFER;
-        }
-        for (int i = 0; i < n; ++i) {
-            if (wc_array[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "MPComm: WC error in rdmaReadSyncMultiQP (drain): status=%d\n",
-                        wc_array[i].status);
-                return MPCOMM_ERR_TRANSFER;
-            }
-            total_completed++;
-        }
-        if (n == 0) {
-            std::this_thread::yield();
-        }
-    }
-    
-    return MPCOMM_SUCCESS;
-}
-
 struct ibv_qp *MPComm::getOrCreateQP(size_t local_nic_index,
                                      const std::string &remote_host_id,
                                      size_t remote_nic_index,
@@ -3575,8 +2980,8 @@ int MPComm::pollAllNicsForAsync(TransferContext& ctx) {
     // Poll only candidate NICs for better performance in single-transfer scenarios
     // When parallel transfers share the same NICs, completions will still be properly routed
     // because we poll CQs (shared per NIC) and decode the transfer handle from wr_id
-    const int poll_batch_size = 64;  // Increased batch size for better efficiency
-    struct ibv_wc wc_array[64];
+    const int poll_batch_size = static_cast<int>(poll_batch_size_);
+    struct ibv_wc wc_array[64];  // Fixed max size; actual poll count controlled by poll_batch_size
     size_t num_nics = nic_contexts_.size();
     size_t num_candidate_nics = ctx.candidate_nic_indices.size();
     
@@ -3779,7 +3184,7 @@ void MPComm::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     
     // Busy-poll loop (no condition variables, minimal latency)
     size_t idle_spins = 0;
-    constexpr size_t kMaxIdleSpins = 10000;  // After this many idle spins, yield
+    const size_t kMaxIdleSpins = max_idle_spins_;  // After this many idle spins, yield
     
     while (worker_running_.load(std::memory_order_relaxed)) {
         // Try to get a task from our lock-free queue
@@ -3821,22 +3226,33 @@ void MPComm::processTransfer(TransferContext& ctx) {
     ctx.submitted.store(true);
     ctx.worker_start_time = std::chrono::steady_clock::now();
     
-    const size_t max_outstanding_per_nic = 256 * qps_per_connection_;
-    constexpr size_t kMaxOutstandingPerQP = 256;
-    constexpr size_t kPollInterval = 64;  // Poll after every N posts for better batching
-    
+    const size_t max_outstanding_per_nic = max_outstanding_per_qp_ * qps_per_connection_;
+    const size_t kMaxOutstandingPerQP = max_outstanding_per_qp_;
     size_t total_chunks = ctx.total_chunks.load();
-    size_t posts_since_last_poll = 0;
     bool first_post_recorded = false;
+
+    // Diagnostic counters for performance analysis
+    size_t diag_flow_control_hits = 0;     // Times flow control (outstanding >= max) was triggered
+    size_t diag_qp_full_hits = 0;          // Times no available QP was found
+    size_t diag_completions_during_post = 0; // Completions harvested during posting phase
+    size_t diag_completions_after_post = 0;  // Completions harvested during completion phase
+    size_t diag_completion_poll_rounds = 0;  // Poll rounds in completion phase
+    size_t diag_max_outstanding_seen = 0;    // Peak outstanding WRs observed
     
-    // Cache connection info to avoid repeated lock acquisitions
+    // Cache connection info to avoid repeated lock acquisitions and
+    // eliminate mutex/linear-search from the hot posting loop.
+    static constexpr size_t kMaxQPsPerConn = 16;
     struct NicConnInfo {
         size_t remote_nic;
         uint32_t rkey;
+        uint32_t lkey;                         // Cached lkey for local memory on this NIC
+        struct ibv_qp* qps[kMaxQPsPerConn];    // Cached QP pointers (one per qp_index)
+        size_t num_qps;                        // Number of valid QP entries
     };
     std::unordered_map<uint64_t, NicConnInfo> nic_conn_cache;
     
-    // Pre-cache connection info for all hosts and all candidate NICs
+    // Pre-cache connection info, lkeys, and QP pointers for all hosts and all candidate NICs.
+    // This eliminates mutex acquisitions and linear searches from the hot posting loop.
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
         for (size_t host_idx = 0; host_idx < ctx.host_list.size(); ++host_idx) {
@@ -3852,6 +3268,19 @@ void MPComm::processTransfer(TransferContext& ctx) {
                         info.remote_nic = map_it->second[0];
                     }
                     info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[host_idx], info.remote_nic);
+                    
+                    // Cache lkey: find the memory region containing local_addr on this NIC
+                    info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));
+                    
+                    // Cache QP pointers for all qp_indices
+                    info.num_qps = qps_per_connection_;
+                    for (size_t qi = 0; qi < qps_per_connection_ && qi < kMaxQPsPerConn; ++qi) {
+                        info.qps[qi] = getOrCreateQP(local_nic, host_id, info.remote_nic, qi);
+                    }
+                    for (size_t qi = qps_per_connection_; qi < kMaxQPsPerConn; ++qi) {
+                        info.qps[qi] = nullptr;
+                    }
+                    
                     uint64_t cache_key = (static_cast<uint64_t>(host_idx) << 16) | local_nic;
                     nic_conn_cache[cache_key] = info;
                 }
@@ -3879,8 +3308,15 @@ void MPComm::processTransfer(TransferContext& ctx) {
             size_t best_nic = selectBestNicForAsync(ctx);
             size_t outstanding = ctx.per_nic_posted[best_nic] - ctx.per_nic_completed[best_nic];
             
+            // Track peak outstanding
+            if (outstanding > diag_max_outstanding_seen) {
+                diag_max_outstanding_seen = outstanding;
+            }
+
             // Flow control: poll when NICs are getting full
             if (outstanding >= max_outstanding_per_nic) {
+                diag_flow_control_hits++;
+                size_t before = ctx.total_completed.load();
                 int poll_ret = pollAllNicsForAsync(ctx);
                 if (poll_ret != MPCOMM_SUCCESS) {
                     ctx.error_code.store(poll_ret);
@@ -3888,6 +3324,7 @@ void MPComm::processTransfer(TransferContext& ctx) {
                     ctx.end_time = std::chrono::steady_clock::now();
                     return;
                 }
+                diag_completions_during_post += (ctx.total_completed.load() - before);
                 continue;  // Re-select NIC after polling
             }
             
@@ -3907,35 +3344,35 @@ void MPComm::processTransfer(TransferContext& ctx) {
             }
             
             if (!found_available_qp) {
+                diag_qp_full_hits++;
+                size_t before = ctx.total_completed.load();
                 pollAllNicsForAsync(ctx);
+                diag_completions_during_post += (ctx.total_completed.load() - before);
                 continue;
             }
             
-            // Get lkey for this NIC
-            uint32_t lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
-            if (lkey == 0) {
-                fprintf(stderr, "MPComm: Worker: No lkey for address %p on NIC %zu\n",
-                        reinterpret_cast<void *>(chunk.local_addr), best_nic);
-                ctx.error_code.store(MPCOMM_ERR_MEMORY);
-                ctx.finished.store(true);
-                ctx.end_time = std::chrono::steady_clock::now();
-                return;
-            }
-            
-            // Use cached connection info
+            // Use cached connection info (lkey, rkey, QP pointer all pre-resolved)
             size_t host_idx_for_qp = chunk.host_idx;
             uint64_t cache_key = (static_cast<uint64_t>(host_idx_for_qp) << 16) | best_nic;
             auto cache_it = nic_conn_cache.find(cache_key);
-            size_t remote_nic;
+            
+            uint32_t lkey;
             uint32_t rkey;
+            size_t remote_nic;
+            struct ibv_qp *qp;
             
             if (cache_it != nic_conn_cache.end()) {
-                remote_nic = cache_it->second.remote_nic;
-                rkey = cache_it->second.rkey;
+                const auto& cached = cache_it->second;
+                lkey = cached.lkey;
+                rkey = cached.rkey;
+                remote_nic = cached.remote_nic;
+                qp = (qp_index < cached.num_qps) ? cached.qps[qp_index] : cached.qps[0];
             } else {
+                // Fallback: resolve on the fly (should rarely happen)
+                lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
                 const std::string& chunk_host_id = ctx.host_list[host_idx_for_qp];
                 remote_nic = best_nic;
-                
+                rkey = 0;
                 {
                     std::lock_guard<std::mutex> lock(connections_mutex_);
                     auto it = connections_.find(chunk_host_id);
@@ -3946,10 +3383,18 @@ void MPComm::processTransfer(TransferContext& ctx) {
                             remote_nic = map_it->second[0];
                         }
                         rkey = it->second.getRkeyForAddr(chunk.remote_addr, remote_nic);
-                    } else {
-                        rkey = 0;
                     }
                 }
+                qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
+            }
+            
+            if (lkey == 0) {
+                fprintf(stderr, "MPComm: Worker: No lkey for address %p on NIC %zu\n",
+                        reinterpret_cast<void *>(chunk.local_addr), best_nic);
+                ctx.error_code.store(MPCOMM_ERR_MEMORY);
+                ctx.finished.store(true);
+                ctx.end_time = std::chrono::steady_clock::now();
+                return;
             }
             
             if (rkey == 0) {
@@ -3961,7 +3406,6 @@ void MPComm::processTransfer(TransferContext& ctx) {
                 return;
             }
             
-            struct ibv_qp *qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
             if (!qp) {
                 fprintf(stderr, "MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
                         best_nic, remote_nic);
@@ -4002,18 +3446,10 @@ void MPComm::processTransfer(TransferContext& ctx) {
             ctx.per_nic_qp_posted[best_nic][qp_index]++;
             ctx.per_nic_bytes[best_nic] += chunk.length;
             ctx.next_chunk_idx.fetch_add(1);
-            posts_since_last_poll++;
-            
             // Record first post time
             if (!first_post_recorded) {
                 ctx.first_post_time = std::chrono::steady_clock::now();
                 first_post_recorded = true;
-            }
-            
-            // Proactive polling for pipeline efficiency
-            if (posts_since_last_poll >= kPollInterval) {
-                pollAllNicsForAsync(ctx);
-                posts_since_last_poll = 0;
             }
         }
         
@@ -4025,6 +3461,8 @@ void MPComm::processTransfer(TransferContext& ctx) {
         
         // All chunks posted, poll for remaining completions
         if (ctx.total_completed.load() < total_chunks) {
+            diag_completion_poll_rounds++;
+            size_t before = ctx.total_completed.load();
             int poll_ret = pollAllNicsForAsync(ctx);
             if (poll_ret != MPCOMM_SUCCESS) {
                 ctx.error_code.store(poll_ret);
@@ -4032,8 +3470,7 @@ void MPComm::processTransfer(TransferContext& ctx) {
                 ctx.end_time = std::chrono::steady_clock::now();
                 return;
             }
-            // Brief pause to avoid busy-spinning
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            diag_completions_after_post += (ctx.total_completed.load() - before);
         }
     }
     
@@ -4070,6 +3507,13 @@ void MPComm::processTransfer(TransferContext& ctx) {
     printf("  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
     printf("  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
     printf("  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
+    printf("  Diagnostics: total_chunks=%zu, max_outstanding_per_nic=%zu\n",
+           total_chunks, max_outstanding_per_nic);
+    printf("  Diagnostics: flow_ctrl_hits=%zu, qp_full_hits=%zu\n",
+           diag_flow_control_hits, diag_qp_full_hits);
+    printf("  Diagnostics: completions_during_post=%zu, completions_after_post=%zu, peak_outstanding=%zu\n",
+           diag_completions_during_post, diag_completions_after_post, diag_max_outstanding_seen);
+    printf("  Diagnostics: completion_poll_rounds=%zu\n", diag_completion_poll_rounds);
 }
 
 int MPComm::getNumaForAddr(uintptr_t addr) const {

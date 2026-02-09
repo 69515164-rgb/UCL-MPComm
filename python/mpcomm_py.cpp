@@ -461,7 +461,7 @@ private:
 };
 
 PYBIND11_MODULE(mpcomm, m) {
-    m.doc() = "MPComm - Multi-Path Communication using native ibverbs";
+m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
 
     // Error codes
     py::enum_<MPCommError>(m, "MPCommError")

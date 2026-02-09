@@ -17,6 +17,7 @@ find_path(NUMA_INCLUDE_DIR numaif.h REQUIRED)
 # USE_BNXT: Broadcom NICs (bnxt_re_dv_modify_qp_udp_sport)
 option(USE_MLNX "Enable NVIDIA/Mellanox specific features" OFF)
 option(USE_BNXT "Enable Broadcom specific features" OFF)
+option(USE_CUDA "Enable CUDA/GPU memory support (requires nvidia-peermem)" OFF)
 
 # Find vendor-specific libraries
 if(USE_MLNX)
@@ -33,9 +34,18 @@ if(USE_BNXT)
     endif()
 endif()
 
+if(USE_CUDA)
+    find_library(CUDA_DRIVER_LIBRARY cuda PATHS /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu QUIET)
+    find_path(CUDA_INCLUDE_DIR cuda.h PATHS /usr/local/cuda/include QUIET)
+    if(NOT CUDA_DRIVER_LIBRARY)
+        message(WARNING "CUDA driver library not found, USE_CUDA features may not work")
+    endif()
+endif()
+
 # MPComm library
 add_library(mpcomm STATIC
     src/mpcomm.cpp
+    src/topology.cpp
 )
 
 target_include_directories(mpcomm PUBLIC
@@ -61,6 +71,16 @@ if(USE_BNXT)
     target_compile_definitions(mpcomm PUBLIC USE_BNXT)
     if(BNXT_RE_LIBRARY)
         target_link_libraries(mpcomm PUBLIC ${BNXT_RE_LIBRARY})
+    endif()
+endif()
+
+if(USE_CUDA)
+    target_compile_definitions(mpcomm PUBLIC USE_CUDA)
+    if(CUDA_INCLUDE_DIR)
+        target_include_directories(mpcomm PUBLIC ${CUDA_INCLUDE_DIR})
+    endif()
+    if(CUDA_DRIVER_LIBRARY)
+        target_link_libraries(mpcomm PUBLIC ${CUDA_DRIVER_LIBRARY})
     endif()
 endif()
 

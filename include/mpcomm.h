@@ -145,6 +145,13 @@ struct MemoryRegionInfo {
     uint32_t lkey;
     uint32_t rkey;
     int numa_node;      // NUMA node this memory belongs to (-1 if unknown)
+    bool is_gpu;        // True if this is GPU (HBM) memory
+    int gpu_device_id;  // CUDA device ordinal (-1 if CPU memory)
+    // PCIe-affine NIC indices for GPU memory.
+    // These are the NICs that share the closest PCIe switch with the GPU,
+    // providing optimal GPUDirect RDMA performance.
+    // Empty for CPU memory (falls back to NUMA-level NIC selection).
+    std::vector<size_t> pcie_affine_nic_indices;
 };
 
 // Remote buffer entry received from peer (single buffer)
@@ -316,6 +323,7 @@ struct TransferContext {
     std::atomic<size_t> total_completed;            // Completed chunks
     std::atomic<int> error_code;                    // Error code (0 if no error)
     std::atomic<bool> finished;                     // True when transfer complete or error
+    std::atomic<bool> submitted;                    // True when submitted to worker thread
     
     // Transfer parameters (stored for async processing)
     uintptr_t local_addr;
@@ -338,9 +346,19 @@ struct TransferContext {
     // NUMA-aware NIC selection
     std::vector<size_t> candidate_nic_indices;
     
-    // Timing
-    std::chrono::steady_clock::time_point start_time;
-    std::chrono::steady_clock::time_point end_time;
+    // Timing for each stage
+    std::chrono::steady_clock::time_point start_time;          // User thread starts
+    // Preparation sub-stages (between start_time and queued_time)
+    std::chrono::steady_clock::time_point prep_chunks_calc_time;   // After chunk count calculation
+    std::chrono::steady_clock::time_point prep_chunks_fill_time;   // After chunks array filled
+    std::chrono::steady_clock::time_point prep_numa_query_time;    // After NUMA query
+    std::chrono::steady_clock::time_point prep_flowctrl_time;      // After flow control init
+    std::chrono::steady_clock::time_point queued_time;         // Task queued to worker
+    std::chrono::steady_clock::time_point worker_start_time;   // Worker picks up task
+    std::chrono::steady_clock::time_point cache_done_time;     // Connection cache built
+    std::chrono::steady_clock::time_point first_post_time;     // First chunk posted
+    std::chrono::steady_clock::time_point all_posted_time;     // All chunks posted
+    std::chrono::steady_clock::time_point end_time;            // All completions received
     
     // Round-robin index for NIC selection
     size_t rr_nic_index;
@@ -351,6 +369,7 @@ struct TransferContext {
         , total_completed(0)
         , error_code(0)
         , finished(false)
+        , submitted(false)
         , local_addr(0)
         , is_scatter(true)
         , next_chunk_idx(0)
@@ -720,10 +739,18 @@ public:
 
     /**
      * Get NUMA node for a given memory address (check registered memory regions)
+     * For GPU memory, returns the NUMA node of the GPU's PCIe-affine CPU socket
      * @param addr  Memory address
      * @return NUMA node ID, or -1 if not found in registered regions
      */
     int getNumaNodeForAddr(void* addr) const;
+
+    /**
+     * Check if a memory address belongs to a GPU device
+     * @param addr  Memory address
+     * @return GPU device ID if GPU memory, -1 if CPU memory or not registered
+     */
+    int getGpuDeviceForAddr(void* addr) const;
 
     /**
      * Get local NIC indices for a specific NUMA node
@@ -751,6 +778,13 @@ public:
      */
     int getRemoteNicNumaNode(const std::string& remote_host_id, size_t nic_index) const;
 
+    /**
+     * Get the NUMA node for a specific GPU device (from topology discovery)
+     * @param gpu_device_id  CUDA device ordinal
+     * @return NUMA node ID, or -1 if unknown
+     */
+    int getGpuNumaNode(int gpu_device_id) const;
+
 private:
     // Topology discovery helper functions
     int getNumaNodeCount();
@@ -758,6 +792,21 @@ private:
     std::vector<std::string> getCandidateNics();
     void discoverTopology();
     void printTopologyInfo();
+    // Detect if an address is GPU memory and return the GPU device ID
+    // Returns -1 if the address is CPU memory or detection fails
+    int detectGpuDevice(void* addr) const;
+
+    // Discover PCIe-affine NICs for a GPU device.
+    // Compares GPU and NIC sysfs PCIe paths to find NICs sharing the
+    // closest PCIe switch (longest common PCIe path prefix).
+    // Returns NIC indices sorted by PCIe affinity (closest first).
+    std::vector<size_t> getGpuPcieAffinityNics(int gpu_device_id) const;
+
+    // Get PCIe-affine NIC indices for a registered memory address.
+    // Returns the pcie_affine_nic_indices from the matching MemoryRegionInfo,
+    // or empty vector if not GPU memory or not found.
+    std::vector<size_t> getPcieAffinityNicsForAddr(void* addr) const;
+
     // Internal helper functions
     int openDevices(const std::string &device_names);
     int setupNicContext(const std::string &device_name, NicContext &ctx);
@@ -824,11 +873,6 @@ private:
                                       const std::vector<size_t> &lengths,
                                       TransferDirection direction);
 
-    // Async transfer progress - posts more chunks and polls for completions
-    // Returns: MPCOMM_SUCCESS if complete, MPCOMM_ERR_PENDING if in progress,
-    //          or other error code on failure
-    int transferAsyncProgress(TransferContext& ctx);
-
     // Helper: select best NIC for async transfer (lowest outstanding)
     size_t selectBestNicForAsync(TransferContext& ctx);
 
@@ -860,6 +904,90 @@ private:
     std::unordered_map<TransferHandle, std::unique_ptr<TransferContext>> active_transfers_;
     mutable std::mutex transfers_mutex_;
     std::atomic<TransferHandle> next_transfer_handle_{1};
+
+    // Per-NUMA worker threads for fully async transfer (post + poll)
+    // Each worker is bound to a NUMA node and handles transfers for that NUMA's memory
+    // One worker per NUMA node
+    static constexpr size_t kMaxNumaNodes = 8;         // Support up to 8 NUMA nodes
+    static constexpr size_t kWorkersPerNuma = 1;       // Workers per NUMA node
+    static constexpr size_t kLockFreeQueueSize = 4096; // Lock-free queue capacity
+    size_t num_numa_nodes_;                            // Actual number of NUMA nodes
+    size_t total_workers_;                             // Total worker threads
+    std::vector<std::unique_ptr<std::thread>> worker_threads_;
+    std::atomic<bool> worker_running_{false};
+    
+    // Lock-free MPSC (Multi-Producer Single-Consumer) queue per worker
+    // Using fixed-size ring buffer with atomic head/tail pointers
+    struct LockFreeQueue {
+        std::vector<std::atomic<TransferHandle>> buffer;
+        std::atomic<size_t> head{0};  // Producer write position (CAS-based for MPSC)
+        std::atomic<size_t> tail{0};  // Consumer read position (single consumer, no CAS needed)
+        
+        LockFreeQueue() : buffer(kLockFreeQueueSize) {
+            for (auto& slot : buffer) {
+                slot.store(INVALID_TRANSFER_HANDLE, std::memory_order_relaxed);
+            }
+        }
+        
+        // Try to push (returns false if queue is full) - MPSC safe
+        bool tryPush(TransferHandle handle) {
+            size_t current_head, next_head;
+            do {
+                current_head = head.load(std::memory_order_relaxed);
+                next_head = (current_head + 1) % kLockFreeQueueSize;
+                if (next_head == tail.load(std::memory_order_acquire)) {
+                    return false;  // Queue is full
+                }
+            } while (!head.compare_exchange_weak(current_head, next_head,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed));
+            // Successfully reserved slot at current_head
+            buffer[current_head].store(handle, std::memory_order_release);
+            return true;
+        }
+        
+        // Try to pop (returns INVALID_TRANSFER_HANDLE if queue is empty) - single consumer
+        TransferHandle tryPop() {
+            size_t current_tail = tail.load(std::memory_order_relaxed);
+            if (current_tail == head.load(std::memory_order_acquire)) {
+                return INVALID_TRANSFER_HANDLE;  // Queue is empty
+            }
+            // Wait for the slot to be written (in case producer hasn't finished writing)
+            TransferHandle handle;
+            do {
+                handle = buffer[current_tail].load(std::memory_order_acquire);
+            } while (handle == INVALID_TRANSFER_HANDLE);
+            buffer[current_tail].store(INVALID_TRANSFER_HANDLE, std::memory_order_relaxed);
+            tail.store((current_tail + 1) % kLockFreeQueueSize, std::memory_order_release);
+            return handle;
+        }
+        
+        bool empty() const {
+            return tail.load(std::memory_order_acquire) == head.load(std::memory_order_acquire);
+        }
+    };
+    
+    // Per-worker task queues (total_workers_ = num_numa_nodes_ * kWorkersPerNuma)
+    std::vector<std::unique_ptr<LockFreeQueue>> worker_queues_;
+    
+    // Per-NUMA round-robin counter for load balancing across workers within same NUMA
+    // Using unique_ptr because std::atomic is not copyable/movable
+    std::vector<std::unique_ptr<std::atomic<size_t>>> numa_worker_rr_;
+
+    // Worker thread entry point
+    // worker_id: global worker index (0 to total_workers_-1)
+    // numa_id: NUMA node this worker belongs to
+    // cpu_id: CPU core to bind to (-1 for no binding)
+    void workerThreadLoop(size_t worker_id, int numa_id, int cpu_id);
+    
+    // Process a single transfer (post all chunks + poll until complete)
+    void processTransfer(TransferContext& ctx);
+    
+    // Determine which NUMA node should handle a transfer based on local memory address
+    int getNumaForAddr(uintptr_t addr) const;
+    
+    // Select a worker within a NUMA node (round-robin)
+    size_t selectWorkerForNuma(int numa_id);
 
     // Thread pool for scatter/gather operations
     std::unique_ptr<ThreadPool> thread_pool_;

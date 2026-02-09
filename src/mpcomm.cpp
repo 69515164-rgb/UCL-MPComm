@@ -15,7 +15,9 @@
 #include "mpcomm.h"
 
 #include <arpa/inet.h>
+#include <emmintrin.h>  // For _mm_pause()
 #include <fcntl.h>
+#include <linux/limits.h>  // For PATH_MAX
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <numaif.h>
@@ -23,6 +25,10 @@
 #include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#ifdef USE_CUDA
+#include <cuda.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -280,6 +286,8 @@ MPComm::MPComm()
       max_rdma_transfer_size_(MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE),
       qps_per_connection_(MPCOMM_DEFAULT_QPS_PER_CONNECTION),
       accept_running_(false),
+      num_numa_nodes_(0),
+      total_workers_(0),
       thread_pool_size_(0),  // 0 means auto-detect based on NIC count
       initialized_(false) {
     // Read max RDMA transfer size from environment variable
@@ -420,6 +428,81 @@ int MPComm::init(const std::string &local_host_id,
     discoverTopology();
     printTopologyInfo();
     
+    // Start per-NUMA worker threads for fully async transfer processing
+    // Multiple workers per NUMA node, each bound to different CPUs
+    int numa_count = getNumaNodeCount();
+    num_numa_nodes_ = static_cast<size_t>(std::max(1, numa_count));
+    if (num_numa_nodes_ > kMaxNumaNodes) {
+        num_numa_nodes_ = kMaxNumaNodes;
+    }
+    total_workers_ = num_numa_nodes_ * kWorkersPerNuma;
+    
+    // Initialize lock-free queues for each worker
+    worker_queues_.resize(total_workers_);
+    for (size_t i = 0; i < total_workers_; ++i) {
+        worker_queues_[i] = std::make_unique<LockFreeQueue>();
+    }
+    
+    // Initialize per-NUMA round-robin counters
+    numa_worker_rr_.resize(num_numa_nodes_);
+    for (size_t i = 0; i < num_numa_nodes_; ++i) {
+        numa_worker_rr_[i] = std::make_unique<std::atomic<size_t>>(0);
+    }
+    
+    // Get CPU list for each NUMA node
+    std::vector<std::vector<int>> numa_cpus(num_numa_nodes_);
+    for (size_t numa = 0; numa < num_numa_nodes_; ++numa) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%zu/cpulist", numa);
+        FILE* f = fopen(path, "r");
+        if (f) {
+            char buf[256];
+            if (fgets(buf, sizeof(buf), f)) {
+                // Parse CPU list (format: "0-7,16-23" or "0,1,2,3")
+                char* p = buf;
+                while (*p) {
+                    int start, end;
+                    if (sscanf(p, "%d-%d", &start, &end) == 2) {
+                        for (int cpu = start; cpu <= end; ++cpu) {
+                            numa_cpus[numa].push_back(cpu);
+                        }
+                    } else if (sscanf(p, "%d", &start) == 1) {
+                        numa_cpus[numa].push_back(start);
+                    }
+                    // Move to next number
+                    while (*p && *p != ',' && *p != '-') ++p;
+                    if (*p == '-') {
+                        while (*p && *p != ',') ++p;
+                    }
+                    if (*p == ',') ++p;
+                }
+            }
+            fclose(f);
+        }
+        if (numa_cpus[numa].empty()) {
+            // Fallback: no specific CPU binding
+            numa_cpus[numa].push_back(-1);
+        }
+    }
+    
+    // Start worker threads (kWorkersPerNuma workers per NUMA node)
+    worker_running_.store(true);
+    worker_threads_.resize(total_workers_);
+    for (size_t numa = 0; numa < num_numa_nodes_; ++numa) {
+        for (size_t w = 0; w < kWorkersPerNuma; ++w) {
+            size_t worker_id = numa * kWorkersPerNuma + w;
+            // Assign CPU: cycle through available CPUs on this NUMA node
+            int cpu_id = -1;
+            if (!numa_cpus[numa].empty() && numa_cpus[numa][0] >= 0) {
+                cpu_id = numa_cpus[numa][w % numa_cpus[numa].size()];
+            }
+            worker_threads_[worker_id] = std::make_unique<std::thread>(
+                &MPComm::workerThreadLoop, this, worker_id, static_cast<int>(numa), cpu_id);
+        }
+    }
+    printf("MPComm: Started %zu async worker threads (%zu per NUMA, %zu NUMA nodes)\n", 
+           total_workers_, kWorkersPerNuma, num_numa_nodes_);
+    
     printf("MPComm: Initialized with %zu NICs, TCP port %d\n",
            nic_contexts_.size(), tcp_port_);
     
@@ -429,7 +512,22 @@ int MPComm::init(const std::string &local_host_id,
 void MPComm::shutdown() {
     stopAcceptThread();
 
-    // Shutdown thread pool first (before cleaning up NIC contexts)
+    // Stop all worker threads first (they use busy-poll, just set flag and wait)
+    if (worker_running_.load()) {
+        worker_running_.store(false);
+        // Join all worker threads (they will exit when they see worker_running_ = false)
+        for (size_t i = 0; i < worker_threads_.size(); ++i) {
+            if (worker_threads_[i] && worker_threads_[i]->joinable()) {
+                worker_threads_[i]->join();
+            }
+        }
+        worker_threads_.clear();
+        worker_queues_.clear();
+        numa_worker_rr_.clear();
+        printf("MPComm: All %zu worker threads stopped\n", total_workers_);
+    }
+
+    // Shutdown thread pool (before cleaning up NIC contexts)
     if (thread_pool_) {
         thread_pool_->shutdown();
         thread_pool_.reset();
@@ -686,12 +784,37 @@ int MPComm::registerMemory(void *addr, size_t length) {
     int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                        IBV_ACCESS_REMOTE_WRITE;
 
-    // Detect NUMA node for this memory region using move_pages()
+    // Detect if this is GPU memory and get GPU device ID
+    int gpu_device_id = detectGpuDevice(addr);
+    bool is_gpu = (gpu_device_id >= 0);
+
+    // Detect NUMA node for this memory region
     int numa_node = -1;
-    int status = -1;
-    void* pages[1] = { addr };
-    if (move_pages(0, 1, pages, nullptr, &status, 0) == 0 && status >= 0) {
-        numa_node = status;
+    if (is_gpu) {
+        // For GPU memory, move_pages() won't work.
+        // Look up the GPU's NUMA node from topology discovery instead.
+        numa_node = getGpuNumaNode(gpu_device_id);
+        printf("MPComm: Detected GPU memory (device %d, NUMA %d), using nvidia-peermem\n",
+               gpu_device_id, numa_node);
+        // nvidia-peermem works through the standard ibv_reg_mr path:
+        // The kernel's ib_umem_get() calls get_user_pages() which is intercepted
+        // by nvidia-peermem (ib_peer_memory_client) to pin GPU pages via the
+        // NVIDIA driver. Do NOT add IBV_ACCESS_ON_DEMAND here - ODP uses a
+        // different kernel path that does not invoke peer_memory callbacks,
+        // resulting in EFAULT for GPU addresses.
+    } else {
+        // CPU memory: use move_pages() as before
+        int status = -1;
+        void* pages[1] = { addr };
+        if (move_pages(0, 1, pages, nullptr, &status, 0) == 0 && status >= 0) {
+            numa_node = status;
+        }
+    }
+
+    // Discover PCIe-affine NICs for GPU memory (once, before registering on each NIC)
+    std::vector<size_t> pcie_affine_nics;
+    if (is_gpu) {
+        pcie_affine_nics = getGpuPcieAffinityNics(gpu_device_id);
     }
 
     // Register on all NICs
@@ -700,8 +823,15 @@ int MPComm::registerMemory(void *addr, size_t length) {
         
         struct ibv_mr *mr = ibv_reg_mr(ctx.pd, addr, length, access_flags);
         if (!mr) {
-            fprintf(stderr, "MPComm: Failed to register memory on %s\n",
-                    ctx.device_name.c_str());
+            fprintf(stderr, "MPComm: Failed to register %s memory on %s (errno=%d: %s)\n",
+                    is_gpu ? "GPU" : "CPU", ctx.device_name.c_str(),
+                    errno, strerror(errno));
+            if (is_gpu) {
+                fprintf(stderr, "MPComm: Hint: Ensure nvidia-peermem kernel module is loaded "
+                        "(lsmod | grep nvidia_peermem).\n");
+                fprintf(stderr, "MPComm: Hint: Also verify the GPU memory is valid and "
+                        "CUDA context is active on device %d.\n", gpu_device_id);
+            }
             // Unregister from previous NICs
             for (size_t j = 0; j < i; ++j) {
                 auto &prev_ctx = *nic_contexts_[j];
@@ -725,12 +855,17 @@ int MPComm::registerMemory(void *addr, size_t length) {
         info.lkey = mr->lkey;
         info.rkey = mr->rkey;
         info.numa_node = numa_node;
+        info.is_gpu = is_gpu;
+        info.gpu_device_id = gpu_device_id;
+        info.pcie_affine_nic_indices = pcie_affine_nics;
 
         std::lock_guard<std::mutex> lock(ctx.mr_mutex);
         ctx.memory_regions.push_back(info);
     }
 
-    printf("MPComm: Registered memory %p, length %zu, NUMA node %d\n", addr, length, numa_node);
+    printf("MPComm: Registered %s memory %p, length %zu, NUMA node %d%s\n",
+           is_gpu ? "GPU" : "CPU", addr, length, numa_node,
+           is_gpu ? " (nvidia-peermem)" : "");
     return MPCOMM_SUCCESS;
 }
 
@@ -1171,6 +1306,247 @@ int MPComm::getRemoteNicNumaNode(const std::string& remote_host_id, size_t nic_i
     }
     
     return conn.remote_nic_numa_nodes[nic_index];
+}
+
+// Detect if an address is GPU memory using CUDA driver API
+// Returns the CUDA device ordinal, or -1 if CPU memory / detection fails
+int MPComm::detectGpuDevice(void* addr) const {
+#ifdef USE_CUDA
+    // Use cuPointerGetAttribute to query the memory type
+    unsigned int mem_type = 0;
+    CUresult res = cuPointerGetAttribute(
+        &mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+        reinterpret_cast<CUdeviceptr>(addr));
+    if (res != CUDA_SUCCESS || mem_type != CU_MEMORYTYPE_DEVICE) {
+        return -1;  // Not device memory
+    }
+
+    // Get the CUDA device ordinal for this pointer
+    // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL requires CUDA 11.x+
+    int device_ordinal = -1;
+    res = cuPointerGetAttribute(
+        &device_ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+        reinterpret_cast<CUdeviceptr>(addr));
+    if (res == CUDA_SUCCESS && device_ordinal >= 0) {
+        return device_ordinal;
+    }
+
+    // Fallback: use cuMemGetAddressRange + iterate devices
+    // This is less efficient but works on older CUDA versions
+    CUdeviceptr base;
+    size_t alloc_size;
+    res = cuMemGetAddressRange(&base, &alloc_size,
+                                reinterpret_cast<CUdeviceptr>(addr));
+    if (res != CUDA_SUCCESS) {
+        return -1;
+    }
+
+    // Try to determine device by setting context
+    int device_count = 0;
+    cuDeviceGetCount(&device_count);
+    for (int dev = 0; dev < device_count; ++dev) {
+        CUdevice cu_dev;
+        if (cuDeviceGet(&cu_dev, dev) != CUDA_SUCCESS) continue;
+        CUcontext ctx;
+        if (cuDevicePrimaryCtxRetain(&ctx, cu_dev) != CUDA_SUCCESS) continue;
+
+        CUcontext old_ctx;
+        cuCtxPushCurrent(ctx);
+
+        // Try to get attribute with this device's context
+        unsigned int check_type = 0;
+        CUresult check = cuPointerGetAttribute(
+            &check_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            reinterpret_cast<CUdeviceptr>(addr));
+
+        cuCtxPopCurrent(&old_ctx);
+        cuDevicePrimaryCtxRelease(cu_dev);
+
+        if (check == CUDA_SUCCESS && check_type == CU_MEMORYTYPE_DEVICE) {
+            return dev;
+        }
+    }
+
+    // If we confirmed it's device memory but can't determine which device,
+    // return 0 as best guess (single-GPU case)
+    return 0;
+#else
+    (void)addr;
+    return -1;  // No CUDA support compiled in
+#endif
+}
+
+// Get GPU device ID for a registered memory address
+int MPComm::getGpuDeviceForAddr(void* addr) const {
+    if (!addr || nic_contexts_.empty()) return -1;
+
+    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+
+    const auto& ctx = *nic_contexts_[0];
+    for (const auto& mr : ctx.memory_regions) {
+        uintptr_t start = reinterpret_cast<uintptr_t>(mr.addr);
+        uintptr_t end = start + mr.length;
+        if (target >= start && target < end) {
+            return mr.gpu_device_id;
+        }
+    }
+    return -1;
+}
+
+// Get the NUMA node for a specific GPU device (delegates to TopologyManager via cached topology)
+int MPComm::getGpuNumaNode(int gpu_device_id) const {
+    if (gpu_device_id < 0) return -1;
+
+    // Search GPU topology info discovered during init
+    // The topology info is stored in nic_topology_ style - we need to check
+    // the topology manager's GPU topology. Since we don't hold a reference
+    // to TopologyManager after init, we search the registered memory regions
+    // for GPU entries with matching device ID, or use sysfs directly.
+#ifdef USE_CUDA
+    // Use CUDA driver API to get the PCI bus ID, then read NUMA from sysfs
+    CUdevice cu_dev;
+    if (cuDeviceGet(&cu_dev, gpu_device_id) != CUDA_SUCCESS) {
+        return -1;
+    }
+
+    char pci_bus_id[64] = {0};
+    if (cuDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cu_dev) != CUDA_SUCCESS) {
+        return -1;
+    }
+
+    // Normalize to lower case for sysfs
+    std::string bdf(pci_bus_id);
+    std::transform(bdf.begin(), bdf.end(), bdf.begin(), ::tolower);
+
+    std::string numa_path = "/sys/bus/pci/devices/" + bdf + "/numa_node";
+    std::ifstream numa_file(numa_path);
+    if (numa_file.is_open()) {
+        int numa_node = -1;
+        numa_file >> numa_node;
+        return numa_node;
+    }
+#else
+    (void)gpu_device_id;
+#endif
+    return -1;
+}
+
+// Discover PCIe-affine NICs for a GPU device by comparing sysfs PCIe paths.
+// Returns NIC indices sorted by PCIe affinity (closest first, sharing the
+// longest common PCIe path prefix with the GPU).
+std::vector<size_t> MPComm::getGpuPcieAffinityNics(int gpu_device_id) const {
+    std::vector<size_t> result;
+    if (gpu_device_id < 0) return result;
+
+#ifdef USE_CUDA
+    // Get GPU's PCIe BDF from CUDA driver API
+    CUdevice cu_dev;
+    if (cuDeviceGet(&cu_dev, gpu_device_id) != CUDA_SUCCESS) {
+        return result;
+    }
+
+    char pci_bus_id_buf[64] = {0};
+    if (cuDeviceGetPCIBusId(pci_bus_id_buf, sizeof(pci_bus_id_buf), cu_dev) != CUDA_SUCCESS) {
+        return result;
+    }
+
+    // Normalize GPU BDF to lower case
+    std::string gpu_bdf(pci_bus_id_buf);
+    std::transform(gpu_bdf.begin(), gpu_bdf.end(), gpu_bdf.begin(), ::tolower);
+
+    // Resolve GPU's full sysfs PCIe path (e.g., /sys/devices/pci0000:00/0000:00:01.0/.../0000:3b:00.0)
+    std::string gpu_sysfs = "/sys/bus/pci/devices/" + gpu_bdf;
+    char gpu_resolved[PATH_MAX];
+    if (realpath(gpu_sysfs.c_str(), gpu_resolved) == nullptr) {
+        fprintf(stderr, "MPComm: Cannot resolve GPU %d sysfs path: %s\n",
+                gpu_device_id, gpu_sysfs.c_str());
+        return result;
+    }
+    std::string gpu_path(gpu_resolved);
+
+    // For each NIC, resolve its sysfs PCIe path and compute common prefix with GPU
+    struct NicAffinity {
+        size_t nic_index;
+        size_t common_prefix_len;  // Length of common PCIe path prefix with GPU
+    };
+    std::vector<NicAffinity> affinities;
+
+    for (size_t i = 0; i < nic_contexts_.size(); ++i) {
+        const auto& nic_name = nic_contexts_[i]->device_name;
+        // Resolve NIC's PCIe device path via sysfs
+        std::string nic_sysfs = "/sys/class/infiniband/" + nic_name + "/device";
+        char nic_resolved[PATH_MAX];
+        if (realpath(nic_sysfs.c_str(), nic_resolved) == nullptr) {
+            continue;
+        }
+        std::string nic_path(nic_resolved);
+
+        // Compute longest common prefix length between GPU and NIC PCIe paths
+        size_t common_len = 0;
+        size_t min_len = std::min(gpu_path.size(), nic_path.size());
+        for (size_t j = 0; j < min_len; ++j) {
+            if (gpu_path[j] == nic_path[j]) {
+                common_len = j + 1;
+            } else {
+                break;
+            }
+        }
+
+        affinities.push_back({i, common_len});
+    }
+
+    if (affinities.empty()) return result;
+
+    // Sort by common prefix length descending (closest PCIe affinity first)
+    std::sort(affinities.begin(), affinities.end(),
+              [](const NicAffinity& a, const NicAffinity& b) {
+                  return a.common_prefix_len > b.common_prefix_len;
+              });
+
+    // Find the maximum common prefix length
+    size_t max_common = affinities[0].common_prefix_len;
+
+    // Select NICs that share the maximum common PCIe path with GPU
+    // (these are under the same PCIe switch)
+    for (const auto& aff : affinities) {
+        if (aff.common_prefix_len == max_common) {
+            result.push_back(aff.nic_index);
+        }
+    }
+
+    // Print discovery result
+    printf("MPComm: GPU %d PCIe affinity discovery: %zu/%zu NICs share closest PCIe switch\n",
+           gpu_device_id, result.size(), nic_contexts_.size());
+    printf("MPComm:   GPU path: %s\n", gpu_path.c_str());
+    for (const auto& aff : affinities) {
+        const auto& nic_name = nic_contexts_[aff.nic_index]->device_name;
+        bool is_affine = (aff.common_prefix_len == max_common);
+        printf("MPComm:   %s: common_prefix=%zu%s\n",
+               nic_name.c_str(), aff.common_prefix_len,
+               is_affine ? " [AFFINE]" : "");
+    }
+#else
+    (void)gpu_device_id;
+#endif  // USE_CUDA
+
+    return result;
+}
+
+// Get PCIe-affine NIC indices for a registered memory address
+std::vector<size_t> MPComm::getPcieAffinityNicsForAddr(void* addr) const {
+    if (!addr || nic_contexts_.empty()) return {};
+
+    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+
+    const auto& ctx = *nic_contexts_[0];
+    for (const auto& mr : ctx.memory_regions) {
+        uintptr_t start = reinterpret_cast<uintptr_t>(mr.addr);
+        uintptr_t end = start + mr.length;
+        if (target >= start && target < end) {
+            return mr.pcie_affine_nic_indices;
+        }
+    }
+    return {};
 }
 
 // ============================================================================
@@ -1948,12 +2324,15 @@ int MPComm::connect(const std::string &remote_host_id,
     
     size_t total_connections = 0;
     
-    // Simple suffix-based matching strategy:
-    // Local NIC with suffix N connects to remote NIC with suffix N and N+4 (if they exist)
-    // Example: local mlx5_bond_1 -> remote mlx5_bond_1 + mlx5_bond_5
-    //          local mlx5_bond_2 -> remote mlx5_bond_2 + mlx5_bond_6
+    // Suffix-based matching strategy with cross-NUMA support:
+    // Local NIC with suffix N connects to:
+    //   1. Remote NIC with same suffix N (same relative position, primary)
+    //   2. Remote NIC with suffix N%4 or N-4 (cross-NUMA, secondary)
+    // This ensures that local NUMA1 NICs (suffix 4-7) can reach remote NUMA0 NICs (suffix 0-3)
+    // Example: local mlx5_bond_5 -> remote mlx5_bond_5 (same NUMA) + mlx5_bond_1 (cross NUMA)
+    //          local mlx5_bond_1 -> remote mlx5_bond_1 (same NUMA) + mlx5_bond_5 (cross NUMA)
     
-    printf("MPComm: Using suffix-based matching (N -> N and N+4)\n");
+    printf("MPComm: Using suffix-based matching (N -> N and N%%4 for cross-NUMA)\n");
     
     for (size_t local_nic = 0; local_nic < num_nics; ++local_nic) {
         auto &ctx = *nic_contexts_[local_nic];
@@ -1969,9 +2348,10 @@ int MPComm::connect(const std::string &remote_host_id,
             target_remote_nics.push_back(it->second[0]);
         }
         
-        // Secondary: find remote NIC with suffix N+4
-        int paired_suffix = local_suffix + 4;
-        auto it2 = remote_suffix_to_nics.find(paired_suffix);
+        // Secondary: find remote NIC with cross-NUMA suffix
+        // If local suffix >= 4, try N-4 (e.g., 5 -> 1); otherwise try N+4 (e.g., 1 -> 5)
+        int cross_numa_suffix = (local_suffix >= 4) ? (local_suffix - 4) : (local_suffix + 4);
+        auto it2 = remote_suffix_to_nics.find(cross_numa_suffix);
         if (it2 != remote_suffix_to_nics.end() && !it2->second.empty()) {
             target_remote_nics.push_back(it2->second[0]);
         }
@@ -1979,7 +2359,7 @@ int MPComm::connect(const std::string &remote_host_id,
         if (target_remote_nics.empty()) {
             // No matching suffix found, skip this local NIC
             printf("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC (checked %d and %d), skipping\n",
-                   local_nic, local_name.c_str(), local_suffix, local_suffix, paired_suffix);
+                   local_nic, local_name.c_str(), local_suffix, local_suffix, cross_numa_suffix);
             continue;
         }
         
@@ -2377,10 +2757,10 @@ void MPComm::acceptLoop() {
             }
         }
         
-        printf("MPComm: Passive side: Using suffix-based matching (N -> N and N+4)\n");
+        printf("MPComm: Passive side: Using suffix-based matching (N -> N and cross-NUMA)\n");
         
         // Calculate expected number of connections (must match active side exactly)
-        // Active side: for each local NIC with suffix N, connects to remote NICs with suffix N and N+4
+        // Active side: for each local NIC with suffix N, connects to remote NICs with suffix N and cross-NUMA
         // On passive side, we need to calculate how many remote NICs will connect to us
         size_t expected_connections = 0;
         
@@ -2388,16 +2768,17 @@ void MPComm::acceptLoop() {
         for (size_t remote_nic = 0; remote_nic < remote_num_nics; ++remote_nic) {
             int remote_suffix = extractNicSuffix(remote_nic_names[remote_nic]);
             
-            // Active side with suffix N will try to connect to local NICs with suffix N and N+4
+            // Active side with suffix N will try to connect to local NICs with suffix N and cross-NUMA
             // Count connections where we have matching suffix N (same as remote)
             if (local_suffix_to_nic.count(remote_suffix) > 0) {
                 expected_connections++;  // Primary: N -> N
             }
             
-            // Count connections where we have suffix N+4 (remote N connects to our N+4)
-            int paired_suffix = remote_suffix + 4;
-            if (local_suffix_to_nic.count(paired_suffix) > 0) {
-                expected_connections++;  // Secondary: N -> N+4
+            // Count connections where we have cross-NUMA suffix 
+            // Active side N connects to our N-4 (if N>=4) or N+4 (if N<4)
+            int cross_numa_suffix = (remote_suffix >= 4) ? (remote_suffix - 4) : (remote_suffix + 4);
+            if (local_suffix_to_nic.count(cross_numa_suffix) > 0) {
+                expected_connections++;  // Secondary: cross-NUMA
             }
         }
         
@@ -3003,13 +3384,24 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
         running_local_offset += lengths[i];
     }
     
+    ctx->prep_chunks_calc_time = std::chrono::steady_clock::now();
+    
     // Handle empty transfer
     if (total_chunks == 0) {
         ctx->total_chunks.store(0);
         ctx->total_completed.store(0);
         ctx->finished.store(true);
         ctx->error_code.store(MPCOMM_SUCCESS);
-        ctx->end_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        ctx->prep_chunks_fill_time = now;
+        ctx->prep_numa_query_time = now;
+        ctx->prep_flowctrl_time = now;
+        ctx->queued_time = now;
+        ctx->worker_start_time = now;
+        ctx->cache_done_time = now;
+        ctx->first_post_time = now;
+        ctx->all_posted_time = now;
+        ctx->end_time = now;
         
         TransferHandle handle = ctx->handle;
         {
@@ -3051,9 +3443,21 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
     ctx->total_chunks.store(total_chunks);
     ctx->next_chunk_idx.store(0);
     
-    // NUMA-aware NIC selection
+    ctx->prep_chunks_fill_time = std::chrono::steady_clock::now();
+    
+    // NUMA-aware NIC selection (with PCIe-affine upgrade for GPU memory)
     int memory_numa_node = getNumaNodeForAddr(reinterpret_cast<void*>(local_addr));
-    ctx->candidate_nic_indices = getLocalNicIndicesForNuma(memory_numa_node);
+    
+    // For GPU memory, prefer PCIe-affine NICs (sharing closest PCIe switch)
+    // This provides much finer granularity than NUMA-level selection,
+    // especially when all NICs are on the same NUMA node.
+    auto pcie_affine = getPcieAffinityNicsForAddr(reinterpret_cast<void*>(local_addr));
+    if (!pcie_affine.empty()) {
+        ctx->candidate_nic_indices = std::move(pcie_affine);
+    } else {
+        // CPU memory or PCIe affinity not available: fall back to NUMA-level selection
+        ctx->candidate_nic_indices = getLocalNicIndicesForNuma(memory_numa_node);
+    }
     
     if (ctx->candidate_nic_indices.empty()) {
         ctx->candidate_nic_indices.reserve(num_nics);
@@ -3061,6 +3465,8 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
             ctx->candidate_nic_indices.push_back(i);
         }
     }
+    
+    ctx->prep_numa_query_time = std::chrono::steady_clock::now();
     
     // Initialize per-NIC flow control state
     ctx->per_nic_posted.resize(num_nics, 0);
@@ -3073,29 +3479,34 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
         ctx->per_nic_qp_completed[nic].resize(qps_per_connection_, 0);
     }
     
-    printf("MPComm: %s started with %zu chunks across %zu candidate NICs (handle=%lu)\n",
-           op_name, total_chunks, ctx->candidate_nic_indices.size(), ctx->handle);
+    ctx->prep_flowctrl_time = std::chrono::steady_clock::now();
     
-    // Post initial chunks (synchronously post all, then return)
-    // This is "Mode A": sync post + async poll
+    
+    printf("MPComm: %s queued with %zu chunks across %zu candidate NICs (handle=%lu, numa=%d)\n",
+           op_name, total_chunks, ctx->candidate_nic_indices.size(), ctx->handle, memory_numa_node);
+    
+    // Fully async mode: submit task to a worker thread via lock-free queue
+    // Worker thread will handle all post and poll operations
     TransferHandle handle = ctx->handle;
-    TransferContext* ctx_ptr = ctx.get();  // Keep raw pointer before moving
     
-    // Store context first so progress can access it
+    // Determine which NUMA node should handle this transfer
+    int numa_id = getNumaForAddr(local_addr);
+    
+    // Record queued time before moving ctx
+    ctx->queued_time = std::chrono::steady_clock::now();
+    
+    // Store context first
     {
         std::lock_guard<std::mutex> lock(transfers_mutex_);
         active_transfers_[handle] = std::move(ctx);
     }
     
-    // Post all chunks now (blocking post, but fast)
-    // The actual transfer happens in the background via RDMA
-    // NOTE: Must not hold transfers_mutex_ while calling transferAsyncProgress
-    //       because it calls pollAllNicsForAsync which may need to acquire the lock
-    int ret = transferAsyncProgress(*ctx_ptr);
-    // If error during initial post, mark as finished with error
-    if (ret != MPCOMM_SUCCESS && ret != MPCOMM_ERR_PENDING) {
-        ctx_ptr->error_code.store(ret);
-        ctx_ptr->finished.store(true);
+    // Select a worker within the NUMA node (round-robin)
+    size_t worker_id = selectWorkerForNuma(numa_id);
+    
+    // Submit to worker's lock-free queue (busy-wait if queue is full)
+    while (!worker_queues_[worker_id]->tryPush(handle)) {
+        _mm_pause();  // CPU spin hint
     }
     
     return handle;
@@ -3210,248 +3621,31 @@ int MPComm::pollAllNicsForAsync(TransferContext& ctx) {
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::transferAsyncProgress(TransferContext& ctx) {
-    if (ctx.finished.load()) {
-        return ctx.error_code.load();
-    }
-    
-    const size_t max_outstanding_per_nic = 256 * qps_per_connection_;
-    constexpr size_t kMaxOutstandingPerQP = 256;
-    constexpr size_t kPollInterval = 64;  // Poll after every N posts for better batching
-    
-    size_t total_chunks = ctx.total_chunks.load();
-    size_t posts_since_last_poll = 0;
-    
-    // Cache connection info to avoid repeated lock acquisitions
-    // This is safe because connection info doesn't change during transfer
-    // Key: (host_idx << 16) | local_nic, supports multi-host with up to 65536 NICs per host
-    struct NicConnInfo {
-        size_t remote_nic;
-        uint32_t rkey;
-    };
-    std::unordered_map<uint64_t, NicConnInfo> nic_conn_cache;  // (host_idx, local_nic) -> cached info
-    
-    // Pre-cache connection info for all hosts and all candidate NICs
-    {
-        std::lock_guard<std::mutex> lock(connections_mutex_);
-        for (size_t host_idx = 0; host_idx < ctx.host_list.size(); ++host_idx) {
-            const std::string& host_id = ctx.host_list[host_idx];
-            auto conn_it = connections_.find(host_id);
-            if (conn_it != connections_.end()) {
-                for (size_t local_nic : ctx.candidate_nic_indices) {
-                    NicConnInfo info;
-                    info.remote_nic = local_nic;  // Default: same index
-                    const auto& nic_map = conn_it->second.local_to_remote_nic_map;
-                    auto map_it = nic_map.find(local_nic);
-                    if (map_it != nic_map.end() && !map_it->second.empty()) {
-                        info.remote_nic = map_it->second[0];
-                    }
-                    // Get rkey for this host's remote_addr
-                    info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[host_idx], info.remote_nic);
-                    uint64_t cache_key = (static_cast<uint64_t>(host_idx) << 16) | local_nic;
-                    nic_conn_cache[cache_key] = info;
-                }
-            }
-        }
-    }
-    
-    // Post remaining chunks
-    while (ctx.next_chunk_idx.load() < total_chunks) {
-        size_t chunk_idx = ctx.next_chunk_idx.load();
-        auto &chunk = ctx.all_chunks[chunk_idx];
-        
-        // Try to find a NIC with available slots (without polling first)
-        size_t best_nic = selectBestNicForAsync(ctx);
-        size_t outstanding = ctx.per_nic_posted[best_nic] - ctx.per_nic_completed[best_nic];
-        
-        // Only poll when NICs are getting full
-        if (outstanding >= max_outstanding_per_nic) {
-            // Poll to make room
-            int poll_ret = pollAllNicsForAsync(ctx);
-            if (poll_ret != MPCOMM_SUCCESS) {
-                return poll_ret;
-            }
-            continue;  // Re-select NIC after polling
-        }
-        
-        // Select QP with lowest outstanding within this NIC
-        size_t qp_index = 0;
-        size_t min_qp_outstanding = SIZE_MAX;
-        bool found_available_qp = false;
-        
-        for (size_t qp = 0; qp < qps_per_connection_; ++qp) {
-            size_t qp_outstanding = ctx.per_nic_qp_posted[best_nic][qp] - 
-                                    ctx.per_nic_qp_completed[best_nic][qp];
-            if (qp_outstanding < kMaxOutstandingPerQP && qp_outstanding < min_qp_outstanding) {
-                min_qp_outstanding = qp_outstanding;
-                qp_index = qp;
-                found_available_qp = true;
-            }
-        }
-        
-        if (!found_available_qp) {
-            // All QPs full, poll and retry
-            pollAllNicsForAsync(ctx);
-            continue;
-        }
-        
-        // Get lkey for this NIC
-        uint32_t lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
-        if (lkey == 0) {
-            fprintf(stderr, "MPComm: No lkey for address %p on NIC %zu\n",
-                    reinterpret_cast<void *>(chunk.local_addr), best_nic);
-            return MPCOMM_ERR_MEMORY;
-        }
-        
-        // Use cached connection info (fast path)
-        size_t host_idx_for_qp = chunk.host_idx;
-        uint64_t cache_key = (static_cast<uint64_t>(host_idx_for_qp) << 16) | best_nic;
-        auto cache_it = nic_conn_cache.find(cache_key);
-        size_t remote_nic;
-        uint32_t rkey;
-        
-        if (cache_it != nic_conn_cache.end()) {
-            // Fast path: use cached info
-            remote_nic = cache_it->second.remote_nic;
-            rkey = cache_it->second.rkey;
-        } else {
-            // Slow path: lookup from connection (cache miss)
-            const std::string& chunk_host_id = ctx.host_list[host_idx_for_qp];
-            remote_nic = best_nic;
-            
-            {
-                std::lock_guard<std::mutex> lock(connections_mutex_);
-                auto it = connections_.find(chunk_host_id);
-                if (it != connections_.end()) {
-                    const auto& nic_map = it->second.local_to_remote_nic_map;
-                    auto map_it = nic_map.find(best_nic);
-                    if (map_it != nic_map.end() && !map_it->second.empty()) {
-                        remote_nic = map_it->second[0];
-                    }
-                    rkey = it->second.getRkeyForAddr(chunk.remote_addr, remote_nic);
-                } else {
-                    rkey = 0;
-                }
-            }
-        }
-        
-        if (rkey == 0) {
-            fprintf(stderr, "MPComm: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
-                    remote_nic, chunk.remote_addr);
-            return MPCOMM_ERR_CONNECTION;
-        }
-        
-        struct ibv_qp *qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
-        if (!qp) {
-            fprintf(stderr, "MPComm: No QP for local NIC %zu -> remote NIC %zu\n",
-                    best_nic, remote_nic);
-            return MPCOMM_ERR_CONNECTION;
-        }
-        
-        // Prepare SGE and WR
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = chunk.local_addr;
-        sge.length = static_cast<uint32_t>(chunk.length);
-        sge.lkey = lkey;
-        
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        // Encode nic_index, qp_index, transfer_handle, and chunk_index in wr_id
-        // This enables routing completions to the correct TransferContext
-        wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
-        wr.opcode = ctx.is_scatter ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = chunk.remote_addr;
-        wr.wr.rdma.rkey = rkey;
-        
-        struct ibv_send_wr *bad_wr = nullptr;
-        int ret = ibv_post_send(qp, &wr, &bad_wr);
-        if (ret != 0) {
-            fprintf(stderr, "MPComm: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
-            return MPCOMM_ERR_TRANSFER;
-        }
-        
-        ctx.per_nic_posted[best_nic]++;
-        ctx.per_nic_qp_posted[best_nic][qp_index]++;
-        ctx.per_nic_bytes[best_nic] += chunk.length;
-        ctx.next_chunk_idx.fetch_add(1);
-        posts_since_last_poll++;
-        
-        // Proactive polling to release slots early (improves pipeline efficiency)
-        if (posts_since_last_poll >= kPollInterval) {
-            pollAllNicsForAsync(ctx);
-            posts_since_last_poll = 0;
-        }
-    }
-    
-    // Check if all completions received
-    if (ctx.total_completed.load() >= total_chunks) {
-        ctx.finished.store(true);
-        ctx.error_code.store(MPCOMM_SUCCESS);
-        ctx.end_time = std::chrono::steady_clock::now();
-        return MPCOMM_SUCCESS;
-    }
-    
-    return MPCOMM_ERR_PENDING;
-}
-
 bool MPComm::isTransferComplete(TransferHandle handle) {
-    TransferContext* ctx_ptr = nullptr;
-    
-    // First, quickly check if transfer exists and get pointer (with lock)
-    {
-        std::lock_guard<std::mutex> lock(transfers_mutex_);
-        auto it = active_transfers_.find(handle);
-        if (it == active_transfers_.end()) {
-            return true;  // Invalid handle is considered "complete"
-        }
-        ctx_ptr = it->second.get();
-        
-        // If already finished, return immediately (still under lock)
-        if (ctx_ptr->finished.load()) {
-            return true;
-        }
+    // Fully async mode: just check the finished flag (no polling here)
+    // Worker thread handles all post and poll operations
+    std::lock_guard<std::mutex> lock(transfers_mutex_);
+    auto it = active_transfers_.find(handle);
+    if (it == active_transfers_.end()) {
+        return true;  // Invalid handle is considered "complete"
     }
-    // Lock released here - safe to call pollAllNicsForAsync
-    
-    TransferContext& ctx = *ctx_ptr;
-    
-    // Poll for completions (without holding transfers_mutex_)
-    int ret = pollAllNicsForAsync(ctx);
-    if (ret != MPCOMM_SUCCESS) {
-        ctx.error_code.store(ret);
-        ctx.finished.store(true);
-        ctx.end_time = std::chrono::steady_clock::now();
-        return true;
-    }
-    
-    // Check if all completions received
-    size_t total_chunks = ctx.total_chunks.load();
-    if (ctx.total_completed.load() >= total_chunks) {
-        ctx.finished.store(true);
-        ctx.error_code.store(MPCOMM_SUCCESS);
-        ctx.end_time = std::chrono::steady_clock::now();
-        return true;
-    }
-    
-    return false;
+    return it->second->finished.load();
 }
 
 int MPComm::waitTransfer(TransferHandle handle, int timeout_ms) {
     auto start_time = std::chrono::steady_clock::now();
     
     while (true) {
-        if (isTransferComplete(handle)) {
-            // Get the error code
+        // Just check the finished flag (no polling)
+        {
             std::lock_guard<std::mutex> lock(transfers_mutex_);
             auto it = active_transfers_.find(handle);
             if (it == active_transfers_.end()) {
                 return MPCOMM_ERR_INVALID_HANDLE;
             }
-            return it->second->error_code.load();
+            if (it->second->finished.load()) {
+                return it->second->error_code.load();
+            }
         }
         
         // Check timeout
@@ -3463,8 +3657,8 @@ int MPComm::waitTransfer(TransferHandle handle, int timeout_ms) {
             }
         }
         
-        // Yield to avoid busy spinning
-        std::this_thread::yield();
+        // Sleep briefly to avoid busy spinning (worker thread does the work)
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
 
@@ -3533,6 +3727,350 @@ void MPComm::releaseTransfer(TransferHandle handle) {
         
         active_transfers_.erase(it);
     }
+}
+
+// ============================================================================
+// Worker Thread Implementation for Fully Async Transfer
+// ============================================================================
+
+void MPComm::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
+    // Bind this thread to a specific CPU if requested
+#ifdef __linux__
+    if (cpu_id >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_id, &cpuset);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+            printf("MPComm: Worker %zu (NUMA %d) bound to CPU %d\n", 
+                   worker_id, numa_id, cpu_id);
+        }
+    }
+#else
+    (void)cpu_id;  // Suppress unused parameter warning
+#endif
+    
+    printf("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n", 
+           worker_id, numa_id, static_cast<unsigned long>(pthread_self()));
+    
+    // Busy-poll loop (no condition variables, minimal latency)
+    size_t idle_spins = 0;
+    constexpr size_t kMaxIdleSpins = 10000;  // After this many idle spins, yield
+    
+    while (worker_running_.load(std::memory_order_relaxed)) {
+        // Try to get a task from our lock-free queue
+        TransferHandle handle = worker_queues_[worker_id]->tryPop();
+        
+        if (handle == INVALID_TRANSFER_HANDLE) {
+            // No work available
+            ++idle_spins;
+            if (idle_spins >= kMaxIdleSpins) {
+                // Yield CPU to avoid burning 100% when truly idle
+                _mm_pause();
+                idle_spins = 0;
+            }
+            continue;
+        }
+        
+        // Reset idle counter when we get work
+        idle_spins = 0;
+        
+        // Get the transfer context
+        TransferContext* ctx_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(transfers_mutex_);
+            auto it = active_transfers_.find(handle);
+            if (it == active_transfers_.end()) {
+                continue;  // Transfer was released before we got to it
+            }
+            ctx_ptr = it->second.get();
+        }
+        
+        // Process the transfer (post all chunks + poll until complete)
+        processTransfer(*ctx_ptr);
+    }
+    
+    printf("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
+}
+
+void MPComm::processTransfer(TransferContext& ctx) {
+    ctx.submitted.store(true);
+    ctx.worker_start_time = std::chrono::steady_clock::now();
+    
+    const size_t max_outstanding_per_nic = 256 * qps_per_connection_;
+    constexpr size_t kMaxOutstandingPerQP = 256;
+    constexpr size_t kPollInterval = 64;  // Poll after every N posts for better batching
+    
+    size_t total_chunks = ctx.total_chunks.load();
+    size_t posts_since_last_poll = 0;
+    bool first_post_recorded = false;
+    
+    // Cache connection info to avoid repeated lock acquisitions
+    struct NicConnInfo {
+        size_t remote_nic;
+        uint32_t rkey;
+    };
+    std::unordered_map<uint64_t, NicConnInfo> nic_conn_cache;
+    
+    // Pre-cache connection info for all hosts and all candidate NICs
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (size_t host_idx = 0; host_idx < ctx.host_list.size(); ++host_idx) {
+            const std::string& host_id = ctx.host_list[host_idx];
+            auto conn_it = connections_.find(host_id);
+            if (conn_it != connections_.end()) {
+                for (size_t local_nic : ctx.candidate_nic_indices) {
+                    NicConnInfo info;
+                    info.remote_nic = local_nic;  // Default: same index
+                    const auto& nic_map = conn_it->second.local_to_remote_nic_map;
+                    auto map_it = nic_map.find(local_nic);
+                    if (map_it != nic_map.end() && !map_it->second.empty()) {
+                        info.remote_nic = map_it->second[0];
+                    }
+                    info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[host_idx], info.remote_nic);
+                    uint64_t cache_key = (static_cast<uint64_t>(host_idx) << 16) | local_nic;
+                    nic_conn_cache[cache_key] = info;
+                }
+            }
+        }
+    }
+    ctx.cache_done_time = std::chrono::steady_clock::now();
+    
+    // Post and poll loop
+    while (ctx.next_chunk_idx.load() < total_chunks || ctx.total_completed.load() < total_chunks) {
+        // Check if shutdown requested
+        if (!worker_running_.load()) {
+            ctx.error_code.store(MPCOMM_ERR_TRANSFER);
+            ctx.finished.store(true);
+            ctx.end_time = std::chrono::steady_clock::now();
+            return;
+        }
+        
+        // Post remaining chunks
+        while (ctx.next_chunk_idx.load() < total_chunks) {
+            size_t chunk_idx = ctx.next_chunk_idx.load();
+            auto &chunk = ctx.all_chunks[chunk_idx];
+            
+            // Select best NIC
+            size_t best_nic = selectBestNicForAsync(ctx);
+            size_t outstanding = ctx.per_nic_posted[best_nic] - ctx.per_nic_completed[best_nic];
+            
+            // Flow control: poll when NICs are getting full
+            if (outstanding >= max_outstanding_per_nic) {
+                int poll_ret = pollAllNicsForAsync(ctx);
+                if (poll_ret != MPCOMM_SUCCESS) {
+                    ctx.error_code.store(poll_ret);
+                    ctx.finished.store(true);
+                    ctx.end_time = std::chrono::steady_clock::now();
+                    return;
+                }
+                continue;  // Re-select NIC after polling
+            }
+            
+            // Select QP with lowest outstanding within this NIC
+            size_t qp_index = 0;
+            size_t min_qp_outstanding = SIZE_MAX;
+            bool found_available_qp = false;
+            
+            for (size_t qp = 0; qp < qps_per_connection_; ++qp) {
+                size_t qp_outstanding = ctx.per_nic_qp_posted[best_nic][qp] - 
+                                        ctx.per_nic_qp_completed[best_nic][qp];
+                if (qp_outstanding < kMaxOutstandingPerQP && qp_outstanding < min_qp_outstanding) {
+                    min_qp_outstanding = qp_outstanding;
+                    qp_index = qp;
+                    found_available_qp = true;
+                }
+            }
+            
+            if (!found_available_qp) {
+                pollAllNicsForAsync(ctx);
+                continue;
+            }
+            
+            // Get lkey for this NIC
+            uint32_t lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
+            if (lkey == 0) {
+                fprintf(stderr, "MPComm: Worker: No lkey for address %p on NIC %zu\n",
+                        reinterpret_cast<void *>(chunk.local_addr), best_nic);
+                ctx.error_code.store(MPCOMM_ERR_MEMORY);
+                ctx.finished.store(true);
+                ctx.end_time = std::chrono::steady_clock::now();
+                return;
+            }
+            
+            // Use cached connection info
+            size_t host_idx_for_qp = chunk.host_idx;
+            uint64_t cache_key = (static_cast<uint64_t>(host_idx_for_qp) << 16) | best_nic;
+            auto cache_it = nic_conn_cache.find(cache_key);
+            size_t remote_nic;
+            uint32_t rkey;
+            
+            if (cache_it != nic_conn_cache.end()) {
+                remote_nic = cache_it->second.remote_nic;
+                rkey = cache_it->second.rkey;
+            } else {
+                const std::string& chunk_host_id = ctx.host_list[host_idx_for_qp];
+                remote_nic = best_nic;
+                
+                {
+                    std::lock_guard<std::mutex> lock(connections_mutex_);
+                    auto it = connections_.find(chunk_host_id);
+                    if (it != connections_.end()) {
+                        const auto& nic_map = it->second.local_to_remote_nic_map;
+                        auto map_it = nic_map.find(best_nic);
+                        if (map_it != nic_map.end() && !map_it->second.empty()) {
+                            remote_nic = map_it->second[0];
+                        }
+                        rkey = it->second.getRkeyForAddr(chunk.remote_addr, remote_nic);
+                    } else {
+                        rkey = 0;
+                    }
+                }
+            }
+            
+            if (rkey == 0) {
+                fprintf(stderr, "MPComm: Worker: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
+                        remote_nic, chunk.remote_addr);
+                ctx.error_code.store(MPCOMM_ERR_CONNECTION);
+                ctx.finished.store(true);
+                ctx.end_time = std::chrono::steady_clock::now();
+                return;
+            }
+            
+            struct ibv_qp *qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
+            if (!qp) {
+                fprintf(stderr, "MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
+                        best_nic, remote_nic);
+                ctx.error_code.store(MPCOMM_ERR_CONNECTION);
+                ctx.finished.store(true);
+                ctx.end_time = std::chrono::steady_clock::now();
+                return;
+            }
+            
+            // Prepare SGE and WR
+            struct ibv_sge sge;
+            memset(&sge, 0, sizeof(sge));
+            sge.addr = chunk.local_addr;
+            sge.length = static_cast<uint32_t>(chunk.length);
+            sge.lkey = lkey;
+            
+            struct ibv_send_wr wr;
+            memset(&wr, 0, sizeof(wr));
+            wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
+            wr.opcode = ctx.is_scatter ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            wr.wr.rdma.remote_addr = chunk.remote_addr;
+            wr.wr.rdma.rkey = rkey;
+            
+            struct ibv_send_wr *bad_wr = nullptr;
+            int ret = ibv_post_send(qp, &wr, &bad_wr);
+            if (ret != 0) {
+                fprintf(stderr, "MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
+                ctx.error_code.store(MPCOMM_ERR_TRANSFER);
+                ctx.finished.store(true);
+                ctx.end_time = std::chrono::steady_clock::now();
+                return;
+            }
+            
+            ctx.per_nic_posted[best_nic]++;
+            ctx.per_nic_qp_posted[best_nic][qp_index]++;
+            ctx.per_nic_bytes[best_nic] += chunk.length;
+            ctx.next_chunk_idx.fetch_add(1);
+            posts_since_last_poll++;
+            
+            // Record first post time
+            if (!first_post_recorded) {
+                ctx.first_post_time = std::chrono::steady_clock::now();
+                first_post_recorded = true;
+            }
+            
+            // Proactive polling for pipeline efficiency
+            if (posts_since_last_poll >= kPollInterval) {
+                pollAllNicsForAsync(ctx);
+                posts_since_last_poll = 0;
+            }
+        }
+        
+        // Record all_posted_time when all chunks have been posted (only once)
+        if (ctx.next_chunk_idx.load() >= total_chunks && 
+            ctx.all_posted_time.time_since_epoch().count() == 0) {
+            ctx.all_posted_time = std::chrono::steady_clock::now();
+        }
+        
+        // All chunks posted, poll for remaining completions
+        if (ctx.total_completed.load() < total_chunks) {
+            int poll_ret = pollAllNicsForAsync(ctx);
+            if (poll_ret != MPCOMM_SUCCESS) {
+                ctx.error_code.store(poll_ret);
+                ctx.finished.store(true);
+                ctx.end_time = std::chrono::steady_clock::now();
+                return;
+            }
+            // Brief pause to avoid busy-spinning
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+    }
+    
+    // All done
+    ctx.finished.store(true);
+    ctx.error_code.store(MPCOMM_SUCCESS);
+    ctx.end_time = std::chrono::steady_clock::now();
+    
+    // Print timing breakdown for this transfer
+    auto to_us = [](const std::chrono::steady_clock::time_point& start,
+                    const std::chrono::steady_clock::time_point& end) -> double {
+        return std::chrono::duration<double, std::micro>(end - start).count();
+    };
+    
+    // Calculate total bytes transferred
+    size_t total_bytes = 0;
+    for (const auto& chunk : ctx.all_chunks) {
+        total_bytes += chunk.length;
+    }
+    
+    double total_time_us = to_us(ctx.start_time, ctx.end_time);
+    double bandwidth_gbps = (total_bytes * 8.0) / (total_time_us * 1000.0);  // Gbps
+    
+    printf("MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
+           ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
+    printf("  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
+    printf("      [1a] Chunk calc:                 %8.1f us\n", to_us(ctx.start_time, ctx.prep_chunks_calc_time));
+    printf("      [1b] Chunk fill:                 %8.1f us\n", to_us(ctx.prep_chunks_calc_time, ctx.prep_chunks_fill_time));
+    printf("      [1c] NUMA query:                 %8.1f us\n", to_us(ctx.prep_chunks_fill_time, ctx.prep_numa_query_time));
+    printf("      [1d] FlowCtrl init:              %8.1f us\n", to_us(ctx.prep_numa_query_time, ctx.prep_flowctrl_time));
+    printf("      [1e] Queue submit:               %8.1f us\n", to_us(ctx.prep_flowctrl_time, ctx.queued_time));
+    printf("  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
+    printf("  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
+    printf("  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
+    printf("  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
+    printf("  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
+}
+
+int MPComm::getNumaForAddr(uintptr_t addr) const {
+    // Get NUMA node for the memory address
+    int numa_node = getNumaNodeForAddr(reinterpret_cast<void*>(addr));
+    
+    // If NUMA node is valid and within range, use it
+    if (numa_node >= 0 && static_cast<size_t>(numa_node) < num_numa_nodes_) {
+        return numa_node;
+    }
+    
+    // Fallback: use address hash to distribute across NUMA nodes
+    return static_cast<int>((addr >> 12) % num_numa_nodes_);
+}
+
+size_t MPComm::selectWorkerForNuma(int numa_id) {
+    // Ensure numa_id is valid
+    if (numa_id < 0 || static_cast<size_t>(numa_id) >= num_numa_nodes_) {
+        numa_id = 0;
+    }
+    
+    // Round-robin selection among workers for this NUMA node
+    size_t local_idx = numa_worker_rr_[numa_id]->fetch_add(1, std::memory_order_relaxed) % kWorkersPerNuma;
+    
+    // Convert to global worker ID
+    return static_cast<size_t>(numa_id) * kWorkersPerNuma + local_idx;
 }
 
 // ==================== End Async Transfer Implementation ====================

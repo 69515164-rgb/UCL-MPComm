@@ -30,6 +30,12 @@ Usage:
     # Run async scatter test
     python test_mpcomm.py --mode scatter --async --targets target1:192.168.1.100:12345
     
+    # GPU source test (scatter from GPU HBM via GPUDirect RDMA)
+    python test_mpcomm.py --mode scatter --async --gpu 0 --targets target1:192.168.1.100:12345
+    
+    # GPU source performance test
+    python test_mpcomm.py --mode scatter --async --gpu 0 --test-mode performance --iterations 10 --targets target1:192.168.1.100:12345
+    
     # Multi-NUMA test (use NUMA nodes 0 and 1)
     python test_mpcomm.py --mode scatter --async --num-numas 0,1 --targets target1:192.168.1.100:12345
     
@@ -204,6 +210,7 @@ class MPCommTestHarness:
         max_chunk_size: int,
         num_threads: int,
         performance_mode: bool = False,
+        gpu_device: int = -1,
     ) -> None:
         self.host_id = host_id
         self.device_name = device_name
@@ -212,6 +219,8 @@ class MPCommTestHarness:
         self.max_chunk_size = max_chunk_size
         self.num_threads = num_threads
         self.performance_mode = performance_mode
+        self.gpu_device = gpu_device  # -1 = CPU, >=0 = CUDA device ordinal
+        self.use_gpu = gpu_device >= 0
 
         if min_chunk_size <= 0 or max_chunk_size <= 0:
             raise ValueError("Chunk sizes must be positive integers")
@@ -228,6 +237,16 @@ class MPCommTestHarness:
             raise RuntimeError(f"MPComm initialization failed with code {ret}")
 
         print(f"[test] Initialized MPComm with {self.comm.get_num_nics()} NICs")
+
+        # Set up GPU device if requested
+        if self.use_gpu:
+            if not torch.cuda.is_available():
+                raise RuntimeError("--gpu requested but CUDA is not available")
+            if gpu_device >= torch.cuda.device_count():
+                raise RuntimeError(f"GPU device {gpu_device} not found, "
+                                   f"available: {torch.cuda.device_count()}")
+            torch.cuda.set_device(gpu_device)
+            print(f"[test] Using GPU device {gpu_device}: {torch.cuda.get_device_name(gpu_device)}")
 
         # Allocate and register local buffer
         self._tensor: Optional[torch.Tensor] = None
@@ -255,8 +274,17 @@ class MPCommTestHarness:
         self._connect_targets()
 
     def _allocate_buffer(self) -> int:
-        """Allocate a tensor buffer and register it for RDMA."""
-        tensor = torch.empty(self.buffer_capacity, dtype=torch.uint8)
+        """Allocate a tensor buffer and register it for RDMA.
+        
+        When gpu_device >= 0, allocates on GPU HBM (CUDA device memory).
+        The C++ registerMemory will detect GPU memory via cuPointerGetAttribute
+        and use nvidia-peermem ODP for GPUDirect RDMA registration.
+        """
+        if self.use_gpu:
+            tensor = torch.empty(self.buffer_capacity, dtype=torch.uint8,
+                                 device=f"cuda:{self.gpu_device}")
+        else:
+            tensor = torch.empty(self.buffer_capacity, dtype=torch.uint8)
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         addr = tensor.data_ptr()
@@ -266,7 +294,8 @@ class MPCommTestHarness:
             raise RuntimeError(f"Failed to register memory: {ret}")
 
         self._tensor = tensor
-        print(f"[test] Registered buffer at 0x{addr:x} ({_format_bytes(self.buffer_capacity)})")
+        mem_type = f"GPU:{self.gpu_device}" if self.use_gpu else "CPU"
+        print(f"[test] Registered {mem_type} buffer at 0x{addr:x} ({_format_bytes(self.buffer_capacity)})")
         return addr
 
     def _connect_targets(self) -> None:
@@ -300,32 +329,51 @@ class MPCommTestHarness:
 
     def _reset_local_buffer(self) -> None:
         """Reset local buffer to base IPv4 pattern."""
-        ret = self.comm.write_bytes_to_buffer(
-            self.local_buffer_addr,
-            self._base_buffer_pattern,
-            len(self._base_buffer_pattern)
-        )
-        if ret != 0:
-            raise RuntimeError("Failed to reset local buffer")
+        if self.use_gpu:
+            # For GPU memory, use PyTorch tensor operations (CPU->GPU copy)
+            pattern_tensor = torch.frombuffer(
+                bytearray(self._base_buffer_pattern), dtype=torch.uint8
+            )
+            self._tensor.copy_(pattern_tensor)
+        else:
+            ret = self.comm.write_bytes_to_buffer(
+                self.local_buffer_addr,
+                self._base_buffer_pattern,
+                len(self._base_buffer_pattern)
+            )
+            if ret != 0:
+                raise RuntimeError("Failed to reset local buffer")
 
     def _write_local_chunk(self, offset: int, payload: bytes) -> None:
         """Write data to local buffer at offset."""
-        addr = self.local_buffer_addr + offset
-        ret = self.comm.write_bytes_to_buffer(addr, payload, len(payload))
-        if ret != 0:
-            raise RuntimeError(f"Failed to write local chunk at offset {offset}")
+        if self.use_gpu:
+            # For GPU memory, use PyTorch tensor slice copy (CPU->GPU)
+            payload_tensor = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+            self._tensor[offset:offset + len(payload)].copy_(payload_tensor)
+        else:
+            addr = self.local_buffer_addr + offset
+            ret = self.comm.write_bytes_to_buffer(addr, payload, len(payload))
+            if ret != 0:
+                raise RuntimeError(f"Failed to write local chunk at offset {offset}")
 
     def _clear_local_chunk(self, offset: int, length: int) -> None:
         """Clear local buffer region with zeros."""
-        addr = self.local_buffer_addr + offset
-        ret = self.comm.write_bytes_to_buffer(addr, bytes(length), length)
-        if ret != 0:
-            raise RuntimeError(f"Failed to clear local chunk at offset {offset}")
+        if self.use_gpu:
+            self._tensor[offset:offset + length].zero_()
+        else:
+            addr = self.local_buffer_addr + offset
+            ret = self.comm.write_bytes_to_buffer(addr, bytes(length), length)
+            if ret != 0:
+                raise RuntimeError(f"Failed to clear local chunk at offset {offset}")
 
     def _read_local_bytes(self, offset: int, length: int) -> bytes:
         """Read bytes from local buffer."""
         if length <= 0:
             return b""
+        if self.use_gpu:
+            # For GPU memory, copy slice to CPU then convert to bytes
+            cpu_slice = self._tensor[offset:offset + length].cpu()
+            return bytes(cpu_slice.numpy().tobytes())
         return self.comm.read_bytes_from_buffer(self.local_buffer_addr + offset, length)
 
     def build_replication_plan(self, seed: int, mode: str = "scatter") -> ReplicationPlan:
@@ -2153,6 +2201,12 @@ Examples:
     # Async mode with polling (non-blocking)
     python test_mpcomm.py --mode scatter --async --async-mode polling --targets target1:192.168.1.100:12345
 
+    # GPU source scatter (GPUDirect RDMA via nvidia-peermem)
+    python test_mpcomm.py --mode scatter --async --gpu 0 --targets target1:192.168.1.100:12345
+
+    # GPU source performance test
+    python test_mpcomm.py --mode scatter --async --gpu 0 --test-mode performance --iterations 10 --targets target1:192.168.1.100:12345
+
     # Multi-NUMA test (use NUMA nodes 0 and 1 with parallel async transfers)
     python test_mpcomm.py --mode scatter --async --num-numas 0,1 --targets target1:192.168.1.100:12345
     
@@ -2240,6 +2294,16 @@ Examples:
         "--threaded",
         action="store_true",
         help="Use separate thread + MPComm instance per NUMA node (requires --num-numas)",
+    )
+
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=-1,
+        metavar="DEVICE_ID",
+        help="Use GPU HBM as source memory via GPUDirect RDMA. "
+             "Specify CUDA device ordinal (e.g., --gpu 0). "
+             "Default: -1 (CPU memory)",
     )
 
     parser.add_argument(
@@ -2564,6 +2628,16 @@ def main() -> None:
     
     use_multi_numa = len(numa_nodes) > 0
     use_threaded = args.threaded
+    gpu_device = args.gpu
+    use_gpu = gpu_device >= 0
+
+    if use_gpu and use_multi_numa:
+        print("[warning] --gpu is not compatible with --num-numas, ignoring --num-numas")
+        use_multi_numa = False
+
+    if use_gpu and not args.use_async:
+        print("[info] GPU source mode requires async API, enabling --async automatically")
+        args.use_async = True
 
     if use_multi_numa:
         if not args.use_async:
@@ -2644,6 +2718,7 @@ def main() -> None:
             max_chunk_size=args.max_chunk_size,
             num_threads=args.num_threads,
             performance_mode=is_performance_mode,
+            gpu_device=gpu_device,
         )
 
         try:

@@ -313,6 +313,13 @@ struct TransferResult {
     double elapsed_ms;        // Transfer time in milliseconds
 };
 
+// Transfer direction for unified scatter/gather/broadcast implementation
+enum class TransferDirection {
+    SCATTER,    // local -> remote (RDMA WRITE), local offset advances
+    GATHER,     // remote -> local (RDMA READ), local offset advances
+    BROADCAST   // local -> remote (RDMA WRITE), same local data to all hosts
+};
+
 // Forward declaration
 class MPComm;
 
@@ -330,7 +337,7 @@ struct TransferContext {
     std::vector<std::string> host_list;
     std::vector<uintptr_t> remote_addrs;
     std::vector<size_t> lengths;
-    bool is_scatter;                                // true=scatter, false=gather
+    TransferDirection direction;                     // Transfer direction (scatter/gather/broadcast)
     
     // All chunks to be transferred
     std::vector<ChunkTask> all_chunks;
@@ -371,7 +378,7 @@ struct TransferContext {
         , finished(false)
         , submitted(false)
         , local_addr(0)
-        , is_scatter(true)
+        , direction(TransferDirection::SCATTER)
         , next_chunk_idx(0)
         , rr_nic_index(0) {}
     
@@ -603,6 +610,35 @@ public:
                                const std::vector<std::string> &host_list,
                                const std::vector<uintptr_t> &remote_addrs,
                                const std::vector<size_t> &lengths);
+
+    /**
+     * Start async broadcast operation (returns immediately)
+     * 
+     * Broadcast the same local data to multiple remote hosts using RDMA WRITE.
+     * Unlike scatter where local data is split across hosts, broadcast sends
+     * the SAME local data region to every destination.
+     * 
+     * Data layout:
+     *   local_buffer[0..length] -> host_list[0]:remote_addrs[0]
+     *   local_buffer[0..length] -> host_list[1]:remote_addrs[1]
+     *   local_buffer[0..length] -> host_list[2]:remote_addrs[2]
+     *   ...
+     * 
+     * Each destination receives an identical copy of local_buffer[0..length].
+     * The host_list and remote_addrs must have the same size.
+     * 
+     * Use isTransferComplete() or waitTransfer() to check/wait for completion.
+     * 
+     * @param local_addr       Local buffer address (must be registered)
+     * @param length           Data length to broadcast (same for all destinations)
+     * @param host_list        List of destination host IDs
+     * @param remote_addrs     Remote buffer addresses on each host
+     * @return TransferHandle on success, INVALID_TRANSFER_HANDLE on failure
+     */
+    TransferHandle broadcastAsync(uintptr_t local_addr,
+                                  size_t length,
+                                  const std::vector<std::string> &host_list,
+                                  const std::vector<uintptr_t> &remote_addrs);
 
     /**
      * Check if async transfer is complete (non-blocking)
@@ -859,12 +895,6 @@ private:
 
     // Handle buffer query request from remote
     void handleBufferQuery(int client_fd);
-
-    // Transfer direction for unified scatter/gather implementation
-    enum class TransferDirection {
-        SCATTER,  // local -> remote (RDMA WRITE)
-        GATHER    // remote -> local (RDMA READ)
-    };
 
     // Async transfer implementation - prepares context and posts initial chunks
     TransferHandle transferAsyncStart(uintptr_t local_addr,

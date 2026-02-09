@@ -16,14 +16,14 @@
 
 """MPComm Test Script
 
-Tests mp_replicate (scatter/gather) functionality using MPComm.
+Tests mp_replicate (scatter/gather/broadcast) functionality using MPComm.
 This script runs on the initiator host and performs RDMA operations
 to one or more target hosts.
 
-All transfers go through the async C++ path (scatter_async / gather_async
-+ wait_transfer or is_transfer_complete).  A single MPComm instance is
-used regardless of how many NUMA buffers are allocated; the C++ layer
-handles multi-NIC dispatching and worker-thread binding internally.
+All transfers go through the async C++ path (scatter_async / gather_async /
+broadcast_async + wait_transfer or is_transfer_complete).  A single MPComm
+instance is used regardless of how many NUMA buffers are allocated; the C++
+layer handles multi-NIC dispatching and worker-thread binding internally.
 
 Usage:
     # Basic scatter test (single NUMA, default NUMA 0)
@@ -31,6 +31,12 @@ Usage:
 
     # Gather test
     python test_mpcomm.py --mode gather --targets target1:192.168.1.100:12345
+
+    # Broadcast test (same data to all targets)
+    python test_mpcomm.py --mode broadcast --targets target1:192.168.1.100:12345
+
+    # All modes (scatter + gather + broadcast)
+    python test_mpcomm.py --mode all --targets target1:192.168.1.100:12345
 
     # Polling completion mode
     python test_mpcomm.py --mode scatter --async-mode polling --targets target1:192.168.1.100:12345
@@ -177,6 +183,18 @@ class ReplicationPlan:
     payloads: List[bytes]
 
 
+@dataclass
+class BroadcastPlan:
+    """Plan for broadcast operation.
+
+    Unlike ReplicationPlan where each target gets a different slice of the
+    local buffer, broadcast sends the same local region to every target.
+    """
+    length: int                     # Broadcast data length (same for all targets)
+    remote_addresses: List[int]     # One remote addr per target
+    payload: bytes                  # Expected data (single copy)
+
+
 class PerformanceTracker:
     """Track performance metrics."""
 
@@ -211,7 +229,8 @@ class MPCommTestHarness:
         GPUDirect RDMA via nvidia-peermem.
 
     The only C++ transfer path used is:
-        scatter_async / gather_async  +  wait_transfer / is_transfer_complete
+        scatter_async / gather_async / broadcast_async
+        + wait_transfer / is_transfer_complete
     """
 
     # ------------------------------------------------------------------
@@ -486,7 +505,7 @@ class MPCommTestHarness:
         )
 
     # ------------------------------------------------------------------
-    # Replication plan
+    # Replication plan (scatter / gather)
     # ------------------------------------------------------------------
     def build_replication_plan(self, seed: int, mode: str = "scatter") -> ReplicationPlan:
         """Build a replication plan with random chunk sizes."""
@@ -518,6 +537,30 @@ class MPCommTestHarness:
                     payloads.append(self._base_buffer_pattern[start:start + length])
 
         return ReplicationPlan(lengths, offsets, remote_addresses, payloads)
+
+    # ------------------------------------------------------------------
+    # Broadcast plan
+    # ------------------------------------------------------------------
+    def build_broadcast_plan(self, seed: int) -> BroadcastPlan:
+        """Build a broadcast plan with random data length.
+
+        Broadcast sends the SAME data to every target.  The length is
+        randomly chosen between min_chunk_size and max_chunk_size.
+        """
+        rng = random.Random(seed)
+        length = rng.randint(self.min_chunk_size, self.max_chunk_size)
+
+        remote_addresses = [t.remote_addr for t in self.targets]
+
+        payload = b""
+        if not self.performance_mode:
+            payload = self._base_buffer_pattern[:length]
+
+        return BroadcastPlan(
+            length=length,
+            remote_addresses=remote_addresses,
+            payload=payload,
+        )
 
     def get_remote_addresses_for_numa(self, idx: int) -> List[int]:
         """Return per-target remote addresses for NUMA index *idx*."""
@@ -721,10 +764,177 @@ class MPCommTestHarness:
         return wall_duration, total_bytes, per_numa_durations
 
     # ------------------------------------------------------------------
+    # Broadcast
+    # ------------------------------------------------------------------
+    def run_broadcast(
+        self,
+        seed: int,
+        *,
+        prepare_payload: bool = True,
+        verify: bool = True,
+        reset: bool = True,
+        plan: Optional[BroadcastPlan] = None,
+        timeout_ms: int = -1,
+        poll_interval_us: int = 0,
+    ) -> Tuple[float, int, List[float]]:
+        """Broadcast local buffer to all remote targets (RDMA WRITE).
+
+        Each NUMA buffer broadcasts the SAME data to every target.
+        Returns:
+            (wall_duration, total_bytes, per_numa_durations)
+        """
+        if plan is None:
+            plan = self.build_broadcast_plan(seed)
+
+        host_list = [t.host_id for t in self.targets]
+        # Total bytes = length * num_targets * num_numas
+        total_bytes = plan.length * len(self.targets) * self.num_numas
+        use_polling = poll_interval_us > 0
+
+        # Prepare buffers – write the broadcast payload at offset 0
+        for numa_idx in range(self.num_numas):
+            if prepare_payload and plan.payload:
+                self._write_chunk(numa_idx, 0, plan.payload)
+
+        # Submit one broadcast_async per NUMA buffer
+        handles: List[Tuple[int, int]] = []  # (numa_idx, handle)
+        wall_start = time.perf_counter()
+
+        for numa_idx in range(self.num_numas):
+            local_addr = self.local_buffer_addrs[numa_idx]
+            remote_addrs = self.get_remote_addresses_for_numa(numa_idx)
+
+            handle = self.comm.broadcast_async(
+                local_addr, plan.length, host_list, remote_addrs)
+
+            if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+                for _, h in handles:
+                    self.comm.release_transfer(h)
+                raise RuntimeError(
+                    f"broadcast_async failed for buffer {numa_idx} "
+                    f"(NUMA {self.numa_nodes[numa_idx]})")
+
+            handles.append((numa_idx, handle))
+
+        # Wait for completion
+        per_numa_results: Dict[int, Dict] = {}
+        total_polls = 0
+
+        if use_polling:
+            pending = set(range(len(handles)))
+            poll_counts = {i: 0 for i in range(len(handles))}
+            while pending:
+                done = set()
+                for i in list(pending):
+                    numa_idx, handle = handles[i]
+                    poll_counts[i] += 1
+                    if self.comm.is_transfer_complete(handle):
+                        done.add(i)
+                pending -= done
+                if pending:
+                    time.sleep(poll_interval_us / 1_000_000)
+            total_polls = sum(poll_counts.values())
+        else:
+            for numa_idx, handle in handles:
+                ret = self.comm.wait_transfer(handle, timeout_ms)
+                if ret != 0:
+                    for _, h in handles:
+                        self.comm.release_transfer(h)
+                    raise RuntimeError(
+                        f"wait_transfer failed for buffer {numa_idx} "
+                        f"(NUMA {self.numa_nodes[numa_idx]}): {ret}")
+
+        wall_duration = time.perf_counter() - wall_start
+
+        # Collect results and release handles
+        for numa_idx, handle in handles:
+            result = self.comm.get_transfer_result(handle)
+            self.comm.release_transfer(handle)
+            if result["error_code"] != 0:
+                raise RuntimeError(
+                    f"Transfer error on buffer {numa_idx} "
+                    f"(NUMA {self.numa_nodes[numa_idx]}): {result['error_code']}")
+            per_numa_results[numa_idx] = {
+                "elapsed_ms": result["elapsed_ms"],
+            }
+
+        per_numa_durations = [
+            per_numa_results.get(i, {}).get("elapsed_ms", 0) / 1000.0
+            for i in range(self.num_numas)
+        ]
+
+        if use_polling:
+            print(f"  [async polling] completed after {total_polls} total polls")
+
+        # Verification: read back from each target and compare
+        if verify:
+            for numa_idx in range(self.num_numas):
+                self._verify_broadcast(numa_idx, plan)
+
+        if reset:
+            self._reset_all_buffers()
+
+        return wall_duration, total_bytes, per_numa_durations
+
+    # ------------------------------------------------------------------
     # Verification
     # ------------------------------------------------------------------
+    def _verify_broadcast(self, idx: int, plan: BroadcastPlan) -> None:
+        """Verify broadcast by reading back from each remote via gather_async.
+
+        For each target we issue a gather of *plan.length* bytes from the
+        remote address, then compare with the expected payload.
+        """
+        numa_node = self.numa_nodes[idx]
+        host_list = [t.host_id for t in self.targets]
+        remote_addrs = self.get_remote_addresses_for_numa(idx)
+
+        # Build a gather with the same length for every target, writing
+        # results sequentially into our local buffer.
+        lengths = [plan.length] * len(self.targets)
+        offsets: List[int] = []
+        cursor = 0
+        for l in lengths:
+            offsets.append(cursor)
+            cursor += l
+
+        # Clear the local region that will receive the gather data
+        for offset, length in zip(offsets, lengths):
+            self._clear_chunk(idx, offset, length)
+
+        handle = self.comm.gather_async(
+            self.local_buffer_addrs[idx], host_list,
+            remote_addrs, lengths,
+        )
+        if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+            print(f"[broadcast verify NUMA {numa_node}] gather_async failed",
+                  file=sys.stderr)
+            return
+        ret = self.comm.wait_transfer(handle)
+        self.comm.release_transfer(handle)
+        if ret != 0:
+            print(f"[broadcast verify NUMA {numa_node}] read-back failed",
+                  file=sys.stderr)
+            return
+
+        for i, (offset, length) in enumerate(zip(offsets, lengths)):
+            if length <= 0:
+                continue
+            expected = plan.payload
+            actual = self._read_bytes(idx, offset, length)
+            if actual != expected:
+                print(f"[broadcast verify NUMA {numa_node}] "
+                      f"target={self.targets[i].host_id} "
+                      f"expected={_preview_hex(expected)} "
+                      f"actual={_preview_hex(actual)}")
+                raise AssertionError(
+                    f"Broadcast verification failed NUMA {numa_node} "
+                    f"target {self.targets[i].host_id}")
+            print(f"[broadcast verify NUMA {numa_node}] "
+                  f"target={self.targets[i].host_id} len={length}B OK")
+
     def _verify_scatter(self, idx: int, plan: ReplicationPlan) -> None:
-        """Verify scatter by reading back from remotes via gather."""
+        """Verify scatter by reading back from remotes via gather_async."""
         numa_node = self.numa_nodes[idx]
         host_list = [t.host_id for t in self.targets]
         remote_addrs = self.get_remote_addresses_for_numa(idx)
@@ -732,10 +942,16 @@ class MPCommTestHarness:
         for offset, length in zip(plan.offsets, plan.lengths):
             self._clear_chunk(idx, offset, length)
 
-        ret = self.comm.gather(
+        handle = self.comm.gather_async(
             self.local_buffer_addrs[idx], host_list,
-            remote_addrs, plan.lengths, self.num_threads,
+            remote_addrs, plan.lengths,
         )
+        if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+            print(f"[scatter verify NUMA {numa_node}] gather_async failed",
+                  file=sys.stderr)
+            return
+        ret = self.comm.wait_transfer(handle)
+        self.comm.release_transfer(handle)
         if ret != 0:
             print(f"[scatter verify NUMA {numa_node}] read-back failed",
                   file=sys.stderr)
@@ -804,6 +1020,7 @@ class MPCommTestHarness:
 # Default seeds (base36 encoded)
 SCATTER_SEED = int("5CATT3R", 36)
 GATHER_SEED = int("6A7H3R", 36)
+BROADCAST_SEED = int("BR0ADCA", 36)
 
 
 def parse_target(target_str: str) -> TargetInfo:
@@ -864,6 +1081,12 @@ Examples:
     # Basic scatter (single NUMA 0, wait completion)
     python test_mpcomm.py --mode scatter --targets target1:192.168.1.100:12345
 
+    # Broadcast (same data to all targets)
+    python test_mpcomm.py --mode broadcast --targets target1:192.168.1.100:12345
+
+    # All modes (scatter + gather + broadcast)
+    python test_mpcomm.py --mode all --targets target1:192.168.1.100:12345
+
     # Polling completion mode
     python test_mpcomm.py --mode scatter --async-mode polling --targets target1:192.168.1.100:12345
 
@@ -874,7 +1097,7 @@ Examples:
     python test_mpcomm.py --mode scatter --gpu 0 --test-mode performance --iterations 10 \\
         --targets target1:192.168.1.100:12345
 
-    # Multi-NUMA (separate MPComm + thread per NUMA)
+    # Multi-NUMA (single MPComm, multiple buffers on different NUMA nodes)
     python test_mpcomm.py --mode scatter --num-numas 0,1 --targets target1:192.168.1.100:12345
 
     # Single specific NUMA node
@@ -885,17 +1108,18 @@ Examples:
         --targets target1:192.168.1.100:12345 \\
         --targets target2:114.193.206.253:12345
 
-    # Performance mode with 10 iterations
-    python test_mpcomm.py --mode scatter --test-mode performance --iterations 10 \\
+    # Broadcast performance test
+    python test_mpcomm.py --mode broadcast --test-mode performance --iterations 10 \\
         --targets target1:192.168.1.100:12345
 """,
     )
 
     parser.add_argument(
         "--mode",
-        choices=["scatter", "gather", "both"],
+        choices=["scatter", "gather", "broadcast", "both", "all"],
         default="both",
-        help="Operation mode (default: both)",
+        help="Operation mode: scatter, gather, broadcast, both (scatter+gather), "
+             "or all (scatter+gather+broadcast). Default: both",
     )
 
     parser.add_argument(
@@ -967,6 +1191,11 @@ Examples:
     )
 
     parser.add_argument(
+        "--broadcast-seed",
+        help="Seed for broadcast plan (supports base-36 strings)",
+    )
+
+    parser.add_argument(
         "--test-mode",
         choices=["correctness", "performance"],
         default="correctness",
@@ -1030,10 +1259,12 @@ def run_tests(
     args: argparse.Namespace,
     scatter_seed: int,
     gather_seed: int,
+    broadcast_seed: int,
 ) -> None:
     """Unified test driver for all modes (CPU/GPU, single/multi-NUMA)."""
-    do_scatter = args.mode in {"scatter", "both"}
-    do_gather = args.mode in {"gather", "both"}
+    do_scatter = args.mode in {"scatter", "both", "all"}
+    do_gather = args.mode in {"gather", "both", "all"}
+    do_broadcast = args.mode in {"broadcast", "all"}
     iterations = args.iterations
 
     is_perf = args.test_mode == "performance"
@@ -1051,6 +1282,7 @@ def run_tests(
         mode_tag = f"GPU:{harness.gpu_device}"
     completion = "polling" if poll_us > 0 else "wait"
 
+    # --- Scatter / Gather tests (share ReplicationPlan) ---
     for direction, seed, should_run in [
         ("scatter", scatter_seed, do_scatter),
         ("gather", gather_seed, do_gather),
@@ -1094,6 +1326,44 @@ def run_tests(
                     print(f"    NUMA {nn}: {nd*1_000_000:.2f}us, "
                           f"{_format_bandwidth(nbw)}")
 
+    # --- Broadcast test ---
+    if do_broadcast:
+        seed = broadcast_seed
+        print(f"\n=== Broadcast Test [{mode_tag}, {completion}] "
+              f"(seed={seed}, iterations={iterations}) ===")
+        bplan = harness.build_broadcast_plan(seed)
+        bcast_bytes_per_numa = bplan.length * len(harness.targets)
+
+        for i in range(iterations):
+            current_seed = seed if is_perf else seed + i
+            if iterations > 1:
+                print(f"\n[broadcast] Iteration {i + 1}/{iterations}")
+
+            duration, total_bytes, per_numa = harness.run_broadcast(
+                current_seed,
+                prepare_payload=prepare,
+                verify=verify,
+                reset=reset,
+                plan=bplan if is_perf else None,
+                timeout_ms=timeout_ms,
+                poll_interval_us=poll_us,
+            )
+
+            if perf_tracker:
+                perf_tracker.add_sample(bytes_count=total_bytes, duration=duration)
+
+            bandwidth = total_bytes / duration if duration > 0 else 0
+            duration_us = duration * 1_000_000
+            print(f"  total: duration={duration_us:.2f}us, "
+                  f"bytes={_format_bytes(total_bytes)}, "
+                  f"bandwidth={_format_bandwidth(bandwidth)}")
+            if harness.num_numas > 1:
+                for ni, nd in enumerate(per_numa):
+                    nn = harness.numa_nodes[ni]
+                    nbw = bcast_bytes_per_numa / nd if nd > 0 else 0
+                    print(f"    NUMA {nn}: {nd*1_000_000:.2f}us, "
+                          f"{_format_bandwidth(nbw)}")
+
     if perf_tracker and perf_tracker.total_bytes > 0 and perf_tracker.total_time > 0:
         avg_bw = perf_tracker.average_bandwidth()
         print(f"\n[performance] Aggregate: "
@@ -1124,6 +1394,7 @@ def main() -> None:
     # Parse seeds
     scatter_seed = _parse_seed_arg(args.scatter_seed, SCATTER_SEED)
     gather_seed = _parse_seed_arg(args.gather_seed, GATHER_SEED)
+    broadcast_seed = _parse_seed_arg(args.broadcast_seed, BROADCAST_SEED)
 
     # Determine NUMA nodes
     gpu_device = args.gpu
@@ -1162,7 +1433,7 @@ def main() -> None:
     )
 
     try:
-        run_tests(harness, args, scatter_seed, gather_seed)
+        run_tests(harness, args, scatter_seed, gather_seed, broadcast_seed)
         print("\n[test] All tests passed!")
     finally:
         harness.close()

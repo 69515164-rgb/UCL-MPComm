@@ -169,8 +169,24 @@ public:
     }
 
     /**
-     * Unified async interface for scatter/gather operations
-     * @param comm_type        "scatter" or "gather"
+     * Start async broadcast operation (returns immediately)
+     * Broadcasts the same local data to multiple remote hosts.
+     * @param local_addr       Local buffer address
+     * @param length           Data length to broadcast (same for all destinations)
+     * @param host_list        List of destination host IDs
+     * @param remote_addrs     Remote buffer addresses on each host
+     * @return TransferHandle on success, 0 (INVALID_TRANSFER_HANDLE) on failure
+     */
+    uint64_t broadcastAsync(uintptr_t local_addr,
+                            size_t length,
+                            const std::vector<std::string> &host_list,
+                            const std::vector<uintptr_t> &remote_addrs) {
+        return comm_.broadcastAsync(local_addr, length, host_list, remote_addrs);
+    }
+
+    /**
+     * Unified async interface for scatter/gather/broadcast operations
+     * @param comm_type        "scatter", "gather", or "broadcast"
      * @param host_list        List of remote host IDs
      * @param local_addr       Local buffer address
      * @param remote_addrs     Remote buffer addresses on each host
@@ -186,6 +202,10 @@ public:
             return scatterAsync(local_addr, host_list, remote_addrs, lengths);
         } else if (comm_type == "gather") {
             return gatherAsync(local_addr, host_list, remote_addrs, lengths);
+        } else if (comm_type == "broadcast") {
+            // For broadcast, all lengths must be equal (use first length)
+            if (lengths.empty()) return INVALID_TRANSFER_HANDLE;
+            return broadcastAsync(local_addr, lengths[0], host_list, remote_addrs);
         }
         return INVALID_TRANSFER_HANDLE;
     }
@@ -510,13 +530,19 @@ PYBIND11_MODULE(mpcomm, m) {
              py::arg("remote_addrs"),
              py::arg("lengths"),
              "Start async gather operation, returns handle immediately")
+        .def("broadcast_async", &MPCommPy::broadcastAsync,
+             py::arg("local_addr"),
+             py::arg("length"),
+             py::arg("host_list"),
+             py::arg("remote_addrs"),
+             "Broadcast same local data to multiple remote hosts, returns handle immediately")
         .def("mp_replicate_async", &MPCommPy::mpReplicateAsync,
              py::arg("comm_type"),
              py::arg("host_list"),
              py::arg("local_addr"),
              py::arg("remote_addrs"),
              py::arg("lengths"),
-             "Unified async interface for scatter/gather operations")
+             "Unified async interface for scatter/gather/broadcast operations")
         .def("is_transfer_complete", &MPCommPy::isTransferComplete,
              py::arg("handle"),
              "Check if async transfer is complete (non-blocking)")

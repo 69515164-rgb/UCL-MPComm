@@ -3324,6 +3324,25 @@ TransferHandle MPComm::scatterAsync(uintptr_t local_addr,
                               TransferDirection::SCATTER);
 }
 
+TransferHandle MPComm::broadcastAsync(uintptr_t local_addr,
+                                      size_t length,
+                                      const std::vector<std::string> &host_list,
+                                      const std::vector<uintptr_t> &remote_addrs) {
+    // Broadcast: same length for all hosts, expand to lengths vector
+    size_t host_count = host_list.size();
+    if (host_count == 0 || remote_addrs.size() != host_count) {
+        fprintf(stderr, "MPComm: BroadcastAsync failed - invalid arguments\n");
+        return INVALID_TRANSFER_HANDLE;
+    }
+    if (length == 0) {
+        fprintf(stderr, "MPComm: BroadcastAsync failed - zero length\n");
+        return INVALID_TRANSFER_HANDLE;
+    }
+    std::vector<size_t> lengths(host_count, length);
+    return transferAsyncStart(local_addr, host_list, remote_addrs, lengths,
+                              TransferDirection::BROADCAST);
+}
+
 TransferHandle MPComm::gatherAsync(uintptr_t local_addr,
                                    const std::vector<std::string> &host_list,
                                    const std::vector<uintptr_t> &remote_addrs,
@@ -3337,7 +3356,8 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
                                           const std::vector<uintptr_t> &remote_addrs,
                                           const std::vector<size_t> &lengths,
                                           TransferDirection direction) {
-    const char* op_name = (direction == TransferDirection::SCATTER) ? "ScatterAsync" : "GatherAsync";
+    const char* op_name = (direction == TransferDirection::SCATTER) ? "ScatterAsync" :
+                          (direction == TransferDirection::GATHER) ? "GatherAsync" : "BroadcastAsync";
     
     // Validation
     if (!initialized_) {
@@ -3365,7 +3385,7 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
     ctx->host_list = host_list;
     ctx->remote_addrs = remote_addrs;
     ctx->lengths = lengths;
-    ctx->is_scatter = (direction == TransferDirection::SCATTER);
+    ctx->direction = direction;
     ctx->start_time = std::chrono::steady_clock::now();
     
     // Prepare all chunks (same logic as transferImplDynamic)
@@ -3381,7 +3401,11 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
         host_chunk_starts[i] = total_chunks;
         host_local_offsets[i] = running_local_offset;
         total_chunks += (lengths[i] + max_chunk_size - 1) / max_chunk_size;
-        running_local_offset += lengths[i];
+        // Broadcast: all hosts read from the same local offset (0)
+        // Scatter/Gather: local offset advances consecutively
+        if (direction != TransferDirection::BROADCAST) {
+            running_local_offset += lengths[i];
+        }
     }
     
     ctx->prep_chunks_calc_time = std::chrono::steady_clock::now();
@@ -3695,7 +3719,8 @@ void MPComm::releaseTransfer(TransferHandle handle) {
         // Print statistics if transfer was completed
         TransferContext& ctx = *it->second;
         if (ctx.finished.load() && ctx.error_code.load() == MPCOMM_SUCCESS) {
-            const char* op_name = ctx.is_scatter ? "ScatterAsync" : "GatherAsync";
+            const char* op_name = (ctx.direction == TransferDirection::SCATTER) ? "ScatterAsync" :
+                                  (ctx.direction == TransferDirection::GATHER) ? "GatherAsync" : "BroadcastAsync";
             double transfer_ms = std::chrono::duration<double, std::milli>(
                 ctx.end_time - ctx.start_time).count();
             
@@ -3956,7 +3981,7 @@ void MPComm::processTransfer(TransferContext& ctx) {
             struct ibv_send_wr wr;
             memset(&wr, 0, sizeof(wr));
             wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
-            wr.opcode = ctx.is_scatter ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+            wr.opcode = (ctx.direction == TransferDirection::GATHER) ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
             wr.sg_list = &sge;
             wr.num_sge = 1;
             wr.send_flags = IBV_SEND_SIGNALED;

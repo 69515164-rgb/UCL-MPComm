@@ -16,7 +16,7 @@
 
 """MPComm Test Script
 
-Tests mp_replicate (scatter/gather/broadcast) functionality using MPComm.
+Tests mp_replicate (scatter/gather/broadcast/put/get) functionality using MPComm.
 This script runs on the initiator host and performs RDMA operations
 to one or more target hosts.
 
@@ -35,8 +35,14 @@ Usage:
     # Broadcast test (same data to all targets)
     python test_mpcomm.py --mode broadcast --targets target1:192.168.1.100:12345
 
-    # All modes (scatter + gather + broadcast)
+    # All modes (scatter + gather + broadcast + put + get)
     python test_mpcomm.py --mode all --targets target1:192.168.1.100:12345
+
+    # Put test (write to a single remote host)
+    python test_mpcomm.py --mode put --targets target1:192.168.1.100:12345
+
+    # Get test (read from a single remote host)
+    python test_mpcomm.py --mode get --targets target1:192.168.1.100:12345
 
     # Polling completion mode
     python test_mpcomm.py --mode scatter --async-mode polling --targets target1:192.168.1.100:12345
@@ -993,6 +999,267 @@ class MPCommTestHarness:
                   f"target={self.targets[i].host_id} len={length}B OK")
 
     # ------------------------------------------------------------------
+    # Put / Get (point-to-point)
+    # ------------------------------------------------------------------
+    def run_put(
+        self,
+        seed: int,
+        *,
+        prepare_payload: bool = True,
+        verify: bool = True,
+        reset: bool = True,
+        timeout_ms: int = -1,
+        poll_interval_us: int = 0,
+    ) -> Tuple[float, int, List[float]]:
+        """Put local data to a single remote host (RDMA WRITE).
+
+        For each NUMA buffer, writes a random-sized chunk from local buffer
+        to a randomly chosen target's remote address using put_async.
+
+        Returns:
+            (wall_duration, total_bytes, per_numa_durations)
+        """
+        rng = random.Random(seed)
+        length = rng.randint(self.min_chunk_size, self.max_chunk_size)
+        target = self.targets[rng.randint(0, len(self.targets) - 1)]
+        use_polling = poll_interval_us > 0
+
+        # Build expected payload
+        payload = b""
+        if not self.performance_mode:
+            payload = self._base_buffer_pattern[:length]
+
+        total_bytes = length * self.num_numas
+
+        # Prepare buffers
+        for numa_idx in range(self.num_numas):
+            if prepare_payload and payload:
+                self._write_chunk(numa_idx, 0, payload)
+
+        # Submit put_async for each NUMA buffer
+        handles: List[Tuple[int, int]] = []
+        wall_start = time.perf_counter()
+
+        for numa_idx in range(self.num_numas):
+            local_addr = self.local_buffer_addrs[numa_idx]
+            if target.remote_buffers:
+                buf = target.get_buffer_for_numa(self.numa_nodes[numa_idx])
+                remote_addr = buf['addr']
+            else:
+                remote_addr = target.remote_addr
+
+            handle = self.comm.put_async(
+                local_addr, target.host_id, remote_addr, length)
+
+            if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+                for _, h in handles:
+                    self.comm.release_transfer(h)
+                raise RuntimeError(
+                    f"put_async failed for buffer {numa_idx} "
+                    f"(NUMA {self.numa_nodes[numa_idx]})")
+            handles.append((numa_idx, handle))
+
+        # Wait for completion
+        per_numa_results: Dict[int, Dict] = {}
+        if use_polling:
+            pending = set(range(len(handles)))
+            while pending:
+                done = set()
+                for i in list(pending):
+                    _, handle = handles[i]
+                    if self.comm.is_transfer_complete(handle):
+                        done.add(i)
+                pending -= done
+                if pending:
+                    time.sleep(poll_interval_us / 1_000_000)
+        else:
+            for numa_idx, handle in handles:
+                ret = self.comm.wait_transfer(handle, timeout_ms)
+                if ret != 0:
+                    for _, h in handles:
+                        self.comm.release_transfer(h)
+                    raise RuntimeError(
+                        f"wait_transfer failed for put buffer {numa_idx}: {ret}")
+
+        wall_duration = time.perf_counter() - wall_start
+
+        for numa_idx, handle in handles:
+            result = self.comm.get_transfer_result(handle)
+            self.comm.release_transfer(handle)
+            if result["error_code"] != 0:
+                raise RuntimeError(
+                    f"Put transfer error on buffer {numa_idx}: {result['error_code']}")
+            per_numa_results[numa_idx] = {"elapsed_ms": result["elapsed_ms"]}
+
+        per_numa_durations = [
+            per_numa_results.get(i, {}).get("elapsed_ms", 0) / 1000.0
+            for i in range(self.num_numas)
+        ]
+
+        # Verify: read back from remote via get_async and compare
+        if verify:
+            for numa_idx in range(self.num_numas):
+                self._verify_put(numa_idx, target, length, payload)
+
+        if reset:
+            self._reset_all_buffers()
+
+        return wall_duration, total_bytes, per_numa_durations
+
+    def run_get(
+        self,
+        seed: int,
+        *,
+        prepare_payload: bool = True,
+        verify: bool = True,
+        reset: bool = True,
+        timeout_ms: int = -1,
+        poll_interval_us: int = 0,
+    ) -> Tuple[float, int, List[float]]:
+        """Get data from a single remote host to local buffer (RDMA READ).
+
+        For each NUMA buffer, reads a random-sized chunk from a randomly
+        chosen target's remote address into local buffer using get_async.
+
+        Returns:
+            (wall_duration, total_bytes, per_numa_durations)
+        """
+        rng = random.Random(seed)
+        length = rng.randint(self.min_chunk_size, self.max_chunk_size)
+        target = self.targets[rng.randint(0, len(self.targets) - 1)]
+        use_polling = poll_interval_us > 0
+
+        total_bytes = length * self.num_numas
+
+        # Clear local buffers before get
+        for numa_idx in range(self.num_numas):
+            if prepare_payload:
+                self._clear_chunk(numa_idx, 0, length)
+
+        # Submit get_async for each NUMA buffer
+        handles: List[Tuple[int, int]] = []
+        wall_start = time.perf_counter()
+
+        for numa_idx in range(self.num_numas):
+            local_addr = self.local_buffer_addrs[numa_idx]
+            if target.remote_buffers:
+                buf = target.get_buffer_for_numa(self.numa_nodes[numa_idx])
+                remote_addr = buf['addr']
+            else:
+                remote_addr = target.remote_addr
+
+            handle = self.comm.get_async(
+                local_addr, target.host_id, remote_addr, length)
+
+            if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+                for _, h in handles:
+                    self.comm.release_transfer(h)
+                raise RuntimeError(
+                    f"get_async failed for buffer {numa_idx} "
+                    f"(NUMA {self.numa_nodes[numa_idx]})")
+            handles.append((numa_idx, handle))
+
+        # Wait for completion
+        per_numa_results: Dict[int, Dict] = {}
+        if use_polling:
+            pending = set(range(len(handles)))
+            while pending:
+                done = set()
+                for i in list(pending):
+                    _, handle = handles[i]
+                    if self.comm.is_transfer_complete(handle):
+                        done.add(i)
+                pending -= done
+                if pending:
+                    time.sleep(poll_interval_us / 1_000_000)
+        else:
+            for numa_idx, handle in handles:
+                ret = self.comm.wait_transfer(handle, timeout_ms)
+                if ret != 0:
+                    for _, h in handles:
+                        self.comm.release_transfer(h)
+                    raise RuntimeError(
+                        f"wait_transfer failed for get buffer {numa_idx}: {ret}")
+
+        wall_duration = time.perf_counter() - wall_start
+
+        for numa_idx, handle in handles:
+            result = self.comm.get_transfer_result(handle)
+            self.comm.release_transfer(handle)
+            if result["error_code"] != 0:
+                raise RuntimeError(
+                    f"Get transfer error on buffer {numa_idx}: {result['error_code']}")
+            per_numa_results[numa_idx] = {"elapsed_ms": result["elapsed_ms"]}
+
+        per_numa_durations = [
+            per_numa_results.get(i, {}).get("elapsed_ms", 0) / 1000.0
+            for i in range(self.num_numas)
+        ]
+
+        # Verify: compare local data with expected remote pattern
+        if verify:
+            for numa_idx in range(self.num_numas):
+                self._verify_get(numa_idx, target, length)
+
+        if reset:
+            self._reset_all_buffers()
+
+        return wall_duration, total_bytes, per_numa_durations
+
+    def _verify_put(self, idx: int, target: TargetInfo,
+                    length: int, expected: bytes) -> None:
+        """Verify put by reading back from remote via get_async and comparing."""
+        numa_node = self.numa_nodes[idx]
+        if target.remote_buffers:
+            buf = target.get_buffer_for_numa(numa_node)
+            remote_addr = buf['addr']
+        else:
+            remote_addr = target.remote_addr
+
+        # Clear local region, then read back
+        self._clear_chunk(idx, 0, length)
+        handle = self.comm.get_async(
+            self.local_buffer_addrs[idx], target.host_id, remote_addr, length)
+        if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+            print(f"[put verify NUMA {numa_node}] get_async failed", file=sys.stderr)
+            return
+        ret = self.comm.wait_transfer(handle)
+        self.comm.release_transfer(handle)
+        if ret != 0:
+            print(f"[put verify NUMA {numa_node}] read-back failed", file=sys.stderr)
+            return
+
+        actual = self._read_bytes(idx, 0, length)
+        if actual != expected:
+            print(f"[put verify NUMA {numa_node}] "
+                  f"target={target.host_id} "
+                  f"expected={_preview_hex(expected)} "
+                  f"actual={_preview_hex(actual)}")
+            raise AssertionError(
+                f"Put verification failed NUMA {numa_node} "
+                f"target {target.host_id}")
+        print(f"[put verify NUMA {numa_node}] "
+              f"target={target.host_id} len={length}B OK")
+
+    def _verify_get(self, idx: int, target: TargetInfo, length: int) -> None:
+        """Verify get by comparing local data with expected remote pattern."""
+        numa_node = self.numa_nodes[idx]
+        # Remote buffer contains IPv4 pattern of the target host
+        target_ip_bytes = _resolve_ipv4_bytes(target.host_id)
+        expected = _build_ipv4_pattern(target_ip_bytes, length)
+        actual = self._read_bytes(idx, 0, length)
+        if actual != expected:
+            print(f"[get verify NUMA {numa_node}] "
+                  f"target={target.host_id} "
+                  f"expected={_preview_hex(expected)} "
+                  f"actual={_preview_hex(actual)}")
+            raise AssertionError(
+                f"Get verification failed NUMA {numa_node} "
+                f"target {target.host_id}")
+        print(f"[get verify NUMA {numa_node}] "
+              f"target={target.host_id} len={length}B OK")
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -1021,6 +1288,8 @@ class MPCommTestHarness:
 SCATTER_SEED = int("5CATT3R", 36)
 GATHER_SEED = int("6A7H3R", 36)
 BROADCAST_SEED = int("BR0ADCA", 36)
+PUT_SEED = int("PU7S33D", 36)
+GET_SEED = int("G37S33D", 36)
 
 
 def parse_target(target_str: str) -> TargetInfo:
@@ -1116,10 +1385,10 @@ Examples:
 
     parser.add_argument(
         "--mode",
-        choices=["scatter", "gather", "broadcast", "both", "all"],
+        choices=["scatter", "gather", "broadcast", "put", "get", "both", "all"],
         default="both",
-        help="Operation mode: scatter, gather, broadcast, both (scatter+gather), "
-             "or all (scatter+gather+broadcast). Default: both",
+        help="Operation mode: scatter, gather, broadcast, put, get, both (scatter+gather), "
+             "or all (scatter+gather+broadcast+put+get). Default: both",
     )
 
     parser.add_argument(
@@ -1196,6 +1465,16 @@ Examples:
     )
 
     parser.add_argument(
+        "--put-seed",
+        help="Seed for put plan (supports base-36 strings)",
+    )
+
+    parser.add_argument(
+        "--get-seed",
+        help="Seed for get plan (supports base-36 strings)",
+    )
+
+    parser.add_argument(
         "--test-mode",
         choices=["correctness", "performance"],
         default="correctness",
@@ -1260,11 +1539,15 @@ def run_tests(
     scatter_seed: int,
     gather_seed: int,
     broadcast_seed: int,
+    put_seed: int = 0,
+    get_seed: int = 0,
 ) -> None:
     """Unified test driver for all modes (CPU/GPU, single/multi-NUMA)."""
     do_scatter = args.mode in {"scatter", "both", "all"}
     do_gather = args.mode in {"gather", "both", "all"}
     do_broadcast = args.mode in {"broadcast", "all"}
+    do_put = args.mode in {"put", "all"}
+    do_get = args.mode in {"get", "all"}
     iterations = args.iterations
 
     is_perf = args.test_mode == "performance"
@@ -1364,6 +1647,48 @@ def run_tests(
                     print(f"    NUMA {nn}: {nd*1_000_000:.2f}us, "
                           f"{_format_bandwidth(nbw)}")
 
+    # --- Put / Get tests (point-to-point) ---
+    for direction, seed, should_run in [
+        ("put", put_seed, do_put),
+        ("get", get_seed, do_get),
+    ]:
+        if not should_run:
+            continue
+
+        print(f"\n=== {direction.capitalize()} Test [{mode_tag}, {completion}] "
+              f"(seed={seed}, iterations={iterations}) ===")
+
+        for i in range(iterations):
+            current_seed = seed if is_perf else seed + i
+            if iterations > 1:
+                print(f"\n[{direction}] Iteration {i + 1}/{iterations}")
+
+            run_fn = harness.run_put if direction == "put" else harness.run_get
+            duration, total_bytes, per_numa = run_fn(
+                current_seed,
+                prepare_payload=prepare,
+                verify=verify,
+                reset=reset,
+                timeout_ms=timeout_ms,
+                poll_interval_us=poll_us,
+            )
+
+            if perf_tracker:
+                perf_tracker.add_sample(bytes_count=total_bytes, duration=duration)
+
+            bandwidth = total_bytes / duration if duration > 0 else 0
+            duration_us = duration * 1_000_000
+            print(f"  total: duration={duration_us:.2f}us, "
+                  f"bytes={_format_bytes(total_bytes)}, "
+                  f"bandwidth={_format_bandwidth(bandwidth)}")
+            if harness.num_numas > 1:
+                bytes_per_numa = total_bytes // harness.num_numas
+                for ni, nd in enumerate(per_numa):
+                    nn = harness.numa_nodes[ni]
+                    nbw = bytes_per_numa / nd if nd > 0 else 0
+                    print(f"    NUMA {nn}: {nd*1_000_000:.2f}us, "
+                          f"{_format_bandwidth(nbw)}")
+
     if perf_tracker and perf_tracker.total_bytes > 0 and perf_tracker.total_time > 0:
         avg_bw = perf_tracker.average_bandwidth()
         print(f"\n[performance] Aggregate: "
@@ -1395,6 +1720,8 @@ def main() -> None:
     scatter_seed = _parse_seed_arg(args.scatter_seed, SCATTER_SEED)
     gather_seed = _parse_seed_arg(args.gather_seed, GATHER_SEED)
     broadcast_seed = _parse_seed_arg(args.broadcast_seed, BROADCAST_SEED)
+    put_seed = _parse_seed_arg(args.put_seed, PUT_SEED)
+    get_seed = _parse_seed_arg(args.get_seed, GET_SEED)
 
     # Determine NUMA nodes
     gpu_device = args.gpu
@@ -1433,7 +1760,8 @@ def main() -> None:
     )
 
     try:
-        run_tests(harness, args, scatter_seed, gather_seed, broadcast_seed)
+        run_tests(harness, args, scatter_seed, gather_seed, broadcast_seed,
+                  put_seed, get_seed)
         print("\n[test] All tests passed!")
     finally:
         harness.close()

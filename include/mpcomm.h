@@ -581,6 +581,50 @@ public:
                                   const std::vector<uintptr_t> &remote_addrs);
 
     /**
+     * Start async put operation (returns immediately)
+     * 
+     * Write local data to a single remote host using RDMA WRITE.
+     * This is a point-to-point operation targeting one specific host.
+     * 
+     * Data layout:
+     *   local_buffer[0..length] -> remote_host:remote_addr
+     * 
+     * Use isTransferComplete() or waitTransfer() to check/wait for completion.
+     * 
+     * @param local_addr       Local buffer address (must be registered)
+     * @param remote_host_id   Destination host ID
+     * @param remote_addr      Remote buffer address
+     * @param length           Data length to write
+     * @return TransferHandle on success, INVALID_TRANSFER_HANDLE on failure
+     */
+    TransferHandle putAsync(uintptr_t local_addr,
+                            const std::string &remote_host_id,
+                            uintptr_t remote_addr,
+                            size_t length);
+
+    /**
+     * Start async get operation (returns immediately)
+     * 
+     * Read data from a single remote host to local buffer using RDMA READ.
+     * This is a point-to-point operation targeting one specific host.
+     * 
+     * Data layout:
+     *   remote_host:remote_addr -> local_buffer[0..length]
+     * 
+     * Use isTransferComplete() or waitTransfer() to check/wait for completion.
+     * 
+     * @param local_addr       Local buffer address (must be registered)
+     * @param remote_host_id   Source host ID
+     * @param remote_addr      Remote buffer address
+     * @param length           Data length to read
+     * @return TransferHandle on success, INVALID_TRANSFER_HANDLE on failure
+     */
+    TransferHandle getAsync(uintptr_t local_addr,
+                            const std::string &remote_host_id,
+                            uintptr_t remote_addr,
+                            size_t length);
+
+    /**
      * Check if async transfer is complete (non-blocking)
      * 
      * This function polls for completions and updates internal state.

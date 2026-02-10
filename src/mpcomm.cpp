@@ -2756,6 +2756,38 @@ TransferHandle MPComm::gatherAsync(uintptr_t local_addr,
                               TransferDirection::GATHER);
 }
 
+TransferHandle MPComm::putAsync(uintptr_t local_addr,
+                                const std::string &remote_host_id,
+                                uintptr_t remote_addr,
+                                size_t length) {
+    if (length == 0) {
+        fprintf(stderr, "MPComm: PutAsync failed - zero length\n");
+        return INVALID_TRANSFER_HANDLE;
+    }
+    // Put = RDMA WRITE to a single host, reuse scatter path with 1 host
+    return transferAsyncStart(local_addr,
+                              {remote_host_id},
+                              {remote_addr},
+                              {length},
+                              TransferDirection::SCATTER);
+}
+
+TransferHandle MPComm::getAsync(uintptr_t local_addr,
+                                const std::string &remote_host_id,
+                                uintptr_t remote_addr,
+                                size_t length) {
+    if (length == 0) {
+        fprintf(stderr, "MPComm: GetAsync failed - zero length\n");
+        return INVALID_TRANSFER_HANDLE;
+    }
+    // Get = RDMA READ from a single host, reuse gather path with 1 host
+    return transferAsyncStart(local_addr,
+                              {remote_host_id},
+                              {remote_addr},
+                              {length},
+                              TransferDirection::GATHER);
+}
+
 TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
                                           const std::vector<std::string> &host_list,
                                           const std::vector<uintptr_t> &remote_addrs,

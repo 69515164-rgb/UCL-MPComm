@@ -185,6 +185,38 @@ public:
     }
 
     /**
+     * Start async put operation (returns immediately)
+     * Write local data to a single remote host using RDMA WRITE.
+     * @param local_addr       Local buffer address
+     * @param remote_host_id   Destination host ID
+     * @param remote_addr      Remote buffer address
+     * @param length           Data length to write
+     * @return TransferHandle on success, 0 (INVALID_TRANSFER_HANDLE) on failure
+     */
+    uint64_t putAsync(uintptr_t local_addr,
+                      const std::string &remote_host_id,
+                      uintptr_t remote_addr,
+                      size_t length) {
+        return comm_.putAsync(local_addr, remote_host_id, remote_addr, length);
+    }
+
+    /**
+     * Start async get operation (returns immediately)
+     * Read data from a single remote host to local buffer using RDMA READ.
+     * @param local_addr       Local buffer address
+     * @param remote_host_id   Source host ID
+     * @param remote_addr      Remote buffer address
+     * @param length           Data length to read
+     * @return TransferHandle on success, 0 (INVALID_TRANSFER_HANDLE) on failure
+     */
+    uint64_t getAsync(uintptr_t local_addr,
+                      const std::string &remote_host_id,
+                      uintptr_t remote_addr,
+                      size_t length) {
+        return comm_.getAsync(local_addr, remote_host_id, remote_addr, length);
+    }
+
+    /**
      * Unified async interface for scatter/gather/broadcast operations
      * @param comm_type        "scatter", "gather", or "broadcast"
      * @param host_list        List of remote host IDs
@@ -536,6 +568,18 @@ m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
              py::arg("host_list"),
              py::arg("remote_addrs"),
              "Broadcast same local data to multiple remote hosts, returns handle immediately")
+        .def("put_async", &MPCommPy::putAsync,
+             py::arg("local_addr"),
+             py::arg("remote_host_id"),
+             py::arg("remote_addr"),
+             py::arg("length"),
+             "Write local data to a single remote host (RDMA WRITE), returns handle")
+        .def("get_async", &MPCommPy::getAsync,
+             py::arg("local_addr"),
+             py::arg("remote_host_id"),
+             py::arg("remote_addr"),
+             py::arg("length"),
+             "Read data from a single remote host to local buffer (RDMA READ), returns handle")
         .def("mp_replicate_async", &MPCommPy::mpReplicateAsync,
              py::arg("comm_type"),
              py::arg("host_list"),

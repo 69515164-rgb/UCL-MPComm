@@ -46,8 +46,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -819,7 +821,68 @@ int MPComm::Impl::init(const std::string &local_host_id,
     
     printf("MPComm: Initialized with %zu NICs, TCP port %d\n",
            nic_contexts_.size(), tcp_port_);
-    
+
+    // Generate MPComm version config file
+    {
+        namespace fs = std::filesystem;
+        std::string MPCOMM_VERSION = "R01C01";
+        std::string platform = "cuda";
+        std::string target_dir = "/dockerdata/.trmt/";
+        fs::path full_path = fs::path(target_dir) / "mpcomm.config.json";
+        std::fstream file;
+
+        try {
+            fs::create_directories(target_dir);
+        } catch (const fs::filesystem_error& e) {
+            fprintf(stderr, "MPComm: No version file generated since the target directory %s is not accessible.\n", target_dir.c_str());
+            return MPCOMM_SUCCESS;
+        }
+
+        if (fs::exists(full_path)) {
+            try {
+                std::ifstream tmp(full_path);
+                if (!tmp.is_open()) throw std::exception();
+
+                std::string content((std::istreambuf_iterator<char>(tmp)),
+                                    std::istreambuf_iterator<char>());
+                std::string key = "\"MPCOMM_VERSION\"";
+                size_t keyPos, colonPos, valueStart, valueEnd;
+                if ((keyPos = content.find(key)) == std::string::npos) throw std::exception();
+                if ((colonPos = content.find(':', keyPos + key.length())) == std::string::npos) throw std::exception();
+                if ((valueStart = content.find_first_not_of(" \t\n\r", colonPos + 1)) == std::string::npos) throw std::exception();
+                if ((valueEnd = content.find('"', valueStart + 1)) == std::string::npos) throw std::exception();
+                std::string version_prev = content.substr(valueStart + 1, valueEnd - valueStart - 1);
+                if (version_prev == MPCOMM_VERSION) {
+                    return MPCOMM_SUCCESS;
+                }
+            } catch (const std::exception& e) {
+                fprintf(stderr, "MPComm: Version file %s exists but cannot be updated. Will be rebuilt.\n", full_path.c_str());
+            }
+        }
+
+        file.open(full_path, std::ios::out | std::ios::trunc);
+
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm = *std::localtime(&now_time_t);
+        auto now_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+            now.time_since_epoch() % std::chrono::seconds(1)
+        );
+        std::stringstream ss;
+        ss << std::put_time(&now_tm, "%Y-%m-%dT%H:%M:%S")
+           << "." << std::setfill('0') << std::setw(6) << now_ms.count();
+
+        // Generate JSON
+        std::string jsonStr = "{\n";
+        jsonStr += "    \"TIMESTAMP\": \"" + ss.str() + "\",\n";
+        jsonStr += "    \"MPCOMM_VERSION\": \"" + MPCOMM_VERSION + "\",\n";
+        jsonStr += "    \"PLATFORM\": \"" + platform + "\"\n";
+        jsonStr += "}\n";
+
+        file << jsonStr;
+        file.close();
+    }
+
     return MPCOMM_SUCCESS;
 }
 

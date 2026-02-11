@@ -30,18 +30,447 @@
 #include <cuda.h>
 #endif
 
+#include <infiniband/verbs.h>
+#include <string.h>
+
+#ifdef USE_MLNX
+#include <infiniband/mlx5dv.h>
+#elif defined(USE_BNXT)
+#include <infiniband/bnxt_re_dv.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 namespace mpcomm {
+
+// =====================================================================
+// Internal Types (moved from mpcomm.h for Pimpl encapsulation)
+// =====================================================================
+
+// wr_id encoding for async transfers
+struct WrIdEncoding {
+    static constexpr uint64_t NIC_SHIFT = 56;
+    static constexpr uint64_t QP_SHIFT = 48;
+    static constexpr uint64_t HANDLE_SHIFT = 32;
+    static constexpr uint64_t CHUNK_MASK = 0xFFFFFFFFULL;
+    static constexpr uint64_t HANDLE_MASK = 0xFFFFULL;
+    static constexpr uint64_t QP_MASK = 0xFFULL;
+    static constexpr uint64_t NIC_MASK = 0xFFULL;
+
+    static inline uint64_t encode(size_t nic_index, size_t qp_index,
+                                  TransferHandle handle, size_t chunk_index) {
+        return (static_cast<uint64_t>(nic_index & NIC_MASK) << NIC_SHIFT) |
+               (static_cast<uint64_t>(qp_index & QP_MASK) << QP_SHIFT) |
+               (static_cast<uint64_t>(handle & HANDLE_MASK) << HANDLE_SHIFT) |
+               (chunk_index & CHUNK_MASK);
+    }
+
+    static inline size_t decodeNic(uint64_t wr_id) {
+        return static_cast<size_t>((wr_id >> NIC_SHIFT) & NIC_MASK);
+    }
+
+    static inline size_t decodeQp(uint64_t wr_id) {
+        return static_cast<size_t>((wr_id >> QP_SHIFT) & QP_MASK);
+    }
+
+    static inline TransferHandle decodeHandle(uint64_t wr_id) {
+        return static_cast<TransferHandle>((wr_id >> HANDLE_SHIFT) & HANDLE_MASK);
+    }
+
+    static inline size_t decodeChunk(uint64_t wr_id) {
+        return static_cast<size_t>(wr_id & CHUNK_MASK);
+    }
+};
+
+// Remote endpoint information exchanged via TCP
+struct RemoteEndpointInfo {
+    char gid[64];
+    uint16_t lid;
+    uint32_t qp_num;
+    uint32_t rkey;
+    uint64_t addr;
+    uint64_t length;
+};
+
+// Memory region info
+struct MemoryRegionInfo {
+    void *addr;
+    size_t length;
+    struct ibv_mr *mr;
+    uint32_t lkey;
+    uint32_t rkey;
+    int numa_node;
+    bool is_gpu;
+    int gpu_device_id;
+    std::vector<size_t> pcie_affine_nic_indices;
+};
+
+// Per-NIC context
+struct NicContext {
+    std::string device_name;
+    struct ibv_context *context;
+    struct ibv_pd *pd;
+    struct ibv_cq *cq;
+    uint8_t port;
+    int gid_index;
+    uint16_t lid;
+    union ibv_gid gid;
+
+    std::vector<MemoryRegionInfo> memory_regions;
+    std::mutex mr_mutex;
+
+    std::unordered_map<std::string, std::vector<struct ibv_qp *>> qp_map;
+    std::mutex qp_mutex;
+};
+
+// Connection info for a remote host
+struct ConnectionInfo {
+    std::string host_id;
+    int tcp_port;
+    std::vector<RemoteEndpointInfo> nic_endpoints;
+
+    std::vector<int> remote_nic_numa_nodes;
+    int remote_numa_count;
+    std::vector<std::string> remote_nic_names;
+    std::unordered_map<size_t, std::vector<size_t>> local_to_remote_nic_map;
+
+    std::unordered_map<uint64_t, RemoteBufferEntry> remote_buffers;
+
+    ConnectionInfo() : tcp_port(0), remote_numa_count(0) {}
+
+    uint32_t getRkeyForAddr(uint64_t remote_addr, size_t nic_idx) const {
+        for (const auto& [buf_addr, buf_entry] : remote_buffers) {
+            if (remote_addr >= buf_addr && remote_addr < buf_addr + buf_entry.length) {
+                if (nic_idx < buf_entry.rkeys.size()) {
+                    return buf_entry.rkeys[nic_idx];
+                }
+                break;
+            }
+        }
+        if (nic_idx < nic_endpoints.size()) {
+            return nic_endpoints[nic_idx].rkey;
+        }
+        return 0;
+    }
+};
+
+// Chunk task for transfer operations
+struct ChunkTask {
+    size_t host_idx;
+    uintptr_t local_addr;
+    uintptr_t remote_addr;
+    size_t length;
+};
+
+// Transfer direction
+enum class TransferDirection {
+    SCATTER,
+    GATHER,
+    BROADCAST
+};
+
+// Context for tracking async transfer operations
+struct TransferContext {
+    TransferHandle handle;
+    std::atomic<size_t> total_chunks;
+    std::atomic<size_t> total_completed;
+    std::atomic<int> error_code;
+    std::atomic<bool> finished;
+    std::atomic<bool> submitted;
+
+    uintptr_t local_addr;
+    std::vector<std::string> host_list;
+    std::vector<uintptr_t> remote_addrs;
+    std::vector<size_t> lengths;
+    TransferDirection direction;
+
+    size_t max_chunk_size;
+    std::vector<size_t> host_chunk_starts;
+    std::vector<size_t> host_local_offsets;
+
+    inline ChunkTask getChunk(size_t chunk_idx) const {
+        size_t host_idx = 0;
+        size_t lo = 0, hi = host_chunk_starts.size();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (host_chunk_starts[mid] <= chunk_idx) {
+                host_idx = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        size_t chunk_within_host = chunk_idx - host_chunk_starts[host_idx];
+        size_t offset = chunk_within_host * max_chunk_size;
+        size_t remaining = lengths[host_idx] - offset;
+        size_t len = (remaining < max_chunk_size) ? remaining : max_chunk_size;
+        return ChunkTask{
+            host_idx,
+            static_cast<uintptr_t>(local_addr + host_local_offsets[host_idx] + offset),
+            static_cast<uintptr_t>(remote_addrs[host_idx] + offset),
+            len
+        };
+    }
+
+    std::atomic<size_t> next_chunk_idx;
+
+    std::vector<size_t> per_nic_posted;
+    std::vector<size_t> per_nic_completed;
+    std::vector<size_t> per_nic_bytes;
+    std::vector<std::vector<size_t>> per_nic_qp_posted;
+    std::vector<std::vector<size_t>> per_nic_qp_completed;
+
+    std::vector<size_t> candidate_nic_indices;
+
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point prep_chunks_calc_time;
+    std::chrono::steady_clock::time_point prep_chunks_meta_time;
+    std::chrono::steady_clock::time_point prep_numa_query_time;
+    std::chrono::steady_clock::time_point prep_flowctrl_time;
+    std::chrono::steady_clock::time_point queued_time;
+    std::chrono::steady_clock::time_point worker_start_time;
+    std::chrono::steady_clock::time_point cache_done_time;
+    std::chrono::steady_clock::time_point first_post_time;
+    std::chrono::steady_clock::time_point all_posted_time;
+    std::chrono::steady_clock::time_point end_time;
+
+    size_t rr_nic_index;
+
+    TransferContext()
+        : handle(INVALID_TRANSFER_HANDLE)
+        , total_chunks(0)
+        , total_completed(0)
+        , error_code(0)
+        , finished(false)
+        , submitted(false)
+        , local_addr(0)
+        , direction(TransferDirection::SCATTER)
+        , max_chunk_size(0)
+        , next_chunk_idx(0)
+        , rr_nic_index(0) {}
+
+    TransferContext(const TransferContext&) = delete;
+    TransferContext& operator=(const TransferContext&) = delete;
+};
+
+// =====================================================================
+// MPComm::Impl - Internal Implementation Class
+// =====================================================================
+
+static constexpr size_t kMaxNumaNodes = 8;
+static constexpr size_t kWorkersPerNuma = 1;
+static constexpr size_t kLockFreeQueueSize = 4096;
+
+// Lock-free MPSC queue per worker
+struct LockFreeQueue {
+    std::vector<std::atomic<TransferHandle>> buffer;
+    std::atomic<size_t> head{0};
+    std::atomic<size_t> tail{0};
+
+    LockFreeQueue() : buffer(kLockFreeQueueSize) {
+        for (auto& slot : buffer) {
+            slot.store(INVALID_TRANSFER_HANDLE, std::memory_order_relaxed);
+        }
+    }
+
+    bool tryPush(TransferHandle handle) {
+        size_t current_head, next_head;
+        do {
+            current_head = head.load(std::memory_order_relaxed);
+            next_head = (current_head + 1) % kLockFreeQueueSize;
+            if (next_head == tail.load(std::memory_order_acquire)) {
+                return false;
+            }
+        } while (!head.compare_exchange_weak(current_head, next_head,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed));
+        buffer[current_head].store(handle, std::memory_order_release);
+        return true;
+    }
+
+    TransferHandle tryPop() {
+        size_t current_tail = tail.load(std::memory_order_relaxed);
+        if (current_tail == head.load(std::memory_order_acquire)) {
+            return INVALID_TRANSFER_HANDLE;
+        }
+        TransferHandle handle;
+        do {
+            handle = buffer[current_tail].load(std::memory_order_acquire);
+        } while (handle == INVALID_TRANSFER_HANDLE);
+        buffer[current_tail].store(INVALID_TRANSFER_HANDLE, std::memory_order_relaxed);
+        tail.store((current_tail + 1) % kLockFreeQueueSize, std::memory_order_release);
+        return handle;
+    }
+
+    bool empty() const {
+        return tail.load(std::memory_order_acquire) == head.load(std::memory_order_acquire);
+    }
+};
+
+class MPComm::Impl {
+public:
+    Impl();
+    ~Impl();
+
+    // Public API implementation
+    int init(const std::string &local_host_id,
+             const std::string &device_names, int tcp_port);
+    void shutdown();
+    int registerMemory(void *addr, size_t length);
+    int unregisterMemory(void *addr);
+    int connect(const std::string &remote_host_id,
+                const std::string &remote_tcp_addr, int remote_tcp_port);
+    int startAcceptThread();
+    void stopAcceptThread();
+    int updateRemoteMemoryInfo(const std::string &remote_host_id,
+                               const std::vector<uint32_t> &rkeys);
+    int publishBuffer(void *addr, size_t length, int numa_node);
+    int unpublishBuffer(void *addr);
+    void unpublishAllBuffers();
+    int queryRemoteBuffer(const std::string &remote_host_id,
+                          const std::string &remote_tcp_addr,
+                          int remote_tcp_port, RemoteBufferInfo &out_info);
+    int queryRemoteBufferByNuma(const std::string &remote_host_id,
+                                const std::string &remote_tcp_addr,
+                                int remote_tcp_port, int numa_node,
+                                RemoteBufferEntry &out_entry);
+    const PublishedBufferInfo* getPublishedBufferInfo() const;
+    size_t getPublishedBufferCount() const;
+    uint32_t getRkey(size_t nic_index, void *addr) const;
+
+    TransferHandle scatterAsync(uintptr_t local_addr,
+                                const std::vector<std::string> &host_list,
+                                const std::vector<uintptr_t> &remote_addrs,
+                                const std::vector<size_t> &lengths);
+    TransferHandle gatherAsync(uintptr_t local_addr,
+                               const std::vector<std::string> &host_list,
+                               const std::vector<uintptr_t> &remote_addrs,
+                               const std::vector<size_t> &lengths);
+    TransferHandle broadcastAsync(uintptr_t local_addr, size_t length,
+                                  const std::vector<std::string> &host_list,
+                                  const std::vector<uintptr_t> &remote_addrs);
+    TransferHandle putAsync(uintptr_t local_addr,
+                            const std::string &remote_host_id,
+                            uintptr_t remote_addr, size_t length);
+    TransferHandle getAsync(uintptr_t local_addr,
+                            const std::string &remote_host_id,
+                            uintptr_t remote_addr, size_t length);
+    bool isTransferComplete(TransferHandle handle);
+    int waitTransfer(TransferHandle handle, int timeout_ms);
+    TransferResult getTransferResult(TransferHandle handle);
+    void releaseTransfer(TransferHandle handle);
+
+    size_t getNumNics() const { return nic_contexts_.size(); }
+    const std::string &getLocalHostId() const { return local_host_id_; }
+    int getTcpPort() const { return tcp_port_; }
+    std::string getGid(size_t nic_index) const;
+    std::string getDeviceName(size_t nic_index) const;
+    std::vector<std::string> getActiveDevices() const;
+    size_t getMaxRdmaTransferSize() const;
+    size_t getQpsPerConnection() const;
+    const std::vector<NumaTopology>& getNumaTopology() const;
+    const std::vector<NicTopologyInfo>& getNicTopology() const;
+    int getNicNumaNode(const std::string& nic_name) const;
+    int getNumaNodeForAddr(void* addr) const;
+    std::vector<size_t> getLocalNicIndicesForNuma(int numa_node) const;
+    int getGpuNumaNode(int gpu_device_id) const;
+
+private:
+    // Topology discovery
+    int getNumaNodeCount();
+    int readNicNumaNode(const std::string& nic_name);
+    std::vector<std::string> getCandidateNics();
+    void discoverTopology();
+    void printTopologyInfo();
+    int detectGpuDevice(void* addr) const;
+    std::vector<size_t> getGpuPcieAffinityNics(int gpu_device_id) const;
+    std::vector<size_t> getPcieAffinityNicsForAddr(void* addr) const;
+
+    // Internal helpers
+    int openDevices(const std::string &device_names);
+    int setupNicContext(const std::string &device_name, NicContext &ctx);
+    void cleanupNicContext(NicContext &ctx);
+    int createQP(NicContext &ctx, struct ibv_qp **qp);
+    int modifyQPToInit(NicContext &ctx, struct ibv_qp *qp);
+    int modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
+                      const RemoteEndpointInfo &remote);
+    int modifyQPToRTS(struct ibv_qp *qp);
+    void destroyQP(struct ibv_qp *qp);
+    uint32_t getLkey(size_t nic_index, void *addr) const;
+    struct ibv_qp *getOrCreateQP(size_t local_nic_index,
+                                 const std::string &remote_host_id,
+                                 size_t remote_nic_index,
+                                 size_t qp_index = 0);
+    void acceptLoop();
+    void handleBufferQuery(int client_fd);
+    TransferHandle transferAsyncStart(uintptr_t local_addr,
+                                      const std::vector<std::string> &host_list,
+                                      const std::vector<uintptr_t> &remote_addrs,
+                                      const std::vector<size_t> &lengths,
+                                      TransferDirection direction);
+    size_t selectBestNicForAsync(TransferContext& ctx);
+    int pollAllNicsForAsync(TransferContext& ctx);
+    void workerThreadLoop(size_t worker_id, int numa_id, int cpu_id);
+    void processTransfer(TransferContext& ctx);
+    int getNumaForAddr(uintptr_t addr) const;
+    size_t selectWorkerForNuma(int numa_id);
+
+    // Member variables
+    std::string local_host_id_;
+    int tcp_port_;
+    int listen_fd_;
+    size_t max_rdma_transfer_size_;
+    size_t qps_per_connection_;
+
+    std::vector<std::unique_ptr<NicContext>> nic_contexts_;
+
+    std::unordered_map<std::string, ConnectionInfo> connections_;
+    mutable std::mutex connections_mutex_;
+
+    std::unique_ptr<PublishedBufferInfo> published_buffer_;
+    std::mutex published_buffer_mutex_;
+
+    std::atomic<bool> accept_running_;
+    std::unique_ptr<std::thread> accept_thread_;
+
+    std::unordered_map<TransferHandle, std::unique_ptr<TransferContext>> active_transfers_;
+    mutable std::mutex transfers_mutex_;
+    std::atomic<TransferHandle> next_transfer_handle_{1};
+
+    size_t num_numa_nodes_;
+    size_t total_workers_;
+    std::vector<std::unique_ptr<std::thread>> worker_threads_;
+    std::atomic<bool> worker_running_{false};
+
+    std::vector<std::unique_ptr<LockFreeQueue>> worker_queues_;
+    std::vector<std::unique_ptr<std::atomic<size_t>>> numa_worker_rr_;
+
+    size_t poll_batch_size_;
+    size_t max_idle_spins_;
+    int max_send_wr_;
+    size_t max_outstanding_per_qp_;
+
+    bool initialized_;
+    bool transfer_stats_enabled_;
+
+    std::vector<NumaTopology> numa_topology_;
+    std::vector<NicTopologyInfo> nic_topology_;
+};
 
 // ============================================================================
 // Environment Variables and Helper Functions
@@ -58,6 +487,7 @@ static const char* kPollBatchSizeEnvVar = "MPCOMM_POLL_BATCH_SIZE";
 static const char* kMaxIdleSpinsEnvVar = "MPCOMM_MAX_IDLE_SPINS";
 static const char* kMaxSendWREnvVar = "MPCOMM_MAX_SEND_WR";
 static const char* kMaxOutstandingPerQPEnvVar = "MPCOMM_MAX_OUTSTANDING_PER_QP";
+static const char* kTransferStatsEnvVar = "MPCOMM_TRANSFER_STATS";
 
 // Constants for QP setup
 static const uint8_t kMaxHopLimit = 16;
@@ -125,7 +555,7 @@ static bool isNullGid(const union ibv_gid *gid) {
 // MPComm Implementation
 // ============================================================================
 
-MPComm::MPComm()
+MPComm::Impl::Impl()
     : tcp_port_(0),
       listen_fd_(-1),
       max_rdma_transfer_size_(MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE),
@@ -137,7 +567,8 @@ MPComm::MPComm()
       max_idle_spins_(10000),
       max_send_wr_(512),
       max_outstanding_per_qp_(256),
-      initialized_(false) {
+      initialized_(false),
+      transfer_stats_enabled_(false) {
     // Read max RDMA transfer size from environment variable
     const char* env_val = std::getenv(kMaxRdmaTransferSizeEnvVar);
     if (env_val && env_val[0] != '\0') {
@@ -229,13 +660,19 @@ MPComm::MPComm()
                     kMaxIdleSpinsEnvVar, env_val, max_idle_spins_);
         }
     }
+
+    // Read transfer stats toggle from environment variable
+    env_val = std::getenv(kTransferStatsEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        transfer_stats_enabled_ = (std::string(env_val) == "1" || std::string(env_val) == "true");
+    }
 }
 
-MPComm::~MPComm() {
+MPComm::Impl::~Impl() {
     shutdown();
 }
 
-int MPComm::init(const std::string &local_host_id,
+int MPComm::Impl::init(const std::string &local_host_id,
                  const std::string &device_names,
                  int tcp_port) {
     if (initialized_) {
@@ -374,7 +811,7 @@ int MPComm::init(const std::string &local_host_id,
                 cpu_id = numa_cpus[numa][w % numa_cpus[numa].size()];
             }
             worker_threads_[worker_id] = std::make_unique<std::thread>(
-                &MPComm::workerThreadLoop, this, worker_id, static_cast<int>(numa), cpu_id);
+                &MPComm::Impl::workerThreadLoop, this, worker_id, static_cast<int>(numa), cpu_id);
         }
     }
     printf("MPComm: Started %zu async worker threads (%zu per NUMA, %zu NUMA nodes)\n", 
@@ -386,7 +823,7 @@ int MPComm::init(const std::string &local_host_id,
     return MPCOMM_SUCCESS;
 }
 
-void MPComm::shutdown() {
+void MPComm::Impl::shutdown() {
     stopAcceptThread();
 
     // Stop all worker threads first (they use busy-poll, just set flag and wait)
@@ -419,7 +856,7 @@ void MPComm::shutdown() {
     initialized_ = false;
 }
 
-int MPComm::openDevices(const std::string &device_names) {
+int MPComm::Impl::openDevices(const std::string &device_names) {
     int num_devices = 0;
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
     if (!devices || num_devices <= 0) {
@@ -505,7 +942,7 @@ int MPComm::openDevices(const std::string &device_names) {
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::setupNicContext(const std::string &device_name, NicContext &ctx) {
+int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ctx) {
     int num_devices = 0;
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
     if (!devices) return MPCOMM_ERR_DEVICE;
@@ -607,7 +1044,7 @@ int MPComm::setupNicContext(const std::string &device_name, NicContext &ctx) {
     return MPCOMM_SUCCESS;
 }
 
-void MPComm::cleanupNicContext(NicContext &ctx) {
+void MPComm::Impl::cleanupNicContext(NicContext &ctx) {
     // Destroy QPs
     {
         std::lock_guard<std::mutex> lock(ctx.qp_mutex);
@@ -648,7 +1085,7 @@ void MPComm::cleanupNicContext(NicContext &ctx) {
     }
 }
 
-int MPComm::registerMemory(void *addr, size_t length) {
+int MPComm::Impl::registerMemory(void *addr, size_t length) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
     if (!addr || length == 0) return MPCOMM_ERR_INVALID_ARG;
 
@@ -740,7 +1177,7 @@ int MPComm::registerMemory(void *addr, size_t length) {
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::unregisterMemory(void *addr) {
+int MPComm::Impl::unregisterMemory(void *addr) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
     if (!addr) return MPCOMM_ERR_INVALID_ARG;
 
@@ -760,7 +1197,7 @@ int MPComm::unregisterMemory(void *addr) {
     return MPCOMM_SUCCESS;
 }
 
-uint32_t MPComm::getLkey(size_t nic_index, void *addr) const {
+uint32_t MPComm::Impl::getLkey(size_t nic_index, void *addr) const {
     if (nic_index >= nic_contexts_.size()) return 0;
 
     const auto &ctx = *nic_contexts_[nic_index];
@@ -779,7 +1216,7 @@ uint32_t MPComm::getLkey(size_t nic_index, void *addr) const {
     return 0;
 }
 
-uint32_t MPComm::getRkey(size_t nic_index, void *addr) const {
+uint32_t MPComm::Impl::getRkey(size_t nic_index, void *addr) const {
     if (nic_index >= nic_contexts_.size()) return 0;
 
     const auto &ctx = *nic_contexts_[nic_index];
@@ -797,7 +1234,7 @@ uint32_t MPComm::getRkey(size_t nic_index, void *addr) const {
     return 0;
 }
 
-int MPComm::updateRemoteMemoryInfo(const std::string &remote_host_id,
+int MPComm::Impl::updateRemoteMemoryInfo(const std::string &remote_host_id,
                                    const std::vector<uint32_t> &rkeys) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
     
@@ -816,17 +1253,17 @@ int MPComm::updateRemoteMemoryInfo(const std::string &remote_host_id,
     return MPCOMM_SUCCESS;
 }
 
-std::string MPComm::getGid(size_t nic_index) const {
+std::string MPComm::Impl::getGid(size_t nic_index) const {
     if (nic_index >= nic_contexts_.size()) return "";
     return gidToString(nic_contexts_[nic_index]->gid);
 }
 
-std::string MPComm::getDeviceName(size_t nic_index) const {
+std::string MPComm::Impl::getDeviceName(size_t nic_index) const {
     if (nic_index >= nic_contexts_.size()) return "";
     return nic_contexts_[nic_index]->device_name;
 }
 
-std::vector<std::string> MPComm::getActiveDevices() const {
+std::vector<std::string> MPComm::Impl::getActiveDevices() const {
     std::vector<std::string> devices;
     devices.reserve(nic_contexts_.size());
     for (const auto &ctx : nic_contexts_) {
@@ -835,19 +1272,11 @@ std::vector<std::string> MPComm::getActiveDevices() const {
     return devices;
 }
 
-const char* MPComm::getNicFilterEnvVarName() {
-    return kNicFilterEnvVar;
-}
-
-size_t MPComm::getMaxRdmaTransferSize() const {
+size_t MPComm::Impl::getMaxRdmaTransferSize() const {
     return max_rdma_transfer_size_;
 }
 
-const char* MPComm::getQpsPerConnectionEnvVarName() {
-    return kQpsPerConnectionEnvVar;
-}
-
-size_t MPComm::getQpsPerConnection() const {
+size_t MPComm::Impl::getQpsPerConnection() const {
     return qps_per_connection_;
 }
 
@@ -879,7 +1308,7 @@ static int extractNicSuffix(const std::string& nic_name) {
 }
 
 // Get the number of NUMA nodes in the system
-int MPComm::getNumaNodeCount() {
+int MPComm::Impl::getNumaNodeCount() {
     int count = 0;
     for (int i = 0; i < 256; i++) {
         std::string path = "/sys/devices/system/node/node" + std::to_string(i);
@@ -893,7 +1322,7 @@ int MPComm::getNumaNodeCount() {
 }
 
 // Read the NUMA node of a NIC from sysfs
-int MPComm::readNicNumaNode(const std::string& nic_name) {
+int MPComm::Impl::readNicNumaNode(const std::string& nic_name) {
     std::string path = "/sys/class/infiniband/" + nic_name + "/device/numa_node";
     std::ifstream file(path);
     if (file.is_open()) {
@@ -905,7 +1334,7 @@ int MPComm::readNicNumaNode(const std::string& nic_name) {
 }
 
 // Get candidate NICs (either from MPCOMM_NIC_FILTER or all available)
-std::vector<std::string> MPComm::getCandidateNics() {
+std::vector<std::string> MPComm::Impl::getCandidateNics() {
     std::vector<std::string> candidates;
     
     // Check MPCOMM_NIC_FILTER environment variable
@@ -937,7 +1366,7 @@ std::vector<std::string> MPComm::getCandidateNics() {
 }
 
 // Discover NUMA topology and build NIC-to-NUMA mappings
-void MPComm::discoverTopology() {
+void MPComm::Impl::discoverTopology() {
     int numa_count = getNumaNodeCount();
     std::vector<std::string> candidates = getCandidateNics();
     
@@ -986,7 +1415,7 @@ void MPComm::discoverTopology() {
 }
 
 // Print topology discovery results
-void MPComm::printTopologyInfo() {
+void MPComm::Impl::printTopologyInfo() {
     printf("\n================== MPCOMM Topology Discovery ==================\n");
     printf("System: %zu NUMA nodes, %zu candidate NICs\n", 
            numa_topology_.size(), nic_topology_.size());
@@ -1039,17 +1468,17 @@ void MPComm::printTopologyInfo() {
 }
 
 // Get NUMA topology information
-const std::vector<NumaTopology>& MPComm::getNumaTopology() const {
+const std::vector<NumaTopology>& MPComm::Impl::getNumaTopology() const {
     return numa_topology_;
 }
 
 // Get NIC topology information
-const std::vector<NicTopologyInfo>& MPComm::getNicTopology() const {
+const std::vector<NicTopologyInfo>& MPComm::Impl::getNicTopology() const {
     return nic_topology_;
 }
 
 // Get the NUMA node for a specific NIC
-int MPComm::getNicNumaNode(const std::string& nic_name) const {
+int MPComm::Impl::getNicNumaNode(const std::string& nic_name) const {
     for (const auto& info : nic_topology_) {
         if (info.nic_name == nic_name) {
             return info.numa_node;
@@ -1059,7 +1488,7 @@ int MPComm::getNicNumaNode(const std::string& nic_name) const {
 }
 
 // Get NUMA node for a given memory address (check registered memory regions)
-int MPComm::getNumaNodeForAddr(void* addr) const {
+int MPComm::Impl::getNumaNodeForAddr(void* addr) const {
     if (!addr || nic_contexts_.empty()) return -1;
     
     uintptr_t target = reinterpret_cast<uintptr_t>(addr);
@@ -1077,7 +1506,7 @@ int MPComm::getNumaNodeForAddr(void* addr) const {
 }
 
 // Get local NIC indices for a specific NUMA node
-std::vector<size_t> MPComm::getLocalNicIndicesForNuma(int numa_node) const {
+std::vector<size_t> MPComm::Impl::getLocalNicIndicesForNuma(int numa_node) const {
     std::vector<size_t> indices;
     
     // If numa_node is invalid, return empty (will fallback to all NICs)
@@ -1101,7 +1530,7 @@ std::vector<size_t> MPComm::getLocalNicIndicesForNuma(int numa_node) const {
 
 // Detect if an address is GPU memory using CUDA driver API
 // Returns the CUDA device ordinal, or -1 if CPU memory / detection fails
-int MPComm::detectGpuDevice(void* addr) const {
+int MPComm::Impl::detectGpuDevice(void* addr) const {
 #ifdef USE_CUDA
     // Use cuPointerGetAttribute to query the memory type
     unsigned int mem_type = 0;
@@ -1168,7 +1597,7 @@ int MPComm::detectGpuDevice(void* addr) const {
 }
 
 // Get the NUMA node for a specific GPU device (delegates to TopologyManager via cached topology)
-int MPComm::getGpuNumaNode(int gpu_device_id) const {
+int MPComm::Impl::getGpuNumaNode(int gpu_device_id) const {
     if (gpu_device_id < 0) return -1;
 
     // Search GPU topology info discovered during init
@@ -1208,7 +1637,7 @@ int MPComm::getGpuNumaNode(int gpu_device_id) const {
 // Discover PCIe-affine NICs for a GPU device by comparing sysfs PCIe paths.
 // Returns NIC indices sorted by PCIe affinity (closest first, sharing the
 // longest common PCIe path prefix with the GPU).
-std::vector<size_t> MPComm::getGpuPcieAffinityNics(int gpu_device_id) const {
+std::vector<size_t> MPComm::Impl::getGpuPcieAffinityNics(int gpu_device_id) const {
     std::vector<size_t> result;
     if (gpu_device_id < 0) return result;
 
@@ -1307,7 +1736,7 @@ std::vector<size_t> MPComm::getGpuPcieAffinityNics(int gpu_device_id) const {
 }
 
 // Get PCIe-affine NIC indices for a registered memory address
-std::vector<size_t> MPComm::getPcieAffinityNicsForAddr(void* addr) const {
+std::vector<size_t> MPComm::Impl::getPcieAffinityNicsForAddr(void* addr) const {
     if (!addr || nic_contexts_.empty()) return {};
 
     uintptr_t target = reinterpret_cast<uintptr_t>(addr);
@@ -1327,7 +1756,7 @@ std::vector<size_t> MPComm::getPcieAffinityNicsForAddr(void* addr) const {
 // Buffer Publishing and Query (Multi-buffer with NUMA support)
 // ============================================================================
 
-int MPComm::publishBuffer(void *addr, size_t length, int numa_node) {
+int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
     if (!addr || length == 0) return MPCOMM_ERR_INVALID_ARG;
 
@@ -1382,7 +1811,7 @@ int MPComm::publishBuffer(void *addr, size_t length, int numa_node) {
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::unpublishBuffer(void *addr) {
+int MPComm::Impl::unpublishBuffer(void *addr) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
     
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
@@ -1406,7 +1835,7 @@ int MPComm::unpublishBuffer(void *addr) {
     return MPCOMM_ERR_INVALID_ARG;
 }
 
-void MPComm::unpublishAllBuffers() {
+void MPComm::Impl::unpublishAllBuffers() {
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
     
     if (published_buffer_) {
@@ -1416,13 +1845,13 @@ void MPComm::unpublishAllBuffers() {
     }
 }
 
-size_t MPComm::getPublishedBufferCount() const {
+size_t MPComm::Impl::getPublishedBufferCount() const {
     // Note: Not fully thread-safe, but adequate for informational purposes
     if (!published_buffer_) return 0;
     return published_buffer_->buffers.size();
 }
 
-int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
+int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
                               const std::string &remote_tcp_addr,
                               int remote_tcp_port,
                               RemoteBufferInfo &out_info) {
@@ -1629,7 +2058,7 @@ int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::queryRemoteBufferByNuma(const std::string &remote_host_id,
+int MPComm::Impl::queryRemoteBufferByNuma(const std::string &remote_host_id,
                                     const std::string &remote_tcp_addr,
                                     int remote_tcp_port,
                                     int numa_node,
@@ -1664,12 +2093,12 @@ int MPComm::queryRemoteBufferByNuma(const std::string &remote_host_id,
     return MPCOMM_SUCCESS;
 }
 
-const PublishedBufferInfo* MPComm::getPublishedBufferInfo() const {
+const PublishedBufferInfo* MPComm::Impl::getPublishedBufferInfo() const {
     // Note: This is not thread-safe for simplicity
     return published_buffer_.get();
 }
 
-void MPComm::handleBufferQuery(int client_fd) {
+void MPComm::Impl::handleBufferQuery(int client_fd) {
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
     
     // Check if any buffers are published
@@ -1750,7 +2179,7 @@ void MPComm::handleBufferQuery(int client_fd) {
 // QP Management
 // ============================================================================
 
-int MPComm::createQP(NicContext &ctx, struct ibv_qp **qp) {
+int MPComm::Impl::createQP(NicContext &ctx, struct ibv_qp **qp) {
     struct ibv_qp_init_attr init_attr;
     memset(&init_attr, 0, sizeof(init_attr));
     
@@ -1772,7 +2201,7 @@ int MPComm::createQP(NicContext &ctx, struct ibv_qp **qp) {
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::modifyQPToInit(NicContext &ctx, struct ibv_qp *qp) {
+int MPComm::Impl::modifyQPToInit(NicContext &ctx, struct ibv_qp *qp) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     
@@ -1793,7 +2222,7 @@ int MPComm::modifyQPToInit(NicContext &ctx, struct ibv_qp *qp) {
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
+int MPComm::Impl::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
                           const RemoteEndpointInfo &remote) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -1826,7 +2255,7 @@ int MPComm::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::modifyQPToRTS(struct ibv_qp *qp) {
+int MPComm::Impl::modifyQPToRTS(struct ibv_qp *qp) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     
@@ -1862,7 +2291,7 @@ int MPComm::modifyQPToRTS(struct ibv_qp *qp) {
     return MPCOMM_SUCCESS;
 }
 
-void MPComm::destroyQP(struct ibv_qp *qp) {
+void MPComm::Impl::destroyQP(struct ibv_qp *qp) {
     if (qp) {
         ibv_destroy_qp(qp);
     }
@@ -1872,7 +2301,7 @@ void MPComm::destroyQP(struct ibv_qp *qp) {
 // TCP Handshake for Metadata Exchange
 // ============================================================================
 
-int MPComm::connect(const std::string &remote_host_id,
+int MPComm::Impl::connect(const std::string &remote_host_id,
                     const std::string &remote_tcp_addr,
                     int remote_tcp_port) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
@@ -2277,18 +2706,18 @@ int MPComm::connect(const std::string &remote_host_id,
     return MPCOMM_SUCCESS;
 }
 
-int MPComm::startAcceptThread() {
+int MPComm::Impl::startAcceptThread() {
     if (listen_fd_ < 0) {
         fprintf(stderr, "MPComm: TCP listener not initialized\n");
         return MPCOMM_ERR_CONNECTION;
     }
 
     accept_running_ = true;
-    accept_thread_ = std::make_unique<std::thread>(&MPComm::acceptLoop, this);
+    accept_thread_ = std::make_unique<std::thread>(&MPComm::Impl::acceptLoop, this);
     return MPCOMM_SUCCESS;
 }
 
-void MPComm::stopAcceptThread() {
+void MPComm::Impl::stopAcceptThread() {
     accept_running_ = false;
     
     // Interrupt accept() by connecting to ourselves
@@ -2311,7 +2740,7 @@ void MPComm::stopAcceptThread() {
     accept_thread_.reset();
 }
 
-void MPComm::acceptLoop() {
+void MPComm::Impl::acceptLoop() {
     while (accept_running_) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
@@ -2690,7 +3119,7 @@ void MPComm::acceptLoop() {
     }
 }
 
-struct ibv_qp *MPComm::getOrCreateQP(size_t local_nic_index,
+struct ibv_qp *MPComm::Impl::getOrCreateQP(size_t local_nic_index,
                                      const std::string &remote_host_id,
                                      size_t remote_nic_index,
                                      size_t qp_index) {
@@ -2721,7 +3150,7 @@ struct ibv_qp *MPComm::getOrCreateQP(size_t local_nic_index,
 
 // ==================== Async Transfer Implementation ====================
 
-TransferHandle MPComm::scatterAsync(uintptr_t local_addr,
+TransferHandle MPComm::Impl::scatterAsync(uintptr_t local_addr,
                                     const std::vector<std::string> &host_list,
                                     const std::vector<uintptr_t> &remote_addrs,
                                     const std::vector<size_t> &lengths) {
@@ -2729,7 +3158,7 @@ TransferHandle MPComm::scatterAsync(uintptr_t local_addr,
                               TransferDirection::SCATTER);
 }
 
-TransferHandle MPComm::broadcastAsync(uintptr_t local_addr,
+TransferHandle MPComm::Impl::broadcastAsync(uintptr_t local_addr,
                                       size_t length,
                                       const std::vector<std::string> &host_list,
                                       const std::vector<uintptr_t> &remote_addrs) {
@@ -2748,7 +3177,7 @@ TransferHandle MPComm::broadcastAsync(uintptr_t local_addr,
                               TransferDirection::BROADCAST);
 }
 
-TransferHandle MPComm::gatherAsync(uintptr_t local_addr,
+TransferHandle MPComm::Impl::gatherAsync(uintptr_t local_addr,
                                    const std::vector<std::string> &host_list,
                                    const std::vector<uintptr_t> &remote_addrs,
                                    const std::vector<size_t> &lengths) {
@@ -2756,7 +3185,7 @@ TransferHandle MPComm::gatherAsync(uintptr_t local_addr,
                               TransferDirection::GATHER);
 }
 
-TransferHandle MPComm::putAsync(uintptr_t local_addr,
+TransferHandle MPComm::Impl::putAsync(uintptr_t local_addr,
                                 const std::string &remote_host_id,
                                 uintptr_t remote_addr,
                                 size_t length) {
@@ -2772,7 +3201,7 @@ TransferHandle MPComm::putAsync(uintptr_t local_addr,
                               TransferDirection::SCATTER);
 }
 
-TransferHandle MPComm::getAsync(uintptr_t local_addr,
+TransferHandle MPComm::Impl::getAsync(uintptr_t local_addr,
                                 const std::string &remote_host_id,
                                 uintptr_t remote_addr,
                                 size_t length) {
@@ -2788,7 +3217,7 @@ TransferHandle MPComm::getAsync(uintptr_t local_addr,
                               TransferDirection::GATHER);
 }
 
-TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
+TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
                                           const std::vector<std::string> &host_list,
                                           const std::vector<uintptr_t> &remote_addrs,
                                           const std::vector<size_t> &lengths,
@@ -2854,7 +3283,7 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
         ctx->finished.store(true);
         ctx->error_code.store(MPCOMM_SUCCESS);
         auto now = std::chrono::steady_clock::now();
-        ctx->prep_chunks_fill_time = now;
+        ctx->prep_chunks_meta_time = now;
         ctx->prep_numa_query_time = now;
         ctx->prep_flowctrl_time = now;
         ctx->queued_time = now;
@@ -2872,39 +3301,15 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
         return handle;
     }
     
-    // Fill chunks
-    ctx->all_chunks.resize(total_chunks);
-    for (size_t host_idx = 0; host_idx < host_count; ++host_idx) {
-        const size_t host_len = lengths[host_idx];
-        const uintptr_t base_local = local_addr + host_local_offsets[host_idx];
-        const uintptr_t base_remote = remote_addrs[host_idx];
-        size_t chunk_idx = host_chunk_starts[host_idx];
-        
-        size_t full_chunks = host_len / max_chunk_size;
-        for (size_t i = 0; i < full_chunks; ++i) {
-            ctx->all_chunks[chunk_idx++] = {
-                host_idx,
-                base_local + i * max_chunk_size,
-                base_remote + i * max_chunk_size,
-                max_chunk_size
-            };
-        }
-        
-        size_t remainder = host_len % max_chunk_size;
-        if (remainder > 0) {
-            ctx->all_chunks[chunk_idx] = {
-                host_idx,
-                base_local + full_chunks * max_chunk_size,
-                base_remote + full_chunks * max_chunk_size,
-                remainder
-            };
-        }
-    }
+    // Store chunk metadata for lazy computation (no pre-allocated chunk array)
+    ctx->max_chunk_size = max_chunk_size;
+    ctx->host_chunk_starts = std::move(host_chunk_starts);
+    ctx->host_local_offsets = std::move(host_local_offsets);
     
     ctx->total_chunks.store(total_chunks);
     ctx->next_chunk_idx.store(0);
     
-    ctx->prep_chunks_fill_time = std::chrono::steady_clock::now();
+    ctx->prep_chunks_meta_time = std::chrono::steady_clock::now();
     
     // NUMA-aware NIC selection (with PCIe-affine upgrade for GPU memory)
     int memory_numa_node = getNumaNodeForAddr(reinterpret_cast<void*>(local_addr));
@@ -2973,7 +3378,7 @@ TransferHandle MPComm::transferAsyncStart(uintptr_t local_addr,
     return handle;
 }
 
-size_t MPComm::selectBestNicForAsync(TransferContext& ctx) {
+size_t MPComm::Impl::selectBestNicForAsync(TransferContext& ctx) {
     size_t num_nics = nic_contexts_.size();
     size_t num_candidate_nics = ctx.candidate_nic_indices.size();
     const size_t max_outstanding_per_nic = 256 * qps_per_connection_;
@@ -3008,7 +3413,7 @@ size_t MPComm::selectBestNicForAsync(TransferContext& ctx) {
     return best_nic;
 }
 
-int MPComm::pollAllNicsForAsync(TransferContext& ctx) {
+int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
     // Poll only candidate NICs for better performance in single-transfer scenarios
     // When parallel transfers share the same NICs, completions will still be properly routed
     // because we poll CQs (shared per NIC) and decode the transfer handle from wr_id
@@ -3082,7 +3487,7 @@ int MPComm::pollAllNicsForAsync(TransferContext& ctx) {
     return MPCOMM_SUCCESS;
 }
 
-bool MPComm::isTransferComplete(TransferHandle handle) {
+bool MPComm::Impl::isTransferComplete(TransferHandle handle) {
     // Fully async mode: just check the finished flag (no polling here)
     // Worker thread handles all post and poll operations
     std::lock_guard<std::mutex> lock(transfers_mutex_);
@@ -3093,7 +3498,7 @@ bool MPComm::isTransferComplete(TransferHandle handle) {
     return it->second->finished.load();
 }
 
-int MPComm::waitTransfer(TransferHandle handle, int timeout_ms) {
+int MPComm::Impl::waitTransfer(TransferHandle handle, int timeout_ms) {
     auto start_time = std::chrono::steady_clock::now();
     
     while (true) {
@@ -3123,7 +3528,7 @@ int MPComm::waitTransfer(TransferHandle handle, int timeout_ms) {
     }
 }
 
-TransferResult MPComm::getTransferResult(TransferHandle handle) {
+TransferResult MPComm::Impl::getTransferResult(TransferHandle handle) {
     TransferResult result = {MPCOMM_ERR_INVALID_HANDLE, 0, 0.0};
     
     std::lock_guard<std::mutex> lock(transfers_mutex_);
@@ -3149,7 +3554,7 @@ TransferResult MPComm::getTransferResult(TransferHandle handle) {
     return result;
 }
 
-void MPComm::releaseTransfer(TransferHandle handle) {
+void MPComm::Impl::releaseTransfer(TransferHandle handle) {
     std::lock_guard<std::mutex> lock(transfers_mutex_);
     auto it = active_transfers_.find(handle);
     if (it != active_transfers_.end()) {
@@ -3167,24 +3572,26 @@ void MPComm::releaseTransfer(TransferHandle handle) {
             }
             double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
             
-            printf("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
-            printf("%-20s %15s %12s %12s %12s\n", 
-                   "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
-            printf("------------------------------------------------------------------------\n");
-            size_t num_nics = nic_contexts_.size();
-            for (size_t nic = 0; nic < num_nics; ++nic) {
-                double share_pct = (total_bytes > 0) ? 
-                                   (100.0 * ctx.per_nic_bytes[nic] / total_bytes) : 0.0;
-                double nic_bandwidth_gbps = (ctx.per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
-                printf("%-20s %15zu %12zu %11.1f%% %12.2f\n",
-                       nic_contexts_[nic]->device_name.c_str(),
-                       ctx.per_nic_bytes[nic], ctx.per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
+            if (transfer_stats_enabled_) {
+                printf("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
+                printf("%-20s %15s %12s %12s %12s\n", 
+                       "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
+                printf("------------------------------------------------------------------------\n");
+                size_t num_nics = nic_contexts_.size();
+                for (size_t nic = 0; nic < num_nics; ++nic) {
+                    double share_pct = (total_bytes > 0) ? 
+                                       (100.0 * ctx.per_nic_bytes[nic] / total_bytes) : 0.0;
+                    double nic_bandwidth_gbps = (ctx.per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
+                    printf("%-20s %15zu %12zu %11.1f%% %12.2f\n",
+                           nic_contexts_[nic]->device_name.c_str(),
+                           ctx.per_nic_bytes[nic], ctx.per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
+                }
+                printf("------------------------------------------------------------------------\n");
+                printf("%-20s %15zu %12zu %12s %12.2f\n",
+                       "Total", total_bytes, ctx.total_chunks.load(), "-", total_bandwidth_gbps);
+                printf("Time: %.2f ms\n", transfer_ms);
+                printf("==============================================================\n\n");
             }
-            printf("------------------------------------------------------------------------\n");
-            printf("%-20s %15zu %12zu %12s %12.2f\n",
-                   "Total", total_bytes, ctx.total_chunks.load(), "-", total_bandwidth_gbps);
-            printf("Time: %.2f ms\n", transfer_ms);
-            printf("==============================================================\n\n");
         }
         
         active_transfers_.erase(it);
@@ -3195,7 +3602,7 @@ void MPComm::releaseTransfer(TransferHandle handle) {
 // Worker Thread Implementation for Fully Async Transfer
 // ============================================================================
 
-void MPComm::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
+void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     // Bind this thread to a specific CPU if requested
 #ifdef __linux__
     if (cpu_id >= 0) {
@@ -3254,7 +3661,7 @@ void MPComm::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     printf("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
 }
 
-void MPComm::processTransfer(TransferContext& ctx) {
+void MPComm::Impl::processTransfer(TransferContext& ctx) {
     ctx.submitted.store(true);
     ctx.worker_start_time = std::chrono::steady_clock::now();
     
@@ -3334,7 +3741,7 @@ void MPComm::processTransfer(TransferContext& ctx) {
         // Post remaining chunks
         while (ctx.next_chunk_idx.load() < total_chunks) {
             size_t chunk_idx = ctx.next_chunk_idx.load();
-            auto &chunk = ctx.all_chunks[chunk_idx];
+            auto chunk = ctx.getChunk(chunk_idx);
             
             // Select best NIC
             size_t best_nic = selectBestNicForAsync(ctx);
@@ -3519,36 +3926,38 @@ void MPComm::processTransfer(TransferContext& ctx) {
     
     // Calculate total bytes transferred
     size_t total_bytes = 0;
-    for (const auto& chunk : ctx.all_chunks) {
-        total_bytes += chunk.length;
+    for (size_t i = 0; i < ctx.lengths.size(); ++i) {
+        total_bytes += ctx.lengths[i];
     }
     
     double total_time_us = to_us(ctx.start_time, ctx.end_time);
     double bandwidth_gbps = (total_bytes * 8.0) / (total_time_us * 1000.0);  // Gbps
     
-    printf("MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
-           ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
-    printf("  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
-    printf("      [1a] Chunk calc:                 %8.1f us\n", to_us(ctx.start_time, ctx.prep_chunks_calc_time));
-    printf("      [1b] Chunk fill:                 %8.1f us\n", to_us(ctx.prep_chunks_calc_time, ctx.prep_chunks_fill_time));
-    printf("      [1c] NUMA query:                 %8.1f us\n", to_us(ctx.prep_chunks_fill_time, ctx.prep_numa_query_time));
-    printf("      [1d] FlowCtrl init:              %8.1f us\n", to_us(ctx.prep_numa_query_time, ctx.prep_flowctrl_time));
-    printf("      [1e] Queue submit:               %8.1f us\n", to_us(ctx.prep_flowctrl_time, ctx.queued_time));
-    printf("  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
-    printf("  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
-    printf("  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
-    printf("  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
-    printf("  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
-    printf("  Diagnostics: total_chunks=%zu, max_outstanding_per_nic=%zu\n",
-           total_chunks, max_outstanding_per_nic);
-    printf("  Diagnostics: flow_ctrl_hits=%zu, qp_full_hits=%zu\n",
-           diag_flow_control_hits, diag_qp_full_hits);
-    printf("  Diagnostics: completions_during_post=%zu, completions_after_post=%zu, peak_outstanding=%zu\n",
-           diag_completions_during_post, diag_completions_after_post, diag_max_outstanding_seen);
-    printf("  Diagnostics: completion_poll_rounds=%zu\n", diag_completion_poll_rounds);
+    if (transfer_stats_enabled_) {
+        printf("MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
+               ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
+        printf("  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
+        printf("      [1a] Chunk calc:                 %8.1f us\n", to_us(ctx.start_time, ctx.prep_chunks_calc_time));
+        printf("      [1b] Chunk meta:                 %8.1f us\n", to_us(ctx.prep_chunks_calc_time, ctx.prep_chunks_meta_time));
+        printf("      [1c] NUMA query:                 %8.1f us\n", to_us(ctx.prep_chunks_meta_time, ctx.prep_numa_query_time));
+        printf("      [1d] FlowCtrl init:              %8.1f us\n", to_us(ctx.prep_numa_query_time, ctx.prep_flowctrl_time));
+        printf("      [1e] Queue submit:               %8.1f us\n", to_us(ctx.prep_flowctrl_time, ctx.queued_time));
+        printf("  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
+        printf("  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
+        printf("  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
+        printf("  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
+        printf("  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
+        printf("  Diagnostics: total_chunks=%zu, max_outstanding_per_nic=%zu\n",
+               total_chunks, max_outstanding_per_nic);
+        printf("  Diagnostics: flow_ctrl_hits=%zu, qp_full_hits=%zu\n",
+               diag_flow_control_hits, diag_qp_full_hits);
+        printf("  Diagnostics: completions_during_post=%zu, completions_after_post=%zu, peak_outstanding=%zu\n",
+               diag_completions_during_post, diag_completions_after_post, diag_max_outstanding_seen);
+        printf("  Diagnostics: completion_poll_rounds=%zu\n", diag_completion_poll_rounds);
+    }
 }
 
-int MPComm::getNumaForAddr(uintptr_t addr) const {
+int MPComm::Impl::getNumaForAddr(uintptr_t addr) const {
     // Get NUMA node for the memory address
     int numa_node = getNumaNodeForAddr(reinterpret_cast<void*>(addr));
     
@@ -3561,7 +3970,7 @@ int MPComm::getNumaForAddr(uintptr_t addr) const {
     return static_cast<int>((addr >> 12) % num_numa_nodes_);
 }
 
-size_t MPComm::selectWorkerForNuma(int numa_id) {
+size_t MPComm::Impl::selectWorkerForNuma(int numa_id) {
     // Ensure numa_id is valid
     if (numa_id < 0 || static_cast<size_t>(numa_id) >= num_numa_nodes_) {
         numa_id = 0;
@@ -3575,5 +3984,210 @@ size_t MPComm::selectWorkerForNuma(int numa_id) {
 }
 
 // ==================== End Async Transfer Implementation ====================
+
+// =====================================================================
+// MPComm Public API - Delegates to Impl (Pimpl Pattern)
+// =====================================================================
+
+MPComm::MPComm() : impl_(std::make_unique<Impl>()) {}
+
+MPComm::~MPComm() = default;
+
+MPComm::MPComm(MPComm &&) noexcept = default;
+
+MPComm &MPComm::operator=(MPComm &&) noexcept = default;
+
+int MPComm::init(const std::string &local_host_id,
+                 const std::string &device_names,
+                 int tcp_port) {
+    return impl_->init(local_host_id, device_names, tcp_port);
+}
+
+void MPComm::shutdown() {
+    impl_->shutdown();
+}
+
+int MPComm::registerMemory(void *addr, size_t length) {
+    return impl_->registerMemory(addr, length);
+}
+
+int MPComm::unregisterMemory(void *addr) {
+    return impl_->unregisterMemory(addr);
+}
+
+int MPComm::connect(const std::string &remote_host_id,
+                    const std::string &remote_tcp_addr,
+                    int remote_tcp_port) {
+    return impl_->connect(remote_host_id, remote_tcp_addr, remote_tcp_port);
+}
+
+int MPComm::startAcceptThread() {
+    return impl_->startAcceptThread();
+}
+
+void MPComm::stopAcceptThread() {
+    impl_->stopAcceptThread();
+}
+
+int MPComm::updateRemoteMemoryInfo(const std::string &remote_host_id,
+                                   const std::vector<uint32_t> &rkeys) {
+    return impl_->updateRemoteMemoryInfo(remote_host_id, rkeys);
+}
+
+int MPComm::publishBuffer(void *addr, size_t length, int numa_node) {
+    return impl_->publishBuffer(addr, length, numa_node);
+}
+
+int MPComm::unpublishBuffer(void *addr) {
+    return impl_->unpublishBuffer(addr);
+}
+
+void MPComm::unpublishAllBuffers() {
+    impl_->unpublishAllBuffers();
+}
+
+int MPComm::queryRemoteBuffer(const std::string &remote_host_id,
+                              const std::string &remote_tcp_addr,
+                              int remote_tcp_port,
+                              RemoteBufferInfo &out_info) {
+    return impl_->queryRemoteBuffer(remote_host_id, remote_tcp_addr,
+                                    remote_tcp_port, out_info);
+}
+
+int MPComm::queryRemoteBufferByNuma(const std::string &remote_host_id,
+                                    const std::string &remote_tcp_addr,
+                                    int remote_tcp_port,
+                                    int numa_node,
+                                    RemoteBufferEntry &out_entry) {
+    return impl_->queryRemoteBufferByNuma(remote_host_id, remote_tcp_addr,
+                                          remote_tcp_port, numa_node, out_entry);
+}
+
+const PublishedBufferInfo* MPComm::getPublishedBufferInfo() const {
+    return impl_->getPublishedBufferInfo();
+}
+
+size_t MPComm::getPublishedBufferCount() const {
+    return impl_->getPublishedBufferCount();
+}
+
+uint32_t MPComm::getRkey(size_t nic_index, void *addr) const {
+    return impl_->getRkey(nic_index, addr);
+}
+
+TransferHandle MPComm::scatterAsync(uintptr_t local_addr,
+                                    const std::vector<std::string> &host_list,
+                                    const std::vector<uintptr_t> &remote_addrs,
+                                    const std::vector<size_t> &lengths) {
+    return impl_->scatterAsync(local_addr, host_list, remote_addrs, lengths);
+}
+
+TransferHandle MPComm::gatherAsync(uintptr_t local_addr,
+                                   const std::vector<std::string> &host_list,
+                                   const std::vector<uintptr_t> &remote_addrs,
+                                   const std::vector<size_t> &lengths) {
+    return impl_->gatherAsync(local_addr, host_list, remote_addrs, lengths);
+}
+
+TransferHandle MPComm::broadcastAsync(uintptr_t local_addr,
+                                      size_t length,
+                                      const std::vector<std::string> &host_list,
+                                      const std::vector<uintptr_t> &remote_addrs) {
+    return impl_->broadcastAsync(local_addr, length, host_list, remote_addrs);
+}
+
+TransferHandle MPComm::putAsync(uintptr_t local_addr,
+                                const std::string &remote_host_id,
+                                uintptr_t remote_addr,
+                                size_t length) {
+    return impl_->putAsync(local_addr, remote_host_id, remote_addr, length);
+}
+
+TransferHandle MPComm::getAsync(uintptr_t local_addr,
+                                const std::string &remote_host_id,
+                                uintptr_t remote_addr,
+                                size_t length) {
+    return impl_->getAsync(local_addr, remote_host_id, remote_addr, length);
+}
+
+bool MPComm::isTransferComplete(TransferHandle handle) {
+    return impl_->isTransferComplete(handle);
+}
+
+int MPComm::waitTransfer(TransferHandle handle, int timeout_ms) {
+    return impl_->waitTransfer(handle, timeout_ms);
+}
+
+TransferResult MPComm::getTransferResult(TransferHandle handle) {
+    return impl_->getTransferResult(handle);
+}
+
+void MPComm::releaseTransfer(TransferHandle handle) {
+    impl_->releaseTransfer(handle);
+}
+
+size_t MPComm::getNumNics() const {
+    return impl_->getNumNics();
+}
+
+const std::string &MPComm::getLocalHostId() const {
+    return impl_->getLocalHostId();
+}
+
+int MPComm::getTcpPort() const {
+    return impl_->getTcpPort();
+}
+
+std::string MPComm::getGid(size_t nic_index) const {
+    return impl_->getGid(nic_index);
+}
+
+std::string MPComm::getDeviceName(size_t nic_index) const {
+    return impl_->getDeviceName(nic_index);
+}
+
+std::vector<std::string> MPComm::getActiveDevices() const {
+    return impl_->getActiveDevices();
+}
+
+const char* MPComm::getNicFilterEnvVarName() {
+    return kNicFilterEnvVar;
+}
+
+size_t MPComm::getMaxRdmaTransferSize() const {
+    return impl_->getMaxRdmaTransferSize();
+}
+
+size_t MPComm::getQpsPerConnection() const {
+    return impl_->getQpsPerConnection();
+}
+
+const char* MPComm::getQpsPerConnectionEnvVarName() {
+    return kQpsPerConnectionEnvVar;
+}
+
+const std::vector<NumaTopology>& MPComm::getNumaTopology() const {
+    return impl_->getNumaTopology();
+}
+
+const std::vector<NicTopologyInfo>& MPComm::getNicTopology() const {
+    return impl_->getNicTopology();
+}
+
+int MPComm::getNicNumaNode(const std::string& nic_name) const {
+    return impl_->getNicNumaNode(nic_name);
+}
+
+int MPComm::getNumaNodeForAddr(void* addr) const {
+    return impl_->getNumaNodeForAddr(addr);
+}
+
+std::vector<size_t> MPComm::getLocalNicIndicesForNuma(int numa_node) const {
+    return impl_->getLocalNicIndicesForNuma(numa_node);
+}
+
+int MPComm::getGpuNumaNode(int gpu_device_id) const {
+    return impl_->getGpuNumaNode(gpu_device_id);
+}
 
 }  // namespace mpcomm

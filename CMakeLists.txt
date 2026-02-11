@@ -1,5 +1,8 @@
-cmake_minimum_required(VERSION 3.10)
-project(mpcomm LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.14)
+project(mpcomm VERSION 1.0.0 LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,59 +45,98 @@ if(USE_CUDA)
     endif()
 endif()
 
-# MPComm library
-add_library(mpcomm STATIC
+# MPComm static library
+add_library(mpcomm_static STATIC
     src/mpcomm.cpp
-    src/topology.cpp
+)
+set_target_properties(mpcomm_static PROPERTIES
+    OUTPUT_NAME mpcomm
+    EXPORT_NAME mpcomm_static
 )
 
-target_include_directories(mpcomm PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+target_include_directories(mpcomm_static PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     ${IBVERBS_INCLUDE_DIR}
 )
 
-target_link_libraries(mpcomm PUBLIC
+target_link_libraries(mpcomm_static PUBLIC
     ${IBVERBS_LIBRARY}
     ${NUMA_LIBRARY}
     pthread
 )
 
+# MPComm shared library
+add_library(mpcomm_shared SHARED
+    src/mpcomm.cpp
+)
+set_target_properties(mpcomm_shared PROPERTIES
+    OUTPUT_NAME mpcomm
+    EXPORT_NAME mpcomm
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+target_include_directories(mpcomm_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    ${IBVERBS_INCLUDE_DIR}
+)
+
+target_link_libraries(mpcomm_shared PRIVATE
+    ${IBVERBS_LIBRARY}
+    ${NUMA_LIBRARY}
+    pthread
+)
+
+# Convenience alias (points to shared library by default)
+add_library(mpcomm ALIAS mpcomm_shared)
+
 # Add vendor-specific compile definitions and libraries
 if(USE_MLNX)
-    target_compile_definitions(mpcomm PUBLIC USE_MLNX)
+    target_compile_definitions(mpcomm_static PUBLIC USE_MLNX)
+    target_compile_definitions(mpcomm_shared PUBLIC USE_MLNX)
     if(MLX5_LIBRARY)
-        target_link_libraries(mpcomm PUBLIC ${MLX5_LIBRARY})
+        target_link_libraries(mpcomm_static PUBLIC ${MLX5_LIBRARY})
+        target_link_libraries(mpcomm_shared PRIVATE ${MLX5_LIBRARY})
     endif()
 endif()
 
 if(USE_BNXT)
-    target_compile_definitions(mpcomm PUBLIC USE_BNXT)
+    target_compile_definitions(mpcomm_static PUBLIC USE_BNXT)
+    target_compile_definitions(mpcomm_shared PUBLIC USE_BNXT)
     if(BNXT_RE_LIBRARY)
-        target_link_libraries(mpcomm PUBLIC ${BNXT_RE_LIBRARY})
+        target_link_libraries(mpcomm_static PUBLIC ${BNXT_RE_LIBRARY})
+        target_link_libraries(mpcomm_shared PRIVATE ${BNXT_RE_LIBRARY})
     endif()
 endif()
 
 if(USE_CUDA)
-    target_compile_definitions(mpcomm PUBLIC USE_CUDA)
+    target_compile_definitions(mpcomm_static PUBLIC USE_CUDA)
+    target_compile_definitions(mpcomm_shared PUBLIC USE_CUDA)
     if(CUDA_INCLUDE_DIR)
-        target_include_directories(mpcomm PUBLIC ${CUDA_INCLUDE_DIR})
+        target_include_directories(mpcomm_static PUBLIC ${CUDA_INCLUDE_DIR})
+        target_include_directories(mpcomm_shared PUBLIC ${CUDA_INCLUDE_DIR})
     endif()
     if(CUDA_DRIVER_LIBRARY)
-        target_link_libraries(mpcomm PUBLIC ${CUDA_DRIVER_LIBRARY})
+        target_link_libraries(mpcomm_static PUBLIC ${CUDA_DRIVER_LIBRARY})
+        target_link_libraries(mpcomm_shared PRIVATE ${CUDA_DRIVER_LIBRARY})
     endif()
 endif()
 
 # Enable position independent code for static library
 # Required when linking into shared libraries (e.g., Python modules)
-set_target_properties(mpcomm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(mpcomm_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Compiler flags
-target_compile_options(mpcomm PRIVATE
-    -Wall
-    -Wextra
-    -Werror
-    -O2
-)
+foreach(_target mpcomm_static mpcomm_shared)
+    target_compile_options(${_target} PRIVATE
+        -Wall
+        -Wextra
+        -Werror
+        -O2
+    )
+endforeach()
 
 # Python bindings (optional)
 option(BUILD_MPCOMM_PYTHON "Build MPComm Python bindings" OFF)
@@ -134,7 +176,7 @@ if(BUILD_MPCOMM_PYTHON)
     )
 
     target_link_libraries(mpcomm_py PRIVATE
-        mpcomm
+        mpcomm_static
         ${Python3_LIBRARIES}
     )
 
@@ -157,14 +199,59 @@ if(BUILD_MPCOMM_EXAMPLES)
     add_executable(mpcomm_example
         examples/basic_example.cpp
     )
-    target_link_libraries(mpcomm_example mpcomm)
+    target_link_libraries(mpcomm_example mpcomm_shared)
 endif()
 
-# Test executable (optional)
-option(BUILD_MPCOMM_TESTS "Build MPComm tests" OFF)
-if(BUILD_MPCOMM_TESTS)
-    add_executable(mpcomm_test
-        tests/mpcomm_test.cpp
+# =====================================================================
+# Install rules
+# =====================================================================
+
+# Install header files
+install(FILES include/mpcomm.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Install libraries
+install(TARGETS mpcomm_static mpcomm_shared
+    EXPORT mpcommTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install CMake package config files
+set(MPCOMM_CMAKE_INSTALL_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/mpcomm)
+
+install(EXPORT mpcommTargets
+    FILE mpcommTargets.cmake
+    NAMESPACE mpcomm::
+    DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mpcommConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
+    INSTALL_DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
+    DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+)
+
+# Install Python module (when built)
+if(BUILD_MPCOMM_PYTHON)
+    install(TARGETS mpcomm_py
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python/mpcomm
     )
-    target_link_libraries(mpcomm_test mpcomm)
+    install(FILES python/__init__.py
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/python/mpcomm
+    )
 endif()

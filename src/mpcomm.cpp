@@ -40,6 +40,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -252,6 +253,8 @@ struct TransferContext {
     std::chrono::steady_clock::time_point end_time;
 
     size_t rr_nic_index;
+    int numa_id;  // NUMA node that owns this transfer
+    std::string timing_breakdown_str;  // Buffered timing breakdown (written by worker, printed by releaseTransfer)
 
     TransferContext()
         : handle(INVALID_TRANSFER_HANDLE)
@@ -264,7 +267,8 @@ struct TransferContext {
         , direction(TransferDirection::SCATTER)
         , max_chunk_size(0)
         , next_chunk_idx(0)
-        , rr_nic_index(0) {}
+        , rr_nic_index(0)
+        , numa_id(0) {}
 
     TransferContext(const TransferContext&) = delete;
     TransferContext& operator=(const TransferContext&) = delete;
@@ -450,8 +454,17 @@ private:
     std::atomic<bool> accept_running_;
     std::unique_ptr<std::thread> accept_thread_;
 
-    std::unordered_map<TransferHandle, std::unique_ptr<TransferContext>> active_transfers_;
-    mutable std::mutex transfers_mutex_;
+    // Per-NUMA transfer state to avoid cross-NUMA lock contention
+    struct alignas(64) NumaTransferState {
+        std::unordered_map<TransferHandle, std::unique_ptr<TransferContext>> active_transfers;
+        mutable std::mutex mutex;
+    };
+    std::array<NumaTransferState, kMaxNumaNodes> per_numa_transfers_;
+
+    // Lightweight handle-to-NUMA routing map (only used by user-facing API, not worker hot path)
+    std::unordered_map<TransferHandle, int> handle_numa_map_;
+    mutable std::mutex handle_numa_mutex_;
+
     std::atomic<TransferHandle> next_transfer_handle_{1};
 
     size_t num_numa_nodes_;
@@ -3357,9 +3370,15 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         ctx->end_time = now;
         
         TransferHandle handle = ctx->handle;
+        int zero_numa = getNumaForAddr(local_addr);
+        ctx->numa_id = zero_numa;
         {
-            std::lock_guard<std::mutex> lock(transfers_mutex_);
-            active_transfers_[handle] = std::move(ctx);
+            std::lock_guard<std::mutex> lock(per_numa_transfers_[zero_numa].mutex);
+            per_numa_transfers_[zero_numa].active_transfers[handle] = std::move(ctx);
+        }
+        {
+            std::lock_guard<std::mutex> lock(handle_numa_mutex_);
+            handle_numa_map_[handle] = zero_numa;
         }
         return handle;
     }
@@ -3411,8 +3430,8 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     ctx->prep_flowctrl_time = std::chrono::steady_clock::now();
     
     
-    printf("MPComm: %s queued with %zu chunks across %zu candidate NICs (handle=%lu, numa=%d)\n",
-           op_name, total_chunks, ctx->candidate_nic_indices.size(), ctx->handle, memory_numa_node);
+    // printf("MPComm: %s queued with %zu chunks across %zu candidate NICs (handle=%lu, numa=%d)\n",
+    //        op_name, total_chunks, ctx->candidate_nic_indices.size(), ctx->handle, memory_numa_node);
     
     // Fully async mode: submit task to a worker thread via lock-free queue
     // Worker thread will handle all post and poll operations
@@ -3420,14 +3439,19 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     
     // Determine which NUMA node should handle this transfer
     int numa_id = getNumaForAddr(local_addr);
+    ctx->numa_id = numa_id;
     
     // Record queued time before moving ctx
     ctx->queued_time = std::chrono::steady_clock::now();
     
-    // Store context first
+    // Store context in per-NUMA map (avoids cross-NUMA lock contention)
     {
-        std::lock_guard<std::mutex> lock(transfers_mutex_);
-        active_transfers_[handle] = std::move(ctx);
+        std::lock_guard<std::mutex> lock(per_numa_transfers_[numa_id].mutex);
+        per_numa_transfers_[numa_id].active_transfers[handle] = std::move(ctx);
+    }
+    {
+        std::lock_guard<std::mutex> lock(handle_numa_mutex_);
+        handle_numa_map_[handle] = numa_id;
     }
     
     // Select a worker within the NUMA node (round-robin)
@@ -3503,12 +3527,15 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
                 if (wc_handle == ctx.handle) {
                     return MPCOMM_ERR_TRANSFER;
                 }
-                // Error belongs to another transfer, mark it there
-                std::lock_guard<std::mutex> lock(transfers_mutex_);
-                auto it = active_transfers_.find(wc_handle);
-                if (it != active_transfers_.end()) {
-                    it->second->error_code.store(MPCOMM_ERR_TRANSFER);
-                    it->second->finished.store(true);
+                // Error belongs to another transfer on the same NUMA, mark it there
+                {
+                    auto& nts = per_numa_transfers_[ctx.numa_id];
+                    std::lock_guard<std::mutex> lock(nts.mutex);
+                    auto it = nts.active_transfers.find(wc_handle);
+                    if (it != nts.active_transfers.end()) {
+                        it->second->error_code.store(MPCOMM_ERR_TRANSFER);
+                        it->second->finished.store(true);
+                    }
                 }
                 continue;
             }
@@ -3529,10 +3556,11 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
                 }
                 ctx.total_completed.fetch_add(1);
             } else {
-                // Completion belongs to another transfer - route it there
-                std::lock_guard<std::mutex> lock(transfers_mutex_);
-                auto it = active_transfers_.find(wc_handle);
-                if (it != active_transfers_.end()) {
+                // Completion belongs to another transfer on the same NUMA - route it there
+                auto& nts = per_numa_transfers_[ctx.numa_id];
+                std::lock_guard<std::mutex> lock(nts.mutex);
+                auto it = nts.active_transfers.find(wc_handle);
+                if (it != nts.active_transfers.end()) {
                     TransferContext* other_ctx = it->second.get();
                     if (completed_nic < num_nics) {
                         other_ctx->per_nic_completed[completed_nic]++;
@@ -3553,29 +3581,44 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
 bool MPComm::Impl::isTransferComplete(TransferHandle handle) {
     // Fully async mode: just check the finished flag (no polling here)
     // Worker thread handles all post and poll operations
-    std::lock_guard<std::mutex> lock(transfers_mutex_);
-    auto it = active_transfers_.find(handle);
-    if (it == active_transfers_.end()) {
-        return true;  // Invalid handle is considered "complete"
+    int numa_id = -1;
+    {
+        std::lock_guard<std::mutex> lock(handle_numa_mutex_);
+        auto it = handle_numa_map_.find(handle);
+        if (it == handle_numa_map_.end()) return true;  // Invalid handle is considered "complete"
+        numa_id = it->second;
+    }
+    auto& nts = per_numa_transfers_[numa_id];
+    std::lock_guard<std::mutex> lock(nts.mutex);
+    auto it = nts.active_transfers.find(handle);
+    if (it == nts.active_transfers.end()) {
+        return true;
     }
     return it->second->finished.load();
 }
 
 int MPComm::Impl::waitTransfer(TransferHandle handle, int timeout_ms) {
-    auto start_time = std::chrono::steady_clock::now();
+    // Resolve handle to NUMA node once (avoids repeated map lookup)
+    int numa_id = -1;
+    TransferContext* ctx_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(handle_numa_mutex_);
+        auto it = handle_numa_map_.find(handle);
+        if (it == handle_numa_map_.end()) return MPCOMM_ERR_INVALID_HANDLE;
+        numa_id = it->second;
+    }
+    {
+        auto& nts = per_numa_transfers_[numa_id];
+        std::lock_guard<std::mutex> lock(nts.mutex);
+        auto it = nts.active_transfers.find(handle);
+        if (it == nts.active_transfers.end()) return MPCOMM_ERR_INVALID_HANDLE;
+        ctx_ptr = it->second.get();
+    }
     
-    while (true) {
-        // Just check the finished flag (no polling)
-        {
-            std::lock_guard<std::mutex> lock(transfers_mutex_);
-            auto it = active_transfers_.find(handle);
-            if (it == active_transfers_.end()) {
-                return MPCOMM_ERR_INVALID_HANDLE;
-            }
-            if (it->second->finished.load()) {
-                return it->second->error_code.load();
-            }
-        }
+    // Busy-wait on the finished flag (no mutex, no sleep)
+    auto start_time = std::chrono::steady_clock::now();
+    while (!ctx_ptr->finished.load(std::memory_order_acquire)) {
+        _mm_pause();  // CPU spin hint
         
         // Check timeout
         if (timeout_ms >= 0) {
@@ -3585,18 +3628,24 @@ int MPComm::Impl::waitTransfer(TransferHandle handle, int timeout_ms) {
                 return MPCOMM_ERR_TIMEOUT;
             }
         }
-        
-        // Sleep briefly to avoid busy spinning (worker thread does the work)
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
+    return ctx_ptr->error_code.load(std::memory_order_acquire);
 }
 
 TransferResult MPComm::Impl::getTransferResult(TransferHandle handle) {
     TransferResult result = {MPCOMM_ERR_INVALID_HANDLE, 0, 0.0};
     
-    std::lock_guard<std::mutex> lock(transfers_mutex_);
-    auto it = active_transfers_.find(handle);
-    if (it == active_transfers_.end()) {
+    int numa_id = -1;
+    {
+        std::lock_guard<std::mutex> lock(handle_numa_mutex_);
+        auto nit = handle_numa_map_.find(handle);
+        if (nit == handle_numa_map_.end()) return result;
+        numa_id = nit->second;
+    }
+    auto& nts = per_numa_transfers_[numa_id];
+    std::lock_guard<std::mutex> lock(nts.mutex);
+    auto it = nts.active_transfers.find(handle);
+    if (it == nts.active_transfers.end()) {
         return result;
     }
     
@@ -3618,9 +3667,18 @@ TransferResult MPComm::Impl::getTransferResult(TransferHandle handle) {
 }
 
 void MPComm::Impl::releaseTransfer(TransferHandle handle) {
-    std::lock_guard<std::mutex> lock(transfers_mutex_);
-    auto it = active_transfers_.find(handle);
-    if (it != active_transfers_.end()) {
+    int numa_id = -1;
+    {
+        std::lock_guard<std::mutex> lock(handle_numa_mutex_);
+        auto nit = handle_numa_map_.find(handle);
+        if (nit == handle_numa_map_.end()) return;
+        numa_id = nit->second;
+        handle_numa_map_.erase(nit);
+    }
+    auto& nts = per_numa_transfers_[numa_id];
+    std::lock_guard<std::mutex> lock(nts.mutex);
+    auto it = nts.active_transfers.find(handle);
+    if (it != nts.active_transfers.end()) {
         // Print statistics if transfer was completed
         TransferContext& ctx = *it->second;
         if (ctx.finished.load() && ctx.error_code.load() == MPCOMM_SUCCESS) {
@@ -3636,6 +3694,10 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
             double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
             
             if (transfer_stats_enabled_) {
+                // Print timing breakdown first (buffered from worker thread)
+                if (!ctx.timing_breakdown_str.empty()) {
+                    fputs(ctx.timing_breakdown_str.c_str(), stdout);
+                }
                 printf("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
                 printf("%-20s %15s %12s %12s %12s\n", 
                        "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
@@ -3657,7 +3719,7 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
             }
         }
         
-        active_transfers_.erase(it);
+        nts.active_transfers.erase(it);
     }
 }
 
@@ -3706,12 +3768,13 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
         // Reset idle counter when we get work
         idle_spins = 0;
         
-        // Get the transfer context
+        // Get the transfer context from per-NUMA map (worker knows its numa_id)
         TransferContext* ctx_ptr = nullptr;
         {
-            std::lock_guard<std::mutex> lock(transfers_mutex_);
-            auto it = active_transfers_.find(handle);
-            if (it == active_transfers_.end()) {
+            auto& nts = per_numa_transfers_[numa_id];
+            std::lock_guard<std::mutex> lock(nts.mutex);
+            auto it = nts.active_transfers.find(handle);
+            if (it == nts.active_transfers.end()) {
                 continue;  // Transfer was released before we got to it
             }
             ctx_ptr = it->second.get();
@@ -3997,26 +4060,49 @@ void MPComm::Impl::processTransfer(TransferContext& ctx) {
     double bandwidth_gbps = (total_bytes * 8.0) / (total_time_us * 1000.0);  // Gbps
     
     if (transfer_stats_enabled_) {
-        printf("MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
-               ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
-        printf("  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
-        printf("      [1a] Chunk calc:                 %8.1f us\n", to_us(ctx.start_time, ctx.prep_chunks_calc_time));
-        printf("      [1b] Chunk meta:                 %8.1f us\n", to_us(ctx.prep_chunks_calc_time, ctx.prep_chunks_meta_time));
-        printf("      [1c] NUMA query:                 %8.1f us\n", to_us(ctx.prep_chunks_meta_time, ctx.prep_numa_query_time));
-        printf("      [1d] FlowCtrl init:              %8.1f us\n", to_us(ctx.prep_numa_query_time, ctx.prep_flowctrl_time));
-        printf("      [1e] Queue submit:               %8.1f us\n", to_us(ctx.prep_flowctrl_time, ctx.queued_time));
-        printf("  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
-        printf("  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
-        printf("  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
-        printf("  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
-        printf("  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
-        printf("  Diagnostics: total_chunks=%zu, max_outstanding_per_nic=%zu\n",
-               total_chunks, max_outstanding_per_nic);
-        printf("  Diagnostics: flow_ctrl_hits=%zu, qp_full_hits=%zu\n",
-               diag_flow_control_hits, diag_qp_full_hits);
-        printf("  Diagnostics: completions_during_post=%zu, completions_after_post=%zu, peak_outstanding=%zu\n",
-               diag_completions_during_post, diag_completions_after_post, diag_max_outstanding_seen);
-        printf("  Diagnostics: completion_poll_rounds=%zu\n", diag_completion_poll_rounds);
+        // Buffer timing breakdown into ctx.timing_breakdown_str instead of printing directly.
+        // This avoids interleaved output from concurrent worker threads.
+        // The buffered string will be printed by releaseTransfer() on the user thread.
+        char buf[256];
+        auto& s = ctx.timing_breakdown_str;
+        s.reserve(2048);
+
+        snprintf(buf, sizeof(buf), "MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
+                 ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
+        s += buf;
+        snprintf(buf, sizeof(buf), "  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "      [1a] Chunk calc:                 %8.1f us\n", to_us(ctx.start_time, ctx.prep_chunks_calc_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "      [1b] Chunk meta:                 %8.1f us\n", to_us(ctx.prep_chunks_calc_time, ctx.prep_chunks_meta_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "      [1c] NUMA query:                 %8.1f us\n", to_us(ctx.prep_chunks_meta_time, ctx.prep_numa_query_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "      [1d] FlowCtrl init:              %8.1f us\n", to_us(ctx.prep_numa_query_time, ctx.prep_flowctrl_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "      [1e] Queue submit:               %8.1f us\n", to_us(ctx.prep_flowctrl_time, ctx.queued_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
+        s += buf;
+        snprintf(buf, sizeof(buf), "  Diagnostics: total_chunks=%zu, max_outstanding_per_nic=%zu\n",
+                 total_chunks, max_outstanding_per_nic);
+        s += buf;
+        snprintf(buf, sizeof(buf), "  Diagnostics: flow_ctrl_hits=%zu, qp_full_hits=%zu\n",
+                 diag_flow_control_hits, diag_qp_full_hits);
+        s += buf;
+        snprintf(buf, sizeof(buf), "  Diagnostics: completions_during_post=%zu, completions_after_post=%zu, peak_outstanding=%zu\n",
+                 diag_completions_during_post, diag_completions_after_post, diag_max_outstanding_seen);
+        s += buf;
+        snprintf(buf, sizeof(buf), "  Diagnostics: completion_poll_rounds=%zu\n", diag_completion_poll_rounds);
+        s += buf;
     }
 }
 

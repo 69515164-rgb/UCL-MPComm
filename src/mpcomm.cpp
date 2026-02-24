@@ -66,6 +66,16 @@ namespace mpcomm {
 // =====================================================================
 
 // wr_id encoding for async transfers
+//
+// 64-bit layout:
+//   [63:56]  NIC index    (8 bits, max 256 NICs)
+//   [55:48]  QP index     (8 bits, max 256 QPs per connection)
+//   [47:32]  Handle       (16 bits, recycled via HandlePool, max 65535 concurrent)
+//   [31:0]   Chunk index  (32 bits, max ~4 billion chunks per transfer)
+//
+// Handle values are recycled: when a transfer is released, its handle is returned
+// to the pool for reuse. This ensures handles stay within the 16-bit encoding
+// space indefinitely, regardless of how many total transfers are performed.
 struct WrIdEncoding {
     static constexpr uint64_t NIC_SHIFT = 56;
     static constexpr uint64_t QP_SHIFT = 48;
@@ -465,7 +475,39 @@ private:
     std::unordered_map<TransferHandle, int> handle_numa_map_;
     mutable std::mutex handle_numa_mutex_;
 
-    std::atomic<TransferHandle> next_transfer_handle_{1};
+    // Handle pool for recycling transfer handles within 16-bit wr_id encoding space.
+    // Handles are allocated from the pool and returned on releaseTransfer().
+    // This prevents handle overflow that would cause completion routing errors.
+    struct HandlePool {
+        static constexpr TransferHandle kMaxHandle = 0xFFFF;  // 16-bit max
+        static constexpr TransferHandle kMinHandle = 1;       // 0 is INVALID_TRANSFER_HANDLE
+
+        std::vector<TransferHandle> free_list;
+        TransferHandle next_new_handle = kMinHandle;  // For initial allocation before recycling kicks in
+        mutable std::mutex mutex;
+
+        // Allocate a handle. Returns INVALID_TRANSFER_HANDLE if pool is exhausted.
+        TransferHandle allocate() {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!free_list.empty()) {
+                TransferHandle h = free_list.back();
+                free_list.pop_back();
+                return h;
+            }
+            if (next_new_handle <= kMaxHandle) {
+                return next_new_handle++;
+            }
+            return INVALID_TRANSFER_HANDLE;  // All 65535 handles are in use
+        }
+
+        // Return a handle to the pool for reuse.
+        void release(TransferHandle handle) {
+            if (handle == INVALID_TRANSFER_HANDLE) return;
+            std::lock_guard<std::mutex> lock(mutex);
+            free_list.push_back(handle);
+        }
+    };
+    HandlePool handle_pool_;
 
     size_t num_numa_nodes_;
     size_t total_workers_;
@@ -3322,7 +3364,13 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
 
     // Create transfer context
     auto ctx = std::make_unique<TransferContext>();
-    ctx->handle = next_transfer_handle_.fetch_add(1);
+    ctx->handle = handle_pool_.allocate();
+    if (ctx->handle == INVALID_TRANSFER_HANDLE) {
+        fprintf(stderr, "MPComm: %s failed - handle pool exhausted "
+                "(all %u handles in use, call releaseTransfer to free handles)\n",
+                op_name, (unsigned)HandlePool::kMaxHandle);
+        return INVALID_TRANSFER_HANDLE;
+    }
     ctx->local_addr = local_addr;
     ctx->host_list = host_list;
     ctx->remote_addrs = remote_addrs;
@@ -3671,7 +3719,11 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
     {
         std::lock_guard<std::mutex> lock(handle_numa_mutex_);
         auto nit = handle_numa_map_.find(handle);
-        if (nit == handle_numa_map_.end()) return;
+        if (nit == handle_numa_map_.end()) {
+            // Handle not found in NUMA map - still return it to pool to avoid leak
+            handle_pool_.release(handle);
+            return;
+        }
         numa_id = nit->second;
         handle_numa_map_.erase(nit);
     }
@@ -3721,6 +3773,9 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
         
         nts.active_transfers.erase(it);
     }
+
+    // Return handle to the pool for reuse
+    handle_pool_.release(handle);
 }
 
 // ============================================================================

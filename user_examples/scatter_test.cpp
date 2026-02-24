@@ -89,6 +89,7 @@ struct TestConfig {
     size_t buffer_size = 1000000000;   // 1 GB per target
     int iterations = 10;
     int warmup = 2;
+    int batch_size = 1;                // number of async requests per batch
     int gpu_device = -1;               // -1 = CPU only
     bool run_both = false;             // run both DRAM and HBM
     std::vector<int> initiator_numas;  // NUMA nodes for initiator buffers
@@ -173,6 +174,7 @@ static void printUsage(const char *prog) {
     printf("  --size BYTES                 Buffer size per target in bytes (default: 1000000000)\n");
     printf("  --iterations N               Number of timed iterations (default: 10)\n");
     printf("  --warmup N                   Number of warmup iterations (default: 2)\n");
+    printf("  --batch-size N               Async requests per batch (default: 1)\n");
     printf("  --gpu DEVICE_ID              GPU device for HBM test (default: -1, CPU only)\n");
     printf("  --both                       Run both DRAM and HBM tests\n");
     printf("\nExamples:\n");
@@ -236,6 +238,9 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
             cfg.iterations = std::stoi(argv[++i]);
         } else if (arg == "--warmup" && i + 1 < argc) {
             cfg.warmup = std::stoi(argv[++i]);
+        } else if (arg == "--batch-size" && i + 1 < argc) {
+            cfg.batch_size = std::stoi(argv[++i]);
+            if (cfg.batch_size < 1) cfg.batch_size = 1;
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_device = std::stoi(argv[++i]);
         } else if (arg == "--both") {
@@ -561,8 +566,11 @@ static int runScatterBenchmark(
            per_numa_size, per_numa_size / 1e6);
     printf(" Aggregate total: %zu bytes (%.2f MB)\n",
            total_size, total_size / 1e6);
-    printf(" Warmup: %d, Iterations: %d\n", cfg.warmup, cfg.iterations);
+    printf(" Warmup: %d, Iterations: %d, Batch size: %d\n",
+           cfg.warmup, cfg.iterations, cfg.batch_size);
     printf("========================================\n\n");
+
+    const int batch_size = cfg.batch_size;
 
     // ---- Warmup ----
     printf("Warming up (%d iterations)...\n", cfg.warmup);
@@ -597,40 +605,67 @@ static int runScatterBenchmark(
     printf("Warmup done.\n\n");
 
     // ---- Timed iterations ----
+    // Each iteration submits batch_size async requests per NUMA, then waits
+    // for all to complete.  Data volume per iteration:
+    //   per_iter_total = total_size * batch_size  (across all NUMAs)
+    //   per_iter_per_numa = per_numa_size * batch_size
+    const int total_iters = cfg.iterations;
+    const size_t iter_total_size = total_size * (size_t)batch_size;
+    const size_t iter_per_numa_size = per_numa_size * (size_t)batch_size;
+
     std::vector<double> durations_ms;         // wall time per iteration
-    std::vector<std::vector<double>> per_numa_ms(num_numas);  // per-NUMA internal time
-    durations_ms.reserve(cfg.iterations);
+    std::vector<std::vector<double>> per_numa_ms(num_numas);  // per-NUMA max internal time per iter
+    durations_ms.reserve(total_iters);
     for (size_t n = 0; n < num_numas; ++n) {
-        per_numa_ms[n].reserve(cfg.iterations);
+        per_numa_ms[n].reserve(total_iters);
     }
 
-    for (int i = 0; i < cfg.iterations; ++i) {
+    for (int iter = 0; iter < total_iters; ++iter) {
         auto wall_start = std::chrono::steady_clock::now();
 
-        // Submit all NUMAs
-        std::vector<TransferHandle> handles;
-        handles.reserve(num_numas);
-        for (size_t n = 0; n < num_numas; ++n) {
-            uintptr_t local_addr = reinterpret_cast<uintptr_t>(numa_buffers[n].ptr);
-            TransferHandle handle = comm.scatterAsync(
-                local_addr, host_list, remote_addrs_per_numa[n], lengths);
-            if (handle == INVALID_TRANSFER_HANDLE) {
-                fprintf(stderr, "scatterAsync failed at iteration %d (NUMA %d)\n",
-                        i, numa_buffers[n].numa_node);
-                for (auto h : handles) comm.releaseTransfer(h);
-                return 1;
+        // Submit batch_size async requests per NUMA
+        // handles[b][n] = handle for batch-request b, NUMA n
+        std::vector<std::vector<TransferHandle>> batch_handles(batch_size);
+        for (int b = 0; b < batch_size; ++b) {
+            batch_handles[b].reserve(num_numas);
+            for (size_t n = 0; n < num_numas; ++n) {
+                uintptr_t local_addr = reinterpret_cast<uintptr_t>(numa_buffers[n].ptr);
+                TransferHandle handle = comm.scatterAsync(
+                    local_addr, host_list, remote_addrs_per_numa[n], lengths);
+                if (handle == INVALID_TRANSFER_HANDLE) {
+                    fprintf(stderr, "scatterAsync failed at iter %d, batch %d (NUMA %d)\n",
+                            iter, b, numa_buffers[n].numa_node);
+                    // Cleanup already-submitted handles
+                    for (int bb = 0; bb <= b; ++bb) {
+                        for (auto h : batch_handles[bb]) {
+                            comm.waitTransfer(h, -1);
+                            comm.releaseTransfer(h);
+                        }
+                    }
+                    return 1;
+                }
+                batch_handles[b].push_back(handle);
             }
-            handles.push_back(handle);
         }
 
-        // Wait all
-        for (size_t n = 0; n < num_numas; ++n) {
-            int ret = comm.waitTransfer(handles[n], -1);
-            if (ret != 0) {
-                fprintf(stderr, "waitTransfer failed at iteration %d (NUMA %d): %d\n",
-                        i, numa_buffers[n].numa_node, ret);
-                for (auto h : handles) comm.releaseTransfer(h);
-                return 1;
+        // Wait all handles in this iteration
+        for (int b = 0; b < batch_size; ++b) {
+            for (size_t n = 0; n < num_numas; ++n) {
+                int ret = comm.waitTransfer(batch_handles[b][n], -1);
+                if (ret != 0) {
+                    fprintf(stderr, "waitTransfer failed at iter %d, batch %d (NUMA %d): %d\n",
+                            iter, b, numa_buffers[n].numa_node, ret);
+                    // Cleanup remaining handles
+                    for (int bb = b; bb < batch_size; ++bb) {
+                        for (size_t nn = (bb == b ? n : 0); nn < num_numas; ++nn) {
+                            comm.waitTransfer(batch_handles[bb][nn], -1);
+                        }
+                    }
+                    for (int bb = 0; bb < batch_size; ++bb) {
+                        for (auto h : batch_handles[bb]) comm.releaseTransfer(h);
+                    }
+                    return 1;
+                }
             }
         }
 
@@ -638,62 +673,84 @@ static int runScatterBenchmark(
         double wall_ms = std::chrono::duration<double, std::milli>(
             wall_end - wall_start).count();
 
-        // Collect per-NUMA internal timing
-        double max_internal_ms = 0;
-        printf("  [%2d] wall=%.3f ms", i, wall_ms);
-        for (size_t n = 0; n < num_numas; ++n) {
-            TransferResult result = comm.getTransferResult(handles[n]);
-            comm.releaseTransfer(handles[n]);
-            per_numa_ms[n].push_back(result.elapsed_ms);
-            if (result.elapsed_ms > max_internal_ms) {
-                max_internal_ms = result.elapsed_ms;
-            }
-            if (num_numas > 1) {
-                double numa_bw_gbps = (per_numa_size * 8.0) / (result.elapsed_ms * 1e6);
-                double numa_bw_gbs = (per_numa_size / 1e9) / (result.elapsed_ms / 1e3);
-                printf("  NUMA%d=%.3f ms (%.2f Gbps, %.2f GB/s)",
-                       numa_buffers[n].numa_node, result.elapsed_ms,
-                       numa_bw_gbps, numa_bw_gbs);
+        // Collect per-NUMA internal timing: max across all batch requests
+        std::vector<double> numa_max_ms(num_numas, 0.0);
+        for (int b = 0; b < batch_size; ++b) {
+            for (size_t n = 0; n < num_numas; ++n) {
+                TransferResult result = comm.getTransferResult(batch_handles[b][n]);
+                if (result.elapsed_ms > numa_max_ms[n]) {
+                    numa_max_ms[n] = result.elapsed_ms;
+                }
             }
         }
 
-        // Use max internal time across NUMAs as the effective duration
-        durations_ms.push_back(max_internal_ms);
+        // Release all handles
+        for (int b = 0; b < batch_size; ++b) {
+            for (auto h : batch_handles[b]) comm.releaseTransfer(h);
+        }
 
-        double agg_bw_gbps = (total_size * 8.0) / (max_internal_ms * 1e6);
-        double agg_bw_gbs = (total_size / 1e9) / (max_internal_ms / 1e3);
+        // Compute iteration bandwidth using wall time
+        double max_internal_ms = 0;
+        for (size_t n = 0; n < num_numas; ++n) {
+            if (numa_max_ms[n] > max_internal_ms) {
+                max_internal_ms = numa_max_ms[n];
+            }
+        }
+
+        durations_ms.push_back(wall_ms);
+        for (size_t n = 0; n < num_numas; ++n) {
+            per_numa_ms[n].push_back(numa_max_ms[n]);
+        }
+
+        // Print iteration result
+        double agg_bw_gbps = (iter_total_size * 8.0) / (wall_ms * 1e6);
+        double agg_bw_gbs = (iter_total_size / 1e9) / (wall_ms / 1e3);
+        printf("  [%2d] %d reqs/NUMA, wall=%.3f ms", iter, batch_size, wall_ms);
+        for (size_t n = 0; n < num_numas; ++n) {
+            if (num_numas > 1) {
+                double numa_bw_gbps = (iter_per_numa_size * 8.0) / (numa_max_ms[n] * 1e6);
+                double numa_bw_gbs = (iter_per_numa_size / 1e9) / (numa_max_ms[n] / 1e3);
+                printf("  NUMA%d=%.3f ms (%.2f Gbps, %.2f GB/s)",
+                       numa_buffers[n].numa_node, numa_max_ms[n],
+                       numa_bw_gbps, numa_bw_gbs);
+            }
+        }
         if (num_numas == 1) {
             printf("  internal=%.3f ms  BW=%.2f Gbps (%.2f GB/s)\n",
                    max_internal_ms, agg_bw_gbps, agg_bw_gbs);
         } else {
             printf("  => Agg: %.3f ms, %.2f Gbps (%.2f GB/s)\n",
-                   max_internal_ms, agg_bw_gbps, agg_bw_gbs);
+                   wall_ms, agg_bw_gbps, agg_bw_gbs);
         }
     }
 
     // ---- Summary ----
     double sum_ms = 0, min_ms = 1e9, max_ms = 0;
-    for (double d : durations_ms) {
+    double sum_bw_gbs = 0, min_bw_gbs = 1e9, max_bw_gbs = 0;
+    for (int i = 0; i < total_iters; ++i) {
+        double d = durations_ms[i];
+        double bw = (iter_total_size / 1e9) / (d / 1e3);
         sum_ms += d;
+        sum_bw_gbs += bw;
         if (d < min_ms) min_ms = d;
         if (d > max_ms) max_ms = d;
+        if (bw < min_bw_gbs) min_bw_gbs = bw;
+        if (bw > max_bw_gbs) max_bw_gbs = bw;
     }
-    double avg_ms = sum_ms / cfg.iterations;
-    double avg_bw_gbps = (total_size * 8.0) / (avg_ms * 1e6);
-    double avg_bw_gbs = (total_size / 1e9) / (avg_ms / 1e3);
-    double min_bw_gbps = (total_size * 8.0) / (min_ms * 1e6);
-    double min_bw_gbs = (total_size / 1e9) / (min_ms / 1e3);
-    double max_bw_gbps = (total_size * 8.0) / (max_ms * 1e6);
-    double max_bw_gbs = (total_size / 1e9) / (max_ms / 1e3);
+    double avg_ms = sum_ms / total_iters;
+    double avg_bw_gbs = sum_bw_gbs / total_iters;
 
-    printf("\n--- %s Summary (%zu targets, %zu NUMAs) ---\n",
-           mem_type_label, host_list.size(), num_numas);
+    printf("\n--- %s Summary (%zu targets, %zu NUMAs, batch_size=%d) ---\n",
+           mem_type_label, host_list.size(), num_numas, batch_size);
+    printf("  Iterations: %d (%d async reqs per NUMA per iter, %d total reqs per iter)\n",
+           total_iters, batch_size, batch_size * (int)num_numas);
+    printf("  Data per iter: %s (%.2f MB per NUMA)\n",
+           formatBytes(iter_total_size).c_str(), iter_per_numa_size / 1e6);
     printf("  Aggregate Avg: %.3f ms (%.2f Gbps, %.2f GB/s)\n",
-           avg_ms, avg_bw_gbps, avg_bw_gbs);
-    printf("  Aggregate Min: %.3f ms (%.2f Gbps, %.2f GB/s)\n",
-           min_ms, min_bw_gbps, min_bw_gbs);
-    printf("  Aggregate Max: %.3f ms (%.2f Gbps, %.2f GB/s)\n",
-           max_ms, max_bw_gbps, max_bw_gbs);
+           avg_ms, avg_bw_gbs * 8.0, avg_bw_gbs);
+    printf("  Best BW:  %.2f Gbps (%.2f GB/s)  |  Worst BW: %.2f Gbps (%.2f GB/s)\n",
+           max_bw_gbs * 8.0, max_bw_gbs, min_bw_gbs * 8.0, min_bw_gbs);
+    printf("  Min wall: %.3f ms  |  Max wall: %.3f ms\n", min_ms, max_ms);
 
     // Per-NUMA summary
     if (num_numas > 1) {
@@ -704,20 +761,18 @@ static int runScatterBenchmark(
                 if (d < nmin) nmin = d;
                 if (d > nmax) nmax = d;
             }
-            double navg = ns / cfg.iterations;
-            double navg_gbps = (per_numa_size * 8.0) / (navg * 1e6);
-            double navg_gbs = (per_numa_size / 1e9) / (navg / 1e3);
-            double nmin_gbps = (per_numa_size * 8.0) / (nmin * 1e6);
-            double nmin_gbs = (per_numa_size / 1e9) / (nmin / 1e3);
-            double nmax_gbps = (per_numa_size * 8.0) / (nmax * 1e6);
-            double nmax_gbs = (per_numa_size / 1e9) / (nmax / 1e3);
-            printf("  NUMA %d: Avg %.3f ms (%.2f Gbps, %.2f GB/s), "
-                   "Min %.3f ms (%.2f Gbps, %.2f GB/s), "
-                   "Max %.3f ms (%.2f Gbps, %.2f GB/s)\n",
+            double navg = ns / total_iters;
+            // Per-NUMA bandwidth: iter_per_numa_size bytes over the NUMA's time
+            double navg_gbs = (iter_per_numa_size / 1e9) / (navg / 1e3);
+            double nmin_gbs = (iter_per_numa_size / 1e9) / (nmin / 1e3);
+            double nmax_gbs = (iter_per_numa_size / 1e9) / (nmax / 1e3);
+            printf("  NUMA %d: Avg %.3f ms (%.2f GB/s), "
+                   "Min %.3f ms (%.2f GB/s), "
+                   "Max %.3f ms (%.2f GB/s)\n",
                    numa_buffers[n].numa_node,
-                   navg, navg_gbps, navg_gbs,
-                   nmin, nmin_gbps, nmin_gbs,
-                   nmax, nmax_gbps, nmax_gbs);
+                   navg, navg_gbs,
+                   nmin, nmax_gbs,
+                   nmax, nmin_gbs);
         }
     }
     printf("\n");

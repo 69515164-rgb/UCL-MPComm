@@ -76,6 +76,12 @@ namespace mpcomm {
 // Handle values are recycled: when a transfer is released, its handle is returned
 // to the pool for reuse. This ensures handles stay within the 16-bit encoding
 // space indefinitely, regardless of how many total transfers are performed.
+// Fixed-size limits for per-NIC flow control arrays in TransferContext.
+// Using inline arrays instead of std::vector eliminates heap allocation
+// in the submit hot path (~0.8 us per call saved).
+static constexpr size_t kMaxNics = 16;
+static constexpr size_t kMaxQPsPerNic = 16;
+
 struct WrIdEncoding {
     static constexpr uint64_t NIC_SHIFT = 56;
     static constexpr uint64_t QP_SHIFT = 48;
@@ -242,11 +248,15 @@ struct TransferContext {
 
     std::atomic<size_t> next_chunk_idx;
 
-    std::vector<size_t> per_nic_posted;
-    std::vector<size_t> per_nic_completed;
-    std::vector<size_t> per_nic_bytes;
-    std::vector<std::vector<size_t>> per_nic_qp_posted;
-    std::vector<std::vector<size_t>> per_nic_qp_completed;
+    // Fixed-size per-NIC flow control arrays (no heap allocation).
+    // Indexed by NIC index; only [0..num_nics_used) are valid.
+    size_t num_nics_used;  // set during init, == nic_contexts_.size()
+    size_t num_qps_used;   // set during init, == qps_per_connection_
+    size_t per_nic_posted[kMaxNics];
+    size_t per_nic_completed[kMaxNics];
+    size_t per_nic_bytes[kMaxNics];
+    size_t per_nic_qp_posted[kMaxNics][kMaxQPsPerNic];
+    size_t per_nic_qp_completed[kMaxNics][kMaxQPsPerNic];
 
     std::vector<size_t> candidate_nic_indices;
 
@@ -277,8 +287,17 @@ struct TransferContext {
         , direction(TransferDirection::SCATTER)
         , max_chunk_size(0)
         , next_chunk_idx(0)
+        , num_nics_used(0)
+        , num_qps_used(0)
         , rr_nic_index(0)
-        , numa_id(0) {}
+        , numa_id(0)
+    {
+        memset(per_nic_posted, 0, sizeof(per_nic_posted));
+        memset(per_nic_completed, 0, sizeof(per_nic_completed));
+        memset(per_nic_bytes, 0, sizeof(per_nic_bytes));
+        memset(per_nic_qp_posted, 0, sizeof(per_nic_qp_posted));
+        memset(per_nic_qp_completed, 0, sizeof(per_nic_qp_completed));
+    }
 
     TransferContext(const TransferContext&) = delete;
     TransferContext& operator=(const TransferContext&) = delete;
@@ -445,6 +464,30 @@ private:
     void processTransfer(TransferContext& ctx);
     int getNumaForAddr(uintptr_t addr) const;
     size_t selectWorkerForNuma(int numa_id);
+
+    // Pipelined worker helpers: process multiple handles concurrently
+    // to keep NIC pipelines full without handle-boundary stalls.
+    struct NicConnInfo {
+        size_t remote_nic;
+        uint32_t rkey;
+        uint32_t lkey;
+        static constexpr size_t kMaxQPsPerConn = 16;
+        struct ibv_qp* qps[kMaxQPsPerConn];
+        size_t num_qps;
+    };
+    using NicConnCache = std::unordered_map<uint64_t, NicConnInfo>;
+    void initContextCache(TransferContext& ctx, NicConnCache& cache);
+    // ActiveContextInfo is passed to pollAllNicsForWorker for lock-free completion routing
+    struct ActiveContextInfo {
+        TransferHandle handle;
+        TransferContext* ctx;
+    };
+    int pollAllNicsForWorker(int numa_id,
+                             const std::vector<size_t>& poll_nic_indices,
+                             size_t (&worker_nic_completed)[kMaxNics],
+                             size_t (&worker_nic_qp_completed)[kMaxNics][kMaxQPsPerNic],
+                             const std::vector<ActiveContextInfo>& active_ctx_info);
+    void finalizeTransferStats(TransferContext& ctx);
 
     // Member variables
     std::string local_host_id_;
@@ -750,6 +793,22 @@ int MPComm::Impl::init(const std::string &local_host_id,
     if (nic_contexts_.empty()) {
         fprintf(stderr, "MPComm: No RDMA devices found\n");
         return MPCOMM_ERR_DEVICE;
+    }
+
+    // Validate fixed-size array limits
+    if (nic_contexts_.size() > kMaxNics) {
+        fprintf(stderr, "MPComm: Too many NICs (%zu > kMaxNics=%zu). "
+                "Increase kMaxNics and rebuild.\n",
+                nic_contexts_.size(), kMaxNics);
+        shutdown();
+        return MPCOMM_ERR_DEVICE;
+    }
+    if (qps_per_connection_ > kMaxQPsPerNic) {
+        fprintf(stderr, "MPComm: Too many QPs per connection (%zu > kMaxQPsPerNic=%zu). "
+                "Increase kMaxQPsPerNic and rebuild.\n",
+                qps_per_connection_, kMaxQPsPerNic);
+        shutdown();
+        return MPCOMM_ERR_INVALID_ARG;
     }
 
     // Setup TCP listener if port specified
@@ -3464,16 +3523,9 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     
     ctx->prep_numa_query_time = std::chrono::steady_clock::now();
     
-    // Initialize per-NIC flow control state
-    ctx->per_nic_posted.resize(num_nics, 0);
-    ctx->per_nic_completed.resize(num_nics, 0);
-    ctx->per_nic_bytes.resize(num_nics, 0);
-    ctx->per_nic_qp_posted.resize(num_nics);
-    ctx->per_nic_qp_completed.resize(num_nics);
-    for (size_t nic = 0; nic < num_nics; ++nic) {
-        ctx->per_nic_qp_posted[nic].resize(qps_per_connection_, 0);
-        ctx->per_nic_qp_completed[nic].resize(qps_per_connection_, 0);
-    }
+    // Record NIC/QP counts for flow control arrays (arrays already zero-initialized in ctor)
+    ctx->num_nics_used = num_nics;
+    ctx->num_qps_used = qps_per_connection_;
     
     ctx->prep_flowctrl_time = std::chrono::steady_clock::now();
     
@@ -3702,8 +3754,8 @@ TransferResult MPComm::Impl::getTransferResult(TransferHandle handle) {
     
     // Calculate bytes transferred
     size_t total_bytes = 0;
-    for (size_t bytes : ctx.per_nic_bytes) {
-        total_bytes += bytes;
+    for (size_t i = 0; i < ctx.num_nics_used; ++i) {
+        total_bytes += ctx.per_nic_bytes[i];
     }
     result.bytes_transferred = total_bytes;
     
@@ -3740,8 +3792,8 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
                 ctx.end_time - ctx.start_time).count();
             
             size_t total_bytes = 0;
-            for (size_t bytes : ctx.per_nic_bytes) {
-                total_bytes += bytes;
+            for (size_t i = 0; i < ctx.num_nics_used; ++i) {
+                total_bytes += ctx.per_nic_bytes[i];
             }
             double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
             
@@ -3801,42 +3853,313 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     printf("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n", 
            worker_id, numa_id, static_cast<unsigned long>(pthread_self()));
     
-    // Busy-poll loop (no condition variables, minimal latency)
+    const size_t kMaxIdleSpins = max_idle_spins_;
+    const size_t max_outstanding_per_nic = max_outstanding_per_qp_ * qps_per_connection_;
+    const size_t kMaxOutstandingPerQP = max_outstanding_per_qp_;
+    size_t num_nics = nic_contexts_.size();
+    
+    // Worker-level outstanding tracking (shared across all active contexts on this worker).
+    // These track the ACTUAL NIC-level outstanding WRs, which is what matters for flow control
+    // since all contexts share the same NIC CQs.
+    // Using fixed-size arrays to avoid heap allocation.
+    size_t worker_nic_posted[kMaxNics] = {};
+    size_t worker_nic_completed[kMaxNics] = {};
+    size_t worker_nic_qp_posted[kMaxNics][kMaxQPsPerNic] = {};
+    size_t worker_nic_qp_completed[kMaxNics][kMaxQPsPerNic] = {};
+    
+    // Active context set: contexts currently being processed by this worker.
+    // Contexts are added when popped from the queue, removed when all chunks are completed.
+    struct ActiveContext {
+        TransferContext* ctx;
+        NicConnCache cache;       // Per-context connection cache (lkey, rkey, QP pointers)
+        bool first_post_recorded;
+    };
+    std::vector<ActiveContext> active_contexts;
+    
+    // Union of all candidate NIC indices across all active contexts (for CQ polling)
+    std::vector<size_t> poll_nic_indices;
+    std::vector<ActiveContextInfo> active_ctx_info;  // Reusable buffer for poll routing
+    
     size_t idle_spins = 0;
-    const size_t kMaxIdleSpins = max_idle_spins_;  // After this many idle spins, yield
     
     while (worker_running_.load(std::memory_order_relaxed)) {
-        // Try to get a task from our lock-free queue
-        TransferHandle handle = worker_queues_[worker_id]->tryPop();
+        // ---- Phase 1: Drain new handles from the queue into active set ----
+        {
+            TransferHandle handle;
+            while ((handle = worker_queues_[worker_id]->tryPop()) != INVALID_TRANSFER_HANDLE) {
+                idle_spins = 0;
+                TransferContext* ctx_ptr = nullptr;
+                {
+                    auto& nts = per_numa_transfers_[numa_id];
+                    std::lock_guard<std::mutex> lock(nts.mutex);
+                    auto it = nts.active_transfers.find(handle);
+                    if (it == nts.active_transfers.end()) {
+                        continue;  // Transfer was released before we got to it
+                    }
+                    ctx_ptr = it->second.get();
+                }
+                
+                // Initialize this context
+                ctx_ptr->submitted.store(true);
+                ctx_ptr->worker_start_time = std::chrono::steady_clock::now();
+                
+                ActiveContext ac;
+                ac.ctx = ctx_ptr;
+                ac.first_post_recorded = false;
+                initContextCache(*ctx_ptr, ac.cache);
+                ctx_ptr->cache_done_time = std::chrono::steady_clock::now();
+                
+                active_contexts.push_back(std::move(ac));
+                
+                // Rebuild poll NIC indices (union of all active contexts' candidate NICs)
+                // Use a simple set-like approach to avoid duplicates
+                poll_nic_indices.clear();
+                std::vector<bool> nic_seen(num_nics, false);
+                for (const auto& actx : active_contexts) {
+                    for (size_t nic : actx.ctx->candidate_nic_indices) {
+                        if (!nic_seen[nic]) {
+                            nic_seen[nic] = true;
+                            poll_nic_indices.push_back(nic);
+                        }
+                    }
+                }
+            }
+        }
         
-        if (handle == INVALID_TRANSFER_HANDLE) {
-            // No work available
+        // If no active contexts, just idle-spin
+        if (active_contexts.empty()) {
             ++idle_spins;
             if (idle_spins >= kMaxIdleSpins) {
-                // Yield CPU to avoid burning 100% when truly idle
                 _mm_pause();
                 idle_spins = 0;
             }
             continue;
         }
-        
-        // Reset idle counter when we get work
         idle_spins = 0;
         
-        // Get the transfer context from per-NUMA map (worker knows its numa_id)
-        TransferContext* ctx_ptr = nullptr;
-        {
-            auto& nts = per_numa_transfers_[numa_id];
-            std::lock_guard<std::mutex> lock(nts.mutex);
-            auto it = nts.active_transfers.find(handle);
-            if (it == nts.active_transfers.end()) {
-                continue;  // Transfer was released before we got to it
+        // ---- Phase 2: Post chunks from all active contexts (unified flow control) ----
+        // Iterate all active contexts round-robin, posting chunks until NICs are full
+        // or all contexts have posted all their chunks.
+        for (auto& ac : active_contexts) {
+            TransferContext& ctx = *ac.ctx;
+            size_t total_chunks = ctx.total_chunks.load();
+            
+            // Post as many chunks as possible from this context
+            while (ctx.next_chunk_idx.load() < total_chunks) {
+                size_t chunk_idx = ctx.next_chunk_idx.load();
+                auto chunk = ctx.getChunk(chunk_idx);
+                
+                // Select best NIC using worker-level outstanding tracking
+                size_t best_nic = num_nics;  // Invalid initially
+                size_t min_outstanding = SIZE_MAX;
+                size_t num_candidate_nics = ctx.candidate_nic_indices.size();
+                
+                for (size_t idx = 0; idx < num_candidate_nics; ++idx) {
+                    size_t nic = ctx.candidate_nic_indices[idx];
+                    size_t outstanding = worker_nic_posted[nic] - worker_nic_completed[nic];
+                    if (outstanding < max_outstanding_per_nic && outstanding < min_outstanding) {
+                        min_outstanding = outstanding;
+                        best_nic = nic;
+                    }
+                }
+                if (best_nic == num_nics) {
+                    // All candidate NICs are full — break out and poll
+                    break;
+                }
+                
+                // Select QP with lowest outstanding within this NIC (worker-level)
+                size_t qp_index = 0;
+                size_t min_qp_outstanding = SIZE_MAX;
+                bool found_available_qp = false;
+                for (size_t qp = 0; qp < qps_per_connection_; ++qp) {
+                    size_t qp_outstanding = worker_nic_qp_posted[best_nic][qp] - 
+                                            worker_nic_qp_completed[best_nic][qp];
+                    if (qp_outstanding < kMaxOutstandingPerQP && qp_outstanding < min_qp_outstanding) {
+                        min_qp_outstanding = qp_outstanding;
+                        qp_index = qp;
+                        found_available_qp = true;
+                    }
+                }
+                if (!found_available_qp) {
+                    break;  // All QPs full on best NIC — poll for completions
+                }
+                
+                // Resolve connection info from cache
+                size_t host_idx_for_qp = chunk.host_idx;
+                uint64_t cache_key = (static_cast<uint64_t>(host_idx_for_qp) << 16) | best_nic;
+                auto cache_it = ac.cache.find(cache_key);
+                
+                uint32_t lkey, rkey;
+                size_t remote_nic;
+                struct ibv_qp *qp;
+                
+                if (cache_it != ac.cache.end()) {
+                    const auto& cached = cache_it->second;
+                    lkey = cached.lkey;
+                    rkey = cached.rkey;
+                    remote_nic = cached.remote_nic;
+                    qp = (qp_index < cached.num_qps) ? cached.qps[qp_index] : cached.qps[0];
+                } else {
+                    // Fallback: resolve on the fly (should rarely happen)
+                    lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
+                    const std::string& chunk_host_id = ctx.host_list[host_idx_for_qp];
+                    remote_nic = best_nic;
+                    rkey = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        auto it = connections_.find(chunk_host_id);
+                        if (it != connections_.end()) {
+                            const auto& nic_map = it->second.local_to_remote_nic_map;
+                            auto map_it = nic_map.find(best_nic);
+                            if (map_it != nic_map.end() && !map_it->second.empty()) {
+                                remote_nic = map_it->second[0];
+                            }
+                            rkey = it->second.getRkeyForAddr(chunk.remote_addr, remote_nic);
+                        }
+                    }
+                    qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
+                }
+                
+                // Validate lkey, rkey, qp
+                if (lkey == 0 || rkey == 0 || !qp) {
+                    if (lkey == 0)
+                        fprintf(stderr, "MPComm: Worker: No lkey for address %p on NIC %zu\n",
+                                reinterpret_cast<void *>(chunk.local_addr), best_nic);
+                    else if (rkey == 0)
+                        fprintf(stderr, "MPComm: Worker: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
+                                remote_nic, chunk.remote_addr);
+                    else
+                        fprintf(stderr, "MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
+                                best_nic, remote_nic);
+                    int err = (lkey == 0) ? MPCOMM_ERR_MEMORY : MPCOMM_ERR_CONNECTION;
+                    ctx.error_code.store(err);
+                    ctx.finished.store(true);
+                    ctx.end_time = std::chrono::steady_clock::now();
+                    break;  // Skip this context, will be removed in Phase 4
+                }
+                
+                // Prepare and post RDMA WR
+                struct ibv_sge sge;
+                memset(&sge, 0, sizeof(sge));
+                sge.addr = chunk.local_addr;
+                sge.length = static_cast<uint32_t>(chunk.length);
+                sge.lkey = lkey;
+                
+                struct ibv_send_wr wr;
+                memset(&wr, 0, sizeof(wr));
+                wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
+                wr.opcode = (ctx.direction == TransferDirection::GATHER) ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+                wr.sg_list = &sge;
+                wr.num_sge = 1;
+                wr.send_flags = IBV_SEND_SIGNALED;
+                wr.wr.rdma.remote_addr = chunk.remote_addr;
+                wr.wr.rdma.rkey = rkey;
+                
+                struct ibv_send_wr *bad_wr = nullptr;
+                int ret = ibv_post_send(qp, &wr, &bad_wr);
+                if (ret != 0) {
+                    fprintf(stderr, "MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
+                    ctx.error_code.store(MPCOMM_ERR_TRANSFER);
+                    ctx.finished.store(true);
+                    ctx.end_time = std::chrono::steady_clock::now();
+                    break;
+                }
+                
+                // Update worker-level flow control counters
+                worker_nic_posted[best_nic]++;
+                worker_nic_qp_posted[best_nic][qp_index]++;
+                
+                // Update per-context counters (for stats and per-context completion tracking)
+                ctx.per_nic_posted[best_nic]++;
+                ctx.per_nic_qp_posted[best_nic][qp_index]++;
+                ctx.per_nic_bytes[best_nic] += chunk.length;
+                ctx.next_chunk_idx.fetch_add(1);
+                
+                if (!ac.first_post_recorded) {
+                    ctx.first_post_time = std::chrono::steady_clock::now();
+                    ac.first_post_recorded = true;
+                }
             }
-            ctx_ptr = it->second.get();
+            
+            // Record all_posted_time when all chunks have been posted (only once)
+            total_chunks = ctx.total_chunks.load();
+            if (ctx.next_chunk_idx.load() >= total_chunks && 
+                ctx.all_posted_time.time_since_epoch().count() == 0) {
+                ctx.all_posted_time = std::chrono::steady_clock::now();
+            }
         }
         
-        // Process the transfer (post all chunks + poll until complete)
-        processTransfer(*ctx_ptr);
+        // ---- Phase 3: Poll completions from all candidate NICs ----
+        // Completions are routed to correct TransferContext via wr_id handle decoding.
+        // Build active context info for lock-free fast-path routing.
+        {
+            active_ctx_info.clear();
+            for (const auto& ac : active_contexts) {
+                active_ctx_info.push_back({ac.ctx->handle, ac.ctx});
+            }
+            
+            int poll_ret = pollAllNicsForWorker(numa_id, poll_nic_indices,
+                                                worker_nic_completed,
+                                                worker_nic_qp_completed,
+                                                active_ctx_info);
+            if (poll_ret != MPCOMM_SUCCESS) {
+                // Fatal poll error — mark all active contexts as failed
+                for (auto& ac : active_contexts) {
+                    if (!ac.ctx->finished.load()) {
+                        ac.ctx->error_code.store(poll_ret);
+                        ac.ctx->finished.store(true);
+                        ac.ctx->end_time = std::chrono::steady_clock::now();
+                    }
+                }
+                active_contexts.clear();
+                poll_nic_indices.clear();
+                continue;
+            }
+        }
+        
+        // ---- Phase 4: Remove completed contexts ----
+        {
+            bool any_removed = false;
+            for (size_t i = 0; i < active_contexts.size(); ) {
+                TransferContext& ctx = *active_contexts[i].ctx;
+                size_t total_chunks = ctx.total_chunks.load();
+                
+                if (ctx.finished.load()) {
+                    // Already finished (error case) — finalize stats and remove
+                    finalizeTransferStats(ctx);
+                    active_contexts.erase(active_contexts.begin() + i);
+                    any_removed = true;
+                    continue;
+                }
+                
+                if (ctx.next_chunk_idx.load() >= total_chunks &&
+                    ctx.total_completed.load() >= total_chunks) {
+                    // All chunks posted and completed — mark finished
+                    ctx.finished.store(true);
+                    ctx.error_code.store(MPCOMM_SUCCESS);
+                    ctx.end_time = std::chrono::steady_clock::now();
+                    finalizeTransferStats(ctx);
+                    active_contexts.erase(active_contexts.begin() + i);
+                    any_removed = true;
+                    continue;
+                }
+                ++i;
+            }
+            
+            // Rebuild poll NIC indices if contexts were removed
+            if (any_removed) {
+                poll_nic_indices.clear();
+                std::vector<bool> nic_seen(num_nics, false);
+                for (const auto& actx : active_contexts) {
+                    for (size_t nic : actx.ctx->candidate_nic_indices) {
+                        if (!nic_seen[nic]) {
+                            nic_seen[nic] = true;
+                            poll_nic_indices.push_back(nic);
+                        }
+                    }
+                }
+            }
+        }
     }
     
     printf("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
@@ -4159,6 +4482,159 @@ void MPComm::Impl::processTransfer(TransferContext& ctx) {
         snprintf(buf, sizeof(buf), "  Diagnostics: completion_poll_rounds=%zu\n", diag_completion_poll_rounds);
         s += buf;
     }
+}
+
+// ============================================================================
+// Pipelined Worker Helper Functions
+// ============================================================================
+
+void MPComm::Impl::initContextCache(TransferContext& ctx, NicConnCache& cache) {
+    // Pre-cache connection info, lkeys, and QP pointers for all hosts and all candidate NICs.
+    // This eliminates mutex acquisitions and linear searches from the hot posting loop.
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    for (size_t host_idx = 0; host_idx < ctx.host_list.size(); ++host_idx) {
+        const std::string& host_id = ctx.host_list[host_idx];
+        auto conn_it = connections_.find(host_id);
+        if (conn_it != connections_.end()) {
+            for (size_t local_nic : ctx.candidate_nic_indices) {
+                NicConnInfo info;
+                info.remote_nic = local_nic;
+                const auto& nic_map = conn_it->second.local_to_remote_nic_map;
+                auto map_it = nic_map.find(local_nic);
+                if (map_it != nic_map.end() && !map_it->second.empty()) {
+                    info.remote_nic = map_it->second[0];
+                }
+                info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[host_idx], info.remote_nic);
+                info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));
+                info.num_qps = qps_per_connection_;
+                for (size_t qi = 0; qi < qps_per_connection_ && qi < NicConnInfo::kMaxQPsPerConn; ++qi) {
+                    info.qps[qi] = getOrCreateQP(local_nic, host_id, info.remote_nic, qi);
+                }
+                for (size_t qi = qps_per_connection_; qi < NicConnInfo::kMaxQPsPerConn; ++qi) {
+                    info.qps[qi] = nullptr;
+                }
+                uint64_t cache_key = (static_cast<uint64_t>(host_idx) << 16) | local_nic;
+                cache[cache_key] = info;
+            }
+        }
+    }
+}
+
+int MPComm::Impl::pollAllNicsForWorker(
+    int numa_id,
+    const std::vector<size_t>& poll_nic_indices,
+    size_t (&worker_nic_completed)[kMaxNics],
+    size_t (&worker_nic_qp_completed)[kMaxNics][kMaxQPsPerNic],
+    const std::vector<ActiveContextInfo>& active_ctx_info)
+{
+    const int poll_batch_size = static_cast<int>(poll_batch_size_);
+    struct ibv_wc wc_array[64];
+    size_t num_nics = nic_contexts_.size();
+    
+    for (size_t nic : poll_nic_indices) {
+        auto &nic_ctx = *nic_contexts_[nic];
+        int n = ibv_poll_cq(nic_ctx.cq, poll_batch_size, wc_array);
+        if (n < 0) {
+            fprintf(stderr, "MPComm: ibv_poll_cq failed on NIC %zu in worker\n", nic);
+            return MPCOMM_ERR_TRANSFER;
+        }
+        for (int i = 0; i < n; ++i) {
+            size_t completed_nic = WrIdEncoding::decodeNic(wc_array[i].wr_id);
+            size_t completed_qp = WrIdEncoding::decodeQp(wc_array[i].wr_id);
+            TransferHandle wc_handle = WrIdEncoding::decodeHandle(wc_array[i].wr_id);
+            
+            // Update worker-level flow control counters (always, regardless of success)
+            if (completed_nic < num_nics) {
+                worker_nic_completed[completed_nic]++;
+                if (completed_qp < qps_per_connection_) {
+                    worker_nic_qp_completed[completed_nic][completed_qp]++;
+                }
+            }
+            
+            // Fast path: find target context in local active list (no lock needed)
+            TransferContext* target_ctx = nullptr;
+            for (const auto& aci : active_ctx_info) {
+                if (aci.handle == wc_handle) {
+                    target_ctx = aci.ctx;
+                    break;
+                }
+            }
+            
+            // Slow path: handle belongs to another transfer on same NUMA (rare)
+            if (!target_ctx) {
+                auto& nts = per_numa_transfers_[numa_id];
+                std::lock_guard<std::mutex> lock(nts.mutex);
+                auto it = nts.active_transfers.find(wc_handle);
+                if (it != nts.active_transfers.end()) {
+                    target_ctx = it->second.get();
+                }
+            }
+            
+            if (!target_ctx) {
+                // Orphaned completion (transfer already released) — ignore
+                continue;
+            }
+            
+            if (wc_array[i].status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "MPComm: WC error on NIC %zu in worker: status=%d, wr_id=0x%lx\n",
+                        nic, wc_array[i].status, wc_array[i].wr_id);
+                target_ctx->error_code.store(MPCOMM_ERR_TRANSFER);
+                target_ctx->finished.store(true);
+                target_ctx->end_time = std::chrono::steady_clock::now();
+                continue;
+            }
+            
+            // Route completion to the target context
+            if (completed_nic < num_nics) {
+                target_ctx->per_nic_completed[completed_nic]++;
+                if (completed_qp < qps_per_connection_) {
+                    target_ctx->per_nic_qp_completed[completed_nic][completed_qp]++;
+                }
+            }
+            target_ctx->total_completed.fetch_add(1);
+        }
+    }
+    return MPCOMM_SUCCESS;
+}
+
+void MPComm::Impl::finalizeTransferStats(TransferContext& ctx) {
+    if (!transfer_stats_enabled_) return;
+    
+    auto to_us = [](const std::chrono::steady_clock::time_point& start,
+                    const std::chrono::steady_clock::time_point& end) -> double {
+        return std::chrono::duration<double, std::micro>(end - start).count();
+    };
+    
+    size_t total_bytes = 0;
+    for (size_t i = 0; i < ctx.lengths.size(); ++i) {
+        total_bytes += ctx.lengths[i];
+    }
+    size_t total_chunks = ctx.total_chunks.load();
+    
+    double total_time_us = to_us(ctx.start_time, ctx.end_time);
+    double bandwidth_gbps = (total_bytes * 8.0) / (total_time_us * 1000.0);
+    
+    char buf[256];
+    auto& s = ctx.timing_breakdown_str;
+    s.reserve(2048);
+    
+    snprintf(buf, sizeof(buf), "MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
+             ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
+    s += buf;
+    snprintf(buf, sizeof(buf), "  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
+    s += buf;
+    snprintf(buf, sizeof(buf), "  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
+    s += buf;
+    snprintf(buf, sizeof(buf), "  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
+    s += buf;
+    snprintf(buf, sizeof(buf), "  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
+    s += buf;
+    snprintf(buf, sizeof(buf), "  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
+    s += buf;
+    snprintf(buf, sizeof(buf), "  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
+    s += buf;
+    snprintf(buf, sizeof(buf), "  Total chunks: %zu\n", total_chunks);
+    s += buf;
 }
 
 int MPComm::Impl::getNumaForAddr(uintptr_t addr) const {

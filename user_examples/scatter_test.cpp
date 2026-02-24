@@ -626,6 +626,7 @@ static int runScatterBenchmark(
         // Submit batch_size async requests per NUMA
         // handles[b][n] = handle for batch-request b, NUMA n
         std::vector<std::vector<TransferHandle>> batch_handles(batch_size);
+        auto last_submit_time = std::chrono::steady_clock::time_point{};
         for (int b = 0; b < batch_size; ++b) {
             batch_handles[b].reserve(num_numas);
             for (size_t n = 0; n < num_numas; ++n) {
@@ -647,6 +648,7 @@ static int runScatterBenchmark(
                 batch_handles[b].push_back(handle);
             }
         }
+        last_submit_time = std::chrono::steady_clock::now();
 
         // Wait all handles in this iteration
         for (int b = 0; b < batch_size; ++b) {
@@ -672,6 +674,10 @@ static int runScatterBenchmark(
         auto wall_end = std::chrono::steady_clock::now();
         double wall_ms = std::chrono::duration<double, std::milli>(
             wall_end - wall_start).count();
+        double submit_ms = std::chrono::duration<double, std::milli>(
+            last_submit_time - wall_start).count();
+        double wait_ms = std::chrono::duration<double, std::milli>(
+            wall_end - last_submit_time).count();
 
         // Collect per-NUMA internal timing: max across all batch requests
         std::vector<double> numa_max_ms(num_numas, 0.0);
@@ -705,7 +711,8 @@ static int runScatterBenchmark(
         // Print iteration result
         double agg_bw_gbps = (iter_total_size * 8.0) / (wall_ms * 1e6);
         double agg_bw_gbs = (iter_total_size / 1e9) / (wall_ms / 1e3);
-        printf("  [%2d] %d reqs/NUMA, wall=%.3f ms", iter, batch_size, wall_ms);
+        printf("  [%4d] %d reqs/NUMA, wall=%.3f ms (submit=%.3f, wait=%.3f)",
+               iter, batch_size, wall_ms, submit_ms, wait_ms);
         for (size_t n = 0; n < num_numas; ++n) {
             if (num_numas > 1) {
                 double numa_bw_gbps = (iter_per_numa_size * 8.0) / (numa_max_ms[n] * 1e6);

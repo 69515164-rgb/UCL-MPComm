@@ -121,9 +121,10 @@ struct TransferResult {
  *   MPCOMM_MAX_IDLE_SPINS          - Worker idle spins before yield (default: 10000).
  *   MPCOMM_MAX_SEND_WR             - QP send queue depth (default: 512).
  *   MPCOMM_MAX_OUTSTANDING_PER_QP  - Max outstanding WRs per QP (default: 256).
- *   MPCOMM_TRANSFER_STATS          - Enable transfer statistics ("1" or "true").
- *   MPCOMM_TRANSFER_STATS_INTERVAL - Print stats every N transfers (default: 0 = every transfer).
- *   MPCOMM_LOG_LEVEL               - Log verbosity: "0"/"error", "1"/"warn", "2"/"info" (default).
+ *   MPCOMM_LOG_LEVEL               - Log verbosity: "0"/"error", "1"/"warn", "2"/"info" (default),
+ *                                    "3"/"debug" (includes transfer timing & NIC statistics).
+ *   MPCOMM_TRANSFER_STATS_INTERVAL - Print stats every N transfers (default: 0 = every transfer,
+ *                                    requires LOG_LEVEL=3/debug).
  */
 class MPComm {
 public:

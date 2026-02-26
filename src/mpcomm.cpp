@@ -505,7 +505,6 @@ private:
     size_t selectBestNicForAsync(TransferContext& ctx);
     int pollAllNicsForAsync(TransferContext& ctx);
     void workerThreadLoop(size_t worker_id, int numa_id, int cpu_id);
-    void processTransfer(TransferContext& ctx);
     int getNumaForAddr(uintptr_t addr) const;
     size_t selectWorkerForNuma(int numa_id);
 
@@ -610,7 +609,6 @@ private:
     size_t max_outstanding_per_qp_;
 
     bool initialized_;
-    bool transfer_stats_enabled_;
     size_t transfer_stats_interval_;              // Print stats every N transfers (0 = every transfer)
     std::atomic<size_t> transfer_stats_counter_;  // Global transfer completion counter
 
@@ -633,7 +631,6 @@ static const char* kPollBatchSizeEnvVar = "MPCOMM_POLL_BATCH_SIZE";
 static const char* kMaxIdleSpinsEnvVar = "MPCOMM_MAX_IDLE_SPINS";
 static const char* kMaxSendWREnvVar = "MPCOMM_MAX_SEND_WR";
 static const char* kMaxOutstandingPerQPEnvVar = "MPCOMM_MAX_OUTSTANDING_PER_QP";
-static const char* kTransferStatsEnvVar = "MPCOMM_TRANSFER_STATS";
 static const char* kTransferStatsIntervalEnvVar = "MPCOMM_TRANSFER_STATS_INTERVAL";
 
 // Constants for QP setup
@@ -715,7 +712,6 @@ MPComm::Impl::Impl()
       max_send_wr_(512),
       max_outstanding_per_qp_(256),
       initialized_(false),
-      transfer_stats_enabled_(false),
       transfer_stats_interval_(0),
       transfer_stats_counter_(0) {
     // Read max RDMA transfer size from environment variable
@@ -810,15 +806,9 @@ MPComm::Impl::Impl()
         }
     }
 
-    // Read transfer stats toggle from environment variable
-    env_val = std::getenv(kTransferStatsEnvVar);
-    if (env_val && env_val[0] != '\0') {
-        transfer_stats_enabled_ = (std::string(env_val) == "1" || std::string(env_val) == "true");
-    }
-
     // Read transfer stats sampling interval from environment variable
     // When set to N (N > 0), only print stats for every Nth transfer.
-    // Default 0 means print stats for every transfer (original behavior).
+    // Default 0 means print stats for every transfer (when DEBUG log level is enabled).
     env_val = std::getenv(kTransferStatsIntervalEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
@@ -3883,27 +3873,27 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
             }
             double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
             
-            if (transfer_stats_enabled_ && !ctx.timing_breakdown_str.empty()) {
+            if (!ctx.timing_breakdown_str.empty()) {
                 // Print timing breakdown first (buffered from worker thread)
-                MPCOMM_LOG_INFO("%s", ctx.timing_breakdown_str.c_str());
-                MPCOMM_LOG_INFO("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
-                MPCOMM_LOG_INFO("%-20s %15s %12s %12s %12s\n", 
+                MPCOMM_LOG_DEBUG("%s", ctx.timing_breakdown_str.c_str());
+                MPCOMM_LOG_DEBUG("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
+                MPCOMM_LOG_DEBUG("%-20s %15s %12s %12s %12s\n", 
                        "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
-                MPCOMM_LOG_INFO("------------------------------------------------------------------------\n");
+                MPCOMM_LOG_DEBUG("------------------------------------------------------------------------\n");
                 size_t num_nics = nic_contexts_.size();
                 for (size_t nic = 0; nic < num_nics; ++nic) {
                     double share_pct = (total_bytes > 0) ? 
                                        (100.0 * ctx.per_nic_bytes[nic] / total_bytes) : 0.0;
                     double nic_bandwidth_gbps = (ctx.per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
-                    MPCOMM_LOG_INFO("%-20s %15zu %12zu %11.1f%% %12.2f\n",
+                    MPCOMM_LOG_DEBUG("%-20s %15zu %12zu %11.1f%% %12.2f\n",
                            nic_contexts_[nic]->device_name.c_str(),
                            ctx.per_nic_bytes[nic], ctx.per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
                 }
-                MPCOMM_LOG_INFO("------------------------------------------------------------------------\n");
-                MPCOMM_LOG_INFO("%-20s %15zu %12zu %12s %12.2f\n",
+                MPCOMM_LOG_DEBUG("------------------------------------------------------------------------\n");
+                MPCOMM_LOG_DEBUG("%-20s %15zu %12zu %12s %12.2f\n",
                        "Total", total_bytes, ctx.total_chunks.load(), "-", total_bandwidth_gbps);
-                MPCOMM_LOG_INFO("Time: %.2f ms\n", transfer_ms);
-                MPCOMM_LOG_INFO("==============================================================\n\n");
+                MPCOMM_LOG_DEBUG("Time: %.2f ms\n", transfer_ms);
+                MPCOMM_LOG_DEBUG("==============================================================\n\n");
             }
         }
         
@@ -4249,330 +4239,6 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
 }
 
-void MPComm::Impl::processTransfer(TransferContext& ctx) {
-    ctx.submitted.store(true);
-    ctx.worker_start_time = std::chrono::steady_clock::now();
-    
-    const size_t max_outstanding_per_nic = max_outstanding_per_qp_ * qps_per_connection_;
-    const size_t kMaxOutstandingPerQP = max_outstanding_per_qp_;
-    size_t total_chunks = ctx.total_chunks.load();
-    bool first_post_recorded = false;
-
-    // Diagnostic counters for performance analysis
-    size_t diag_flow_control_hits = 0;     // Times flow control (outstanding >= max) was triggered
-    size_t diag_qp_full_hits = 0;          // Times no available QP was found
-    size_t diag_completions_during_post = 0; // Completions harvested during posting phase
-    size_t diag_completions_after_post = 0;  // Completions harvested during completion phase
-    size_t diag_completion_poll_rounds = 0;  // Poll rounds in completion phase
-    size_t diag_max_outstanding_seen = 0;    // Peak outstanding WRs observed
-    
-    // Cache connection info to avoid repeated lock acquisitions and
-    // eliminate mutex/linear-search from the hot posting loop.
-    static constexpr size_t kMaxQPsPerConn = 16;
-    struct NicConnInfo {
-        size_t remote_nic;
-        uint32_t rkey;
-        uint32_t lkey;                         // Cached lkey for local memory on this NIC
-        struct ibv_qp* qps[kMaxQPsPerConn];    // Cached QP pointers (one per qp_index)
-        size_t num_qps;                        // Number of valid QP entries
-    };
-    std::unordered_map<uint64_t, NicConnInfo> nic_conn_cache;
-    
-    // Pre-cache connection info, lkeys, and QP pointers for all hosts and all candidate NICs.
-    // This eliminates mutex acquisitions and linear searches from the hot posting loop.
-    {
-        std::lock_guard<std::mutex> lock(connections_mutex_);
-        for (size_t host_idx = 0; host_idx < ctx.host_list.size(); ++host_idx) {
-            const std::string& host_id = ctx.host_list[host_idx];
-            auto conn_it = connections_.find(host_id);
-            if (conn_it != connections_.end()) {
-                for (size_t local_nic : ctx.candidate_nic_indices) {
-                    NicConnInfo info;
-                    info.remote_nic = local_nic;  // Default: same index
-                    const auto& nic_map = conn_it->second.local_to_remote_nic_map;
-                    auto map_it = nic_map.find(local_nic);
-                    if (map_it != nic_map.end() && !map_it->second.empty()) {
-                        info.remote_nic = map_it->second[0];
-                    }
-                    info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[host_idx], info.remote_nic);
-                    
-                    // Cache lkey: find the memory region containing local_addr on this NIC
-                    info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));
-                    
-                    // Cache QP pointers for all qp_indices
-                    info.num_qps = qps_per_connection_;
-                    for (size_t qi = 0; qi < qps_per_connection_ && qi < kMaxQPsPerConn; ++qi) {
-                        info.qps[qi] = getOrCreateQP(local_nic, host_id, info.remote_nic, qi);
-                    }
-                    for (size_t qi = qps_per_connection_; qi < kMaxQPsPerConn; ++qi) {
-                        info.qps[qi] = nullptr;
-                    }
-                    
-                    uint64_t cache_key = (static_cast<uint64_t>(host_idx) << 16) | local_nic;
-                    nic_conn_cache[cache_key] = info;
-                }
-            }
-        }
-    }
-    ctx.cache_done_time = std::chrono::steady_clock::now();
-    
-    // Post and poll loop
-    while (ctx.next_chunk_idx.load() < total_chunks || ctx.total_completed.load() < total_chunks) {
-        // Check if shutdown requested
-        if (!worker_running_.load()) {
-            ctx.error_code.store(MPCOMM_ERR_TRANSFER);
-            ctx.finished.store(true);
-            ctx.end_time = std::chrono::steady_clock::now();
-            return;
-        }
-        
-        // Post remaining chunks
-        while (ctx.next_chunk_idx.load() < total_chunks) {
-            size_t chunk_idx = ctx.next_chunk_idx.load();
-            auto chunk = ctx.getChunk(chunk_idx);
-            
-            // Select best NIC
-            size_t best_nic = selectBestNicForAsync(ctx);
-            size_t outstanding = ctx.per_nic_posted[best_nic] - ctx.per_nic_completed[best_nic];
-            
-            // Track peak outstanding
-            if (outstanding > diag_max_outstanding_seen) {
-                diag_max_outstanding_seen = outstanding;
-            }
-
-            // Flow control: poll when NICs are getting full
-            if (outstanding >= max_outstanding_per_nic) {
-                diag_flow_control_hits++;
-                size_t before = ctx.total_completed.load();
-                int poll_ret = pollAllNicsForAsync(ctx);
-                if (poll_ret != MPCOMM_SUCCESS) {
-                    ctx.error_code.store(poll_ret);
-                    ctx.finished.store(true);
-                    ctx.end_time = std::chrono::steady_clock::now();
-                    return;
-                }
-                diag_completions_during_post += (ctx.total_completed.load() - before);
-                continue;  // Re-select NIC after polling
-            }
-            
-            // Select QP with lowest outstanding within this NIC
-            size_t qp_index = 0;
-            size_t min_qp_outstanding = SIZE_MAX;
-            bool found_available_qp = false;
-            
-            for (size_t qp = 0; qp < qps_per_connection_; ++qp) {
-                size_t qp_outstanding = ctx.per_nic_qp_posted[best_nic][qp] - 
-                                        ctx.per_nic_qp_completed[best_nic][qp];
-                if (qp_outstanding < kMaxOutstandingPerQP && qp_outstanding < min_qp_outstanding) {
-                    min_qp_outstanding = qp_outstanding;
-                    qp_index = qp;
-                    found_available_qp = true;
-                }
-            }
-            
-            if (!found_available_qp) {
-                diag_qp_full_hits++;
-                size_t before = ctx.total_completed.load();
-                pollAllNicsForAsync(ctx);
-                diag_completions_during_post += (ctx.total_completed.load() - before);
-                continue;
-            }
-            
-            // Use cached connection info (lkey, rkey, QP pointer all pre-resolved)
-            size_t host_idx_for_qp = chunk.host_idx;
-            uint64_t cache_key = (static_cast<uint64_t>(host_idx_for_qp) << 16) | best_nic;
-            auto cache_it = nic_conn_cache.find(cache_key);
-            
-            uint32_t lkey;
-            uint32_t rkey;
-            size_t remote_nic;
-            struct ibv_qp *qp;
-            
-            if (cache_it != nic_conn_cache.end()) {
-                const auto& cached = cache_it->second;
-                lkey = cached.lkey;
-                rkey = cached.rkey;
-                remote_nic = cached.remote_nic;
-                qp = (qp_index < cached.num_qps) ? cached.qps[qp_index] : cached.qps[0];
-            } else {
-                // Fallback: resolve on the fly (should rarely happen)
-                lkey = getLkey(best_nic, reinterpret_cast<void *>(chunk.local_addr));
-                const std::string& chunk_host_id = ctx.host_list[host_idx_for_qp];
-                remote_nic = best_nic;
-                rkey = 0;
-                {
-                    std::lock_guard<std::mutex> lock(connections_mutex_);
-                    auto it = connections_.find(chunk_host_id);
-                    if (it != connections_.end()) {
-                        const auto& nic_map = it->second.local_to_remote_nic_map;
-                        auto map_it = nic_map.find(best_nic);
-                        if (map_it != nic_map.end() && !map_it->second.empty()) {
-                            remote_nic = map_it->second[0];
-                        }
-                        rkey = it->second.getRkeyForAddr(chunk.remote_addr, remote_nic);
-                    }
-                }
-                qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
-            }
-            
-            if (lkey == 0) {
-                MPCOMM_LOG_ERROR("MPComm: Worker: No lkey for address %p on NIC %zu\n",
-                        reinterpret_cast<void *>(chunk.local_addr), best_nic);
-                ctx.error_code.store(MPCOMM_ERR_MEMORY);
-                ctx.finished.store(true);
-                ctx.end_time = std::chrono::steady_clock::now();
-                return;
-            }
-            
-            if (rkey == 0) {
-                MPCOMM_LOG_ERROR("MPComm: Worker: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
-                        remote_nic, chunk.remote_addr);
-                ctx.error_code.store(MPCOMM_ERR_CONNECTION);
-                ctx.finished.store(true);
-                ctx.end_time = std::chrono::steady_clock::now();
-                return;
-            }
-            
-            if (!qp) {
-                MPCOMM_LOG_ERROR("MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
-                        best_nic, remote_nic);
-                ctx.error_code.store(MPCOMM_ERR_CONNECTION);
-                ctx.finished.store(true);
-                ctx.end_time = std::chrono::steady_clock::now();
-                return;
-            }
-            
-            // Prepare SGE and WR
-            struct ibv_sge sge;
-            memset(&sge, 0, sizeof(sge));
-            sge.addr = chunk.local_addr;
-            sge.length = static_cast<uint32_t>(chunk.length);
-            sge.lkey = lkey;
-            
-            struct ibv_send_wr wr;
-            memset(&wr, 0, sizeof(wr));
-            wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
-            wr.opcode = (ctx.direction == TransferDirection::GATHER) ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
-            wr.sg_list = &sge;
-            wr.num_sge = 1;
-            wr.send_flags = IBV_SEND_SIGNALED;
-            wr.wr.rdma.remote_addr = chunk.remote_addr;
-            wr.wr.rdma.rkey = rkey;
-            
-            struct ibv_send_wr *bad_wr = nullptr;
-            int ret = ibv_post_send(qp, &wr, &bad_wr);
-            if (ret != 0) {
-                MPCOMM_LOG_ERROR("MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
-                ctx.error_code.store(MPCOMM_ERR_TRANSFER);
-                ctx.finished.store(true);
-                ctx.end_time = std::chrono::steady_clock::now();
-                return;
-            }
-            
-            ctx.per_nic_posted[best_nic]++;
-            ctx.per_nic_qp_posted[best_nic][qp_index]++;
-            ctx.per_nic_bytes[best_nic] += chunk.length;
-            ctx.next_chunk_idx.fetch_add(1);
-            // Record first post time
-            if (!first_post_recorded) {
-                ctx.first_post_time = std::chrono::steady_clock::now();
-                first_post_recorded = true;
-            }
-        }
-        
-        // Record all_posted_time when all chunks have been posted (only once)
-        if (ctx.next_chunk_idx.load() >= total_chunks && 
-            ctx.all_posted_time.time_since_epoch().count() == 0) {
-            ctx.all_posted_time = std::chrono::steady_clock::now();
-        }
-        
-        // All chunks posted, poll for remaining completions
-        if (ctx.total_completed.load() < total_chunks) {
-            diag_completion_poll_rounds++;
-            size_t before = ctx.total_completed.load();
-            int poll_ret = pollAllNicsForAsync(ctx);
-            if (poll_ret != MPCOMM_SUCCESS) {
-                ctx.error_code.store(poll_ret);
-                ctx.finished.store(true);
-                ctx.end_time = std::chrono::steady_clock::now();
-                return;
-            }
-            diag_completions_after_post += (ctx.total_completed.load() - before);
-        }
-    }
-    
-    // All done
-    ctx.finished.store(true);
-    ctx.error_code.store(MPCOMM_SUCCESS);
-    ctx.end_time = std::chrono::steady_clock::now();
-    
-    // Print timing breakdown for this transfer
-    auto to_us = [](const std::chrono::steady_clock::time_point& start,
-                    const std::chrono::steady_clock::time_point& end) -> double {
-        return std::chrono::duration<double, std::micro>(end - start).count();
-    };
-    
-    // Calculate total bytes transferred
-    size_t total_bytes = 0;
-    for (size_t i = 0; i < ctx.lengths.size(); ++i) {
-        total_bytes += ctx.lengths[i];
-    }
-    
-    double total_time_us = to_us(ctx.start_time, ctx.end_time);
-    double bandwidth_gbps = (total_bytes * 8.0) / (total_time_us * 1000.0);  // Gbps
-    
-    // Sampling: only generate stats for every Nth transfer (0 = every transfer)
-    size_t stats_seq = transfer_stats_counter_.fetch_add(1, std::memory_order_relaxed);
-    bool should_print_stats = transfer_stats_enabled_ &&
-        (transfer_stats_interval_ == 0 || (stats_seq % transfer_stats_interval_ == 0));
-
-    if (should_print_stats) {
-        // Buffer timing breakdown into ctx.timing_breakdown_str instead of printing directly.
-        // This avoids interleaved output from concurrent worker threads.
-        // The buffered string will be printed by releaseTransfer() on the user thread.
-        char buf[256];
-        auto& s = ctx.timing_breakdown_str;
-        s.reserve(2048);
-
-        snprintf(buf, sizeof(buf), "MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
-                 ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
-        s += buf;
-        snprintf(buf, sizeof(buf), "  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "      [1a] Chunk calc:                 %8.1f us\n", to_us(ctx.start_time, ctx.prep_chunks_calc_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "      [1b] Chunk meta:                 %8.1f us\n", to_us(ctx.prep_chunks_calc_time, ctx.prep_chunks_meta_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "      [1c] NUMA query:                 %8.1f us\n", to_us(ctx.prep_chunks_meta_time, ctx.prep_numa_query_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "      [1d] FlowCtrl init:              %8.1f us\n", to_us(ctx.prep_numa_query_time, ctx.prep_flowctrl_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "      [1e] Queue submit:               %8.1f us\n", to_us(ctx.prep_flowctrl_time, ctx.queued_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
-        s += buf;
-        snprintf(buf, sizeof(buf), "  Diagnostics: total_chunks=%zu, max_outstanding_per_nic=%zu\n",
-                 total_chunks, max_outstanding_per_nic);
-        s += buf;
-        snprintf(buf, sizeof(buf), "  Diagnostics: flow_ctrl_hits=%zu, qp_full_hits=%zu\n",
-                 diag_flow_control_hits, diag_qp_full_hits);
-        s += buf;
-        snprintf(buf, sizeof(buf), "  Diagnostics: completions_during_post=%zu, completions_after_post=%zu, peak_outstanding=%zu\n",
-                 diag_completions_during_post, diag_completions_after_post, diag_max_outstanding_seen);
-        s += buf;
-        snprintf(buf, sizeof(buf), "  Diagnostics: completion_poll_rounds=%zu\n", diag_completion_poll_rounds);
-        s += buf;
-    }
-}
-
 // ============================================================================
 // Pipelined Worker Helper Functions
 // ============================================================================
@@ -4687,12 +4353,12 @@ int MPComm::Impl::pollAllNicsForWorker(
 }
 
 void MPComm::Impl::finalizeTransferStats(TransferContext& ctx) {
-    if (!transfer_stats_enabled_) return;
+    if (mpcomm_get_log_level() < MPCOMM_LOG_LEVEL_DEBUG) return;
 
     // Sampling: only generate stats for every Nth transfer (0 = every transfer)
     size_t stats_seq = transfer_stats_counter_.fetch_add(1, std::memory_order_relaxed);
     if (transfer_stats_interval_ > 0 && (stats_seq % transfer_stats_interval_ != 0)) return;
-    
+
     auto to_us = [](const std::chrono::steady_clock::time_point& start,
                     const std::chrono::steady_clock::time_point& end) -> double {
         return std::chrono::duration<double, std::micro>(end - start).count();

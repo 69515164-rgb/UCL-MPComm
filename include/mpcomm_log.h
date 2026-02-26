@@ -30,17 +30,20 @@ namespace mpcomm {
 //   0 = ERROR only  (minimal output)
 //   1 = WARN + ERROR
 //   2 = INFO + WARN + ERROR  (default)
+//   3 = DEBUG + INFO + WARN + ERROR  (verbose, includes transfer stats)
 //
 // Environment variable: MPCOMM_LOG_LEVEL
 //   "0" or "error"   -> ERROR only
 //   "1" or "warn"    -> WARN + ERROR
 //   "2" or "info"    -> INFO + WARN + ERROR  (default)
+//   "3" or "debug"   -> DEBUG + all above (transfer timing/NIC stats)
 // =====================================================================
 
 enum MPCommLogLevel {
     MPCOMM_LOG_LEVEL_ERROR = 0,
     MPCOMM_LOG_LEVEL_WARN  = 1,
     MPCOMM_LOG_LEVEL_INFO  = 2,
+    MPCOMM_LOG_LEVEL_DEBUG = 3,
 };
 
 // Singleton log level holder — initialized once from environment variable.
@@ -57,6 +60,8 @@ inline int mpcomm_get_log_level() {
             return (int)MPCOMM_LOG_LEVEL_WARN;
         if (strcmp(env, "2") == 0 || strcmp(env, "info") == 0 || strcmp(env, "INFO") == 0)
             return (int)MPCOMM_LOG_LEVEL_INFO;
+        if (strcmp(env, "3") == 0 || strcmp(env, "debug") == 0 || strcmp(env, "DEBUG") == 0)
+            return (int)MPCOMM_LOG_LEVEL_DEBUG;
         return default_level;
     }();
     return level;
@@ -85,6 +90,7 @@ inline unsigned int mpcomm_log_tid() {
 //
 // Format: [LEVEL] HH:MM:SS.mmm [tid] file:line | message
 //
+// MPCOMM_LOG_DEBUG(fmt, ...)  — DEBUG level, stdout (transfer stats, timing)
 // MPCOMM_LOG_INFO(fmt, ...)   — INFO level, stdout
 // MPCOMM_LOG_WARN(fmt, ...)   — WARN level, stderr
 // MPCOMM_LOG_ERROR(fmt, ...)  — ERROR level, stderr (always printed)
@@ -102,6 +108,13 @@ inline unsigned int mpcomm_log_tid() {
         fprintf(fp, "[%s] %s [%04x] %s:%d | " fmt, \
                 level_str, ts_buf_, mpcomm::mpcomm_log_tid(), \
                 MPCOMM_LOG_FILENAME_, __LINE__, ##__VA_ARGS__); \
+    } while (0)
+
+#define MPCOMM_LOG_DEBUG(fmt, ...) \
+    do { \
+        if (mpcomm::mpcomm_get_log_level() >= mpcomm::MPCOMM_LOG_LEVEL_DEBUG) { \
+            MPCOMM_LOG_IMPL_("DEBUG", stdout, fmt, ##__VA_ARGS__); \
+        } \
     } while (0)
 
 #define MPCOMM_LOG_INFO(fmt, ...) \

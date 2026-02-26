@@ -207,7 +207,7 @@ endif()
 # =====================================================================
 
 # Install header files
-install(FILES include/mpcomm.h
+install(FILES include/mpcomm.h include/mpcomm_log.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 

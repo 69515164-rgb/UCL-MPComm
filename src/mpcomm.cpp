@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "mpcomm.h"
+#include "mpcomm_log.h"
 
 #include <arpa/inet.h>
 #include <emmintrin.h>  // For _mm_pause()
@@ -724,10 +725,10 @@ MPComm::Impl::Impl()
         unsigned long long val = strtoull(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0) {
             max_rdma_transfer_size_ = static_cast<size_t>(val);
-            printf("MPComm: Using max RDMA transfer size from %s: %zu bytes\n",
+            MPCOMM_LOG_INFO("MPComm: Using max RDMA transfer size from %s: %zu bytes\n",
                    kMaxRdmaTransferSizeEnvVar, max_rdma_transfer_size_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s', using default %zu\n",
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s', using default %zu\n",
                     kMaxRdmaTransferSizeEnvVar, env_val,
                     max_rdma_transfer_size_);
         }
@@ -740,10 +741,10 @@ MPComm::Impl::Impl()
         unsigned long val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 64) {
             qps_per_connection_ = static_cast<size_t>(val);
-            printf("MPComm: Using QPs per connection from %s: %zu\n",
+            MPCOMM_LOG_INFO("MPComm: Using QPs per connection from %s: %zu\n",
                    kQpsPerConnectionEnvVar, qps_per_connection_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-64), using default %zu\n",
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 1-64), using default %zu\n",
                     kQpsPerConnectionEnvVar, env_val,
                     qps_per_connection_);
         }
@@ -756,10 +757,10 @@ MPComm::Impl::Impl()
         unsigned long val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 256) {
             poll_batch_size_ = static_cast<size_t>(val);
-            printf("MPComm: Using poll batch size from %s: %zu\n",
+            MPCOMM_LOG_INFO("MPComm: Using poll batch size from %s: %zu\n",
                    kPollBatchSizeEnvVar, poll_batch_size_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-256), using default %zu\n",
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 1-256), using default %zu\n",
                     kPollBatchSizeEnvVar, env_val, poll_batch_size_);
         }
     }
@@ -771,10 +772,10 @@ MPComm::Impl::Impl()
         unsigned long val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 8192) {
             max_send_wr_ = static_cast<int>(val);
-            printf("MPComm: Using max send WR from %s: %d\n",
+            MPCOMM_LOG_INFO("MPComm: Using max send WR from %s: %d\n",
                    kMaxSendWREnvVar, max_send_wr_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-8192), using default %d\n",
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 1-8192), using default %d\n",
                     kMaxSendWREnvVar, env_val, max_send_wr_);
         }
     }
@@ -786,10 +787,10 @@ MPComm::Impl::Impl()
         unsigned long val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 8192) {
             max_outstanding_per_qp_ = static_cast<size_t>(val);
-            printf("MPComm: Using max outstanding per QP from %s: %zu\n",
+            MPCOMM_LOG_INFO("MPComm: Using max outstanding per QP from %s: %zu\n",
                    kMaxOutstandingPerQPEnvVar, max_outstanding_per_qp_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-8192), using default %zu\n",
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 1-8192), using default %zu\n",
                     kMaxOutstandingPerQPEnvVar, env_val, max_outstanding_per_qp_);
         }
     }
@@ -801,10 +802,10 @@ MPComm::Impl::Impl()
         unsigned long val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 10000000) {
             max_idle_spins_ = static_cast<size_t>(val);
-            printf("MPComm: Using max idle spins from %s: %zu\n",
+            MPCOMM_LOG_INFO("MPComm: Using max idle spins from %s: %zu\n",
                    kMaxIdleSpinsEnvVar, max_idle_spins_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s' (must be 1-10000000), using default %zu\n",
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 1-10000000), using default %zu\n",
                     kMaxIdleSpinsEnvVar, env_val, max_idle_spins_);
         }
     }
@@ -824,10 +825,10 @@ MPComm::Impl::Impl()
         unsigned long long val = strtoull(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0') {
             transfer_stats_interval_ = static_cast<size_t>(val);
-            printf("MPComm: Using transfer stats interval from %s: %zu\n",
+            MPCOMM_LOG_INFO("MPComm: Using transfer stats interval from %s: %zu\n",
                    kTransferStatsIntervalEnvVar, transfer_stats_interval_);
         } else {
-            fprintf(stderr, "MPComm: Invalid %s value '%s', using default 0 (every transfer)\n",
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s', using default 0 (every transfer)\n",
                     kTransferStatsIntervalEnvVar, env_val);
         }
     }
@@ -841,7 +842,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
                  const std::string &device_names,
                  int tcp_port) {
     if (initialized_) {
-        fprintf(stderr, "MPComm: Already initialized\n");
+        MPCOMM_LOG_ERROR("MPComm: Already initialized\n");
         return MPCOMM_ERR_CONTEXT;
     }
 
@@ -851,25 +852,25 @@ int MPComm::Impl::init(const std::string &local_host_id,
     // Open RDMA devices
     int ret = openDevices(device_names);
     if (ret != 0) {
-        fprintf(stderr, "MPComm: Failed to open devices\n");
+        MPCOMM_LOG_ERROR("MPComm: Failed to open devices\n");
         return ret;
     }
 
     if (nic_contexts_.empty()) {
-        fprintf(stderr, "MPComm: No RDMA devices found\n");
+        MPCOMM_LOG_ERROR("MPComm: No RDMA devices found\n");
         return MPCOMM_ERR_DEVICE;
     }
 
     // Validate fixed-size array limits
     if (nic_contexts_.size() > kMaxNics) {
-        fprintf(stderr, "MPComm: Too many NICs (%zu > kMaxNics=%zu). "
+        MPCOMM_LOG_ERROR("MPComm: Too many NICs (%zu > kMaxNics=%zu). "
                 "Increase kMaxNics and rebuild.\n",
                 nic_contexts_.size(), kMaxNics);
         shutdown();
         return MPCOMM_ERR_DEVICE;
     }
     if (qps_per_connection_ > kMaxQPsPerNic) {
-        fprintf(stderr, "MPComm: Too many QPs per connection (%zu > kMaxQPsPerNic=%zu). "
+        MPCOMM_LOG_ERROR("MPComm: Too many QPs per connection (%zu > kMaxQPsPerNic=%zu). "
                 "Increase kMaxQPsPerNic and rebuild.\n",
                 qps_per_connection_, kMaxQPsPerNic);
         shutdown();
@@ -880,7 +881,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
     if (tcp_port > 0) {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
-            perror("MPComm: Failed to create socket");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to create socket");
             shutdown();
             return MPCOMM_ERR_CONNECTION;
         }
@@ -895,7 +896,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
         addr.sin_port = htons(tcp_port);
 
         if (bind(listen_fd_, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            perror("MPComm: Failed to bind");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to bind");
             close(listen_fd_);
             listen_fd_ = -1;
             shutdown();
@@ -903,7 +904,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
         }
 
         if (listen(listen_fd_, 16) < 0) {
-            perror("MPComm: Failed to listen");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to listen");
             close(listen_fd_);
             listen_fd_ = -1;
             shutdown();
@@ -995,10 +996,10 @@ int MPComm::Impl::init(const std::string &local_host_id,
                 &MPComm::Impl::workerThreadLoop, this, worker_id, static_cast<int>(numa), cpu_id);
         }
     }
-    printf("MPComm: Started %zu async worker threads (%zu per NUMA, %zu NUMA nodes)\n", 
+    MPCOMM_LOG_INFO("MPComm: Started %zu async worker threads (%zu per NUMA, %zu NUMA nodes)\n", 
            total_workers_, kWorkersPerNuma, num_numa_nodes_);
     
-    printf("MPComm: Initialized with %zu NICs, TCP port %d\n",
+    MPCOMM_LOG_INFO("MPComm: Initialized with %zu NICs, TCP port %d\n",
            nic_contexts_.size(), tcp_port_);
 
     // Generate MPComm version config file
@@ -1013,7 +1014,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
         try {
             fs::create_directories(target_dir);
         } catch (const fs::filesystem_error& e) {
-            fprintf(stderr, "MPComm: No version file generated since the target directory %s is not accessible.\n", target_dir.c_str());
+            MPCOMM_LOG_WARN("MPComm: No version file generated since the target directory %s is not accessible.\n", target_dir.c_str());
             return MPCOMM_SUCCESS;
         }
 
@@ -1035,7 +1036,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
                     return MPCOMM_SUCCESS;
                 }
             } catch (const std::exception& e) {
-                fprintf(stderr, "MPComm: Version file %s exists but cannot be updated. Will be rebuilt.\n", full_path.c_str());
+                MPCOMM_LOG_WARN("MPComm: Version file %s exists but cannot be updated. Will be rebuilt.\n", full_path.c_str());
             }
         }
 
@@ -1080,7 +1081,7 @@ void MPComm::Impl::shutdown() {
         worker_threads_.clear();
         worker_queues_.clear();
         numa_worker_rr_.clear();
-        printf("MPComm: All %zu worker threads stopped\n", total_workers_);
+        MPCOMM_LOG_INFO("MPComm: All %zu worker threads stopped\n", total_workers_);
     }
 
     if (listen_fd_ >= 0) {
@@ -1102,7 +1103,7 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
     int num_devices = 0;
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
     if (!devices || num_devices <= 0) {
-        fprintf(stderr, "MPComm: No RDMA devices found\n");
+        MPCOMM_LOG_ERROR("MPComm: No RDMA devices found\n");
         return MPCOMM_ERR_DEVICE;
     }
 
@@ -1137,16 +1138,18 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
                 filter.push_back(token.substr(start, end - start + 1));
             }
         }
-        printf("MPComm: Using NIC filter from environment variable %s: %s\n",
+        MPCOMM_LOG_INFO("MPComm: Using NIC filter from environment variable %s: %s\n",
                kNicFilterEnvVar, env_filter);
     }
 
     // Log the active filter
     if (!filter.empty()) {
-        printf("MPComm: NIC filter active, allowed devices: ");
+        std::string devs_str;
         for (size_t i = 0; i < filter.size(); ++i) {
-            printf("%s%s", filter[i].c_str(), (i < filter.size() - 1) ? ", " : "\n");
+            devs_str += filter[i];
+            if (i < filter.size() - 1) devs_str += ", ";
         }
+        MPCOMM_LOG_INFO("MPComm: NIC filter active, allowed devices: %s\n", devs_str.c_str());
     }
 
     for (int i = 0; i < num_devices; ++i) {
@@ -1178,7 +1181,7 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
 
         int ret = setupNicContext(name, *ctx);
         if (ret == 0) {
-            printf("MPComm: Opened device %s, GID=%s (NUMA %d)\n",
+            MPCOMM_LOG_INFO("MPComm: Opened device %s, GID=%s (NUMA %d)\n",
                    name, gidToString(ctx->gid).c_str(), nic_numa);
             nic_contexts_.push_back(std::move(ctx));
         }
@@ -1211,7 +1214,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
     ibv_free_device_list(devices);
     
     if (!ctx.context) {
-        fprintf(stderr, "MPComm: Failed to open device %s\n",
+        MPCOMM_LOG_ERROR("MPComm: Failed to open device %s\n",
                 device_name.c_str());
         return MPCOMM_ERR_CONTEXT;
     }
@@ -1219,7 +1222,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
     // Query port
     struct ibv_port_attr port_attr;
     if (ibv_query_port(ctx.context, ctx.port, &port_attr) != 0) {
-        fprintf(stderr, "MPComm: Failed to query port on %s\n",
+        MPCOMM_LOG_ERROR("MPComm: Failed to query port on %s\n",
                 device_name.c_str());
         ibv_close_device(ctx.context);
         ctx.context = nullptr;
@@ -1227,7 +1230,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
     }
 
     if (port_attr.state != IBV_PORT_ACTIVE) {
-        fprintf(stderr, "MPComm: Port not active on %s\n",
+        MPCOMM_LOG_WARN("MPComm: Port not active on %s\n",
                 device_name.c_str());
         ibv_close_device(ctx.context);
         ctx.context = nullptr;
@@ -1249,7 +1252,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
         }
     } else {
         if (ibv_query_gid(ctx.context, ctx.port, ctx.gid_index, &ctx.gid) != 0) {
-            fprintf(stderr, "MPComm: Failed to query GID on %s\n",
+            MPCOMM_LOG_ERROR("MPComm: Failed to query GID on %s\n",
                     device_name.c_str());
             ibv_close_device(ctx.context);
             ctx.context = nullptr;
@@ -1258,7 +1261,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
     }
 
     if (ctx.gid_index < 0) {
-        fprintf(stderr, "MPComm: No valid GID found on %s\n",
+        MPCOMM_LOG_ERROR("MPComm: No valid GID found on %s\n",
                 device_name.c_str());
         ibv_close_device(ctx.context);
         ctx.context = nullptr;
@@ -1268,7 +1271,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
     // Allocate PD
     ctx.pd = ibv_alloc_pd(ctx.context);
     if (!ctx.pd) {
-        fprintf(stderr, "MPComm: Failed to allocate PD on %s\n",
+        MPCOMM_LOG_ERROR("MPComm: Failed to allocate PD on %s\n",
                 device_name.c_str());
         ibv_close_device(ctx.context);
         ctx.context = nullptr;
@@ -1278,7 +1281,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
     // Create CQ
     ctx.cq = ibv_create_cq(ctx.context, kMaxCQE, nullptr, nullptr, 0);
     if (!ctx.cq) {
-        fprintf(stderr, "MPComm: Failed to create CQ on %s\n",
+        MPCOMM_LOG_ERROR("MPComm: Failed to create CQ on %s\n",
                 device_name.c_str());
         ibv_dealloc_pd(ctx.pd);
         ctx.pd = nullptr;
@@ -1348,7 +1351,7 @@ int MPComm::Impl::registerMemory(void *addr, size_t length) {
         // For GPU memory, move_pages() won't work.
         // Look up the GPU's NUMA node from topology discovery instead.
         numa_node = getGpuNumaNode(gpu_device_id);
-        printf("MPComm: Detected GPU memory (device %d, NUMA %d), using nvidia-peermem\n",
+        MPCOMM_LOG_INFO("MPComm: Detected GPU memory (device %d, NUMA %d), using nvidia-peermem\n",
                gpu_device_id, numa_node);
         // nvidia-peermem works through the standard ibv_reg_mr path:
         // The kernel's ib_umem_get() calls get_user_pages() which is intercepted
@@ -1377,13 +1380,13 @@ int MPComm::Impl::registerMemory(void *addr, size_t length) {
         
         struct ibv_mr *mr = ibv_reg_mr(ctx.pd, addr, length, access_flags);
         if (!mr) {
-            fprintf(stderr, "MPComm: Failed to register %s memory on %s (errno=%d: %s)\n",
+            MPCOMM_LOG_ERROR("MPComm: Failed to register %s memory on %s (errno=%d: %s)\n",
                     is_gpu ? "GPU" : "CPU", ctx.device_name.c_str(),
                     errno, strerror(errno));
             if (is_gpu) {
-                fprintf(stderr, "MPComm: Hint: Ensure nvidia-peermem kernel module is loaded "
+                MPCOMM_LOG_WARN("MPComm: Hint: Ensure nvidia-peermem kernel module is loaded "
                         "(lsmod | grep nvidia_peermem).\n");
-                fprintf(stderr, "MPComm: Hint: Also verify the GPU memory is valid and "
+                MPCOMM_LOG_WARN("MPComm: Hint: Also verify the GPU memory is valid and "
                         "CUDA context is active on device %d.\n", gpu_device_id);
             }
             // Unregister from previous NICs
@@ -1417,7 +1420,7 @@ int MPComm::Impl::registerMemory(void *addr, size_t length) {
         ctx.memory_regions.push_back(info);
     }
 
-    printf("MPComm: Registered %s memory %p, length %zu, NUMA node %d%s\n",
+    MPCOMM_LOG_INFO("MPComm: Registered %s memory %p, length %zu, NUMA node %d%s\n",
            is_gpu ? "GPU" : "CPU", addr, length, numa_node,
            is_gpu ? " (nvidia-peermem)" : "");
     return MPCOMM_SUCCESS;
@@ -1486,7 +1489,7 @@ int MPComm::Impl::updateRemoteMemoryInfo(const std::string &remote_host_id,
     
     auto it = connections_.find(remote_host_id);
     if (it == connections_.end()) {
-        fprintf(stderr, "MPComm: Host %s not connected\n", remote_host_id.c_str());
+        MPCOMM_LOG_ERROR("MPComm: Host %s not connected\n", remote_host_id.c_str());
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -1495,7 +1498,7 @@ int MPComm::Impl::updateRemoteMemoryInfo(const std::string &remote_host_id,
         it->second.nic_endpoints[i].rkey = rkeys[i];
     }
 
-    printf("MPComm: Updated rkeys for %s\n", remote_host_id.c_str());
+    MPCOMM_LOG_INFO("MPComm: Updated rkeys for %s\n", remote_host_id.c_str());
     return MPCOMM_SUCCESS;
 }
 
@@ -1662,55 +1665,60 @@ void MPComm::Impl::discoverTopology() {
 
 // Print topology discovery results
 void MPComm::Impl::printTopologyInfo() {
-    printf("\n================== MPCOMM Topology Discovery ==================\n");
-    printf("System: %zu NUMA nodes, %zu candidate NICs\n", 
-           numa_topology_.size(), nic_topology_.size());
-    
-    // Print NIC Filter setting
+    if (mpcomm_get_log_level() < MPCOMM_LOG_LEVEL_INFO) return;
+
+    std::string msg;
+    msg += "\n================== MPCOMM Topology Discovery ==================\n";
+    msg += "System: " + std::to_string(numa_topology_.size()) + " NUMA nodes, "
+         + std::to_string(nic_topology_.size()) + " candidate NICs\n";
+
+    // NIC Filter setting
     const char* filter = std::getenv(kNicFilterEnvVar);
     if (filter && strlen(filter) > 0) {
-        printf("NIC Filter: %s\n", filter);
+        msg += std::string("NIC Filter: ") + filter + "\n";
     } else {
-        printf("NIC Filter: (none, using all available NICs)\n");
+        msg += "NIC Filter: (none, using all available NICs)\n";
     }
-    printf("\n");
-    
-    // Print NUMA topology
+    msg += "\n";
+
+    // NUMA topology
     for (const auto& topo : numa_topology_) {
-        printf("NUMA Node %d:\n", topo.numa_node);
-        
+        msg += "NUMA Node " + std::to_string(topo.numa_node) + ":\n";
+
         if (!topo.local_nics.empty()) {
-            printf("  Local NICs (optimal): ");
+            msg += "  Local NICs (optimal): ";
             for (size_t i = 0; i < topo.local_nics.size(); i++) {
-                printf("%s%s", topo.local_nics[i].c_str(), 
-                       (i < topo.local_nics.size() - 1) ? ", " : "");
+                msg += topo.local_nics[i];
+                if (i < topo.local_nics.size() - 1) msg += ", ";
             }
-            printf(" (%zu NICs)\n", topo.local_nics.size());
+            msg += " (" + std::to_string(topo.local_nics.size()) + " NICs)\n";
         } else {
-            printf("  Local NICs: (none)\n");
+            msg += "  Local NICs: (none)\n";
         }
-        
+
         if (!topo.remote_nics.empty() && topo.local_nics.empty()) {
-            printf("  Fallback NICs (cross-NUMA): ");
+            msg += "  Fallback NICs (cross-NUMA): ";
             for (size_t i = 0; i < topo.remote_nics.size(); i++) {
-                printf("%s%s", topo.remote_nics[i].c_str(),
-                       (i < topo.remote_nics.size() - 1) ? ", " : "");
+                msg += topo.remote_nics[i];
+                if (i < topo.remote_nics.size() - 1) msg += ", ";
             }
-            printf("\n");
+            msg += "\n";
         }
-        printf("\n");
+        msg += "\n";
     }
-    
-    // Print NIC-to-NUMA mapping
-    printf("NIC -> NUMA Mapping:\n");
+
+    // NIC-to-NUMA mapping
+    msg += "NIC -> NUMA Mapping:\n";
     for (const auto& info : nic_topology_) {
         if (info.numa_node >= 0) {
-            printf("  %s -> NUMA %d\n", info.nic_name.c_str(), info.numa_node);
+            msg += "  " + info.nic_name + " -> NUMA " + std::to_string(info.numa_node) + "\n";
         } else {
-            printf("  %s -> NUMA unknown\n", info.nic_name.c_str());
+            msg += "  " + info.nic_name + " -> NUMA unknown\n";
         }
     }
-    printf("================================================================\n\n");
+    msg += "================================================================\n";
+
+    MPCOMM_LOG_INFO("%s", msg.c_str());
 }
 
 // Get NUMA topology information
@@ -1907,7 +1915,7 @@ std::vector<size_t> MPComm::Impl::getGpuPcieAffinityNics(int gpu_device_id) cons
     std::string gpu_sysfs = "/sys/bus/pci/devices/" + gpu_bdf;
     char gpu_resolved[PATH_MAX];
     if (realpath(gpu_sysfs.c_str(), gpu_resolved) == nullptr) {
-        fprintf(stderr, "MPComm: Cannot resolve GPU %d sysfs path: %s\n",
+        MPCOMM_LOG_ERROR("MPComm: Cannot resolve GPU %d sysfs path: %s\n",
                 gpu_device_id, gpu_sysfs.c_str());
         return result;
     }
@@ -1964,13 +1972,13 @@ std::vector<size_t> MPComm::Impl::getGpuPcieAffinityNics(int gpu_device_id) cons
     }
 
     // Print discovery result
-    printf("MPComm: GPU %d PCIe affinity discovery: %zu/%zu NICs share closest PCIe switch\n",
+    MPCOMM_LOG_INFO("MPComm: GPU %d PCIe affinity discovery: %zu/%zu NICs share closest PCIe switch\n",
            gpu_device_id, result.size(), nic_contexts_.size());
-    printf("MPComm:   GPU path: %s\n", gpu_path.c_str());
+    MPCOMM_LOG_INFO("MPComm:   GPU path: %s\n", gpu_path.c_str());
     for (const auto& aff : affinities) {
         const auto& nic_name = nic_contexts_[aff.nic_index]->device_name;
         bool is_affine = (aff.common_prefix_len == max_common);
-        printf("MPComm:   %s: common_prefix=%zu%s\n",
+        MPCOMM_LOG_INFO("MPComm:   %s: common_prefix=%zu%s\n",
                nic_name.c_str(), aff.common_prefix_len,
                is_affine ? " [AFFINE]" : "");
     }
@@ -2020,7 +2028,7 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
             // Update existing entry
             entry.length = length;
             entry.numa_node = (numa_node >= 0) ? numa_node : getNumaNodeForAddr(addr);
-            printf("MPComm: Updated published buffer addr=%p, length=%zu, numa=%d\n",
+            MPCOMM_LOG_INFO("MPComm: Updated published buffer addr=%p, length=%zu, numa=%d\n",
                    addr, length, entry.numa_node);
             return MPCOMM_SUCCESS;
         }
@@ -2037,7 +2045,7 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
     for (size_t i = 0; i < nic_contexts_.size(); ++i) {
         uint32_t rkey = getRkey(i, addr);
         if (rkey == 0) {
-            fprintf(stderr, "MPComm: Buffer not registered on NIC %zu\n", i);
+            MPCOMM_LOG_ERROR("MPComm: Buffer not registered on NIC %zu\n", i);
             return MPCOMM_ERR_MEMORY;
         }
         entry.rkeys.push_back(rkey);
@@ -2046,13 +2054,15 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
     published_buffer_->buffers.push_back(std::move(entry));
     
     const auto &added = published_buffer_->buffers.back();
-    printf("MPComm: Published buffer addr=%p, length=%zu, numa=%d, rkeys=[",
-           addr, length, added.numa_node);
-    for (size_t i = 0; i < added.rkeys.size(); ++i) {
-        printf("%u%s", added.rkeys[i],
-               i < added.rkeys.size() - 1 ? "," : "");
+    {
+        std::string rkeys_str;
+        for (size_t i = 0; i < added.rkeys.size(); ++i) {
+            if (i > 0) rkeys_str += ",";
+            rkeys_str += std::to_string(added.rkeys[i]);
+        }
+        MPCOMM_LOG_INFO("MPComm: Published buffer addr=%p, length=%zu, numa=%d, rkeys=[%s] (total %zu buffers)\n",
+               addr, length, added.numa_node, rkeys_str.c_str(), published_buffer_->buffers.size());
     }
-    printf("] (total %zu buffers)\n", published_buffer_->buffers.size());
     
     return MPCOMM_SUCCESS;
 }
@@ -2072,7 +2082,7 @@ int MPComm::Impl::unpublishBuffer(void *addr) {
     for (auto it = buffers.begin(); it != buffers.end(); ++it) {
         if (it->addr == buf_addr) {
             buffers.erase(it);
-            printf("MPComm: Unpublished buffer addr=%p (remaining %zu buffers)\n",
+            MPCOMM_LOG_INFO("MPComm: Unpublished buffer addr=%p (remaining %zu buffers)\n",
                    addr, buffers.size());
             return MPCOMM_SUCCESS;
         }
@@ -2087,7 +2097,7 @@ void MPComm::Impl::unpublishAllBuffers() {
     if (published_buffer_) {
         size_t count = published_buffer_->buffers.size();
         published_buffer_->buffers.clear();
-        printf("MPComm: Unpublished all %zu buffers\n", count);
+        MPCOMM_LOG_INFO("MPComm: Unpublished all %zu buffers\n", count);
     }
 }
 
@@ -2103,13 +2113,13 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
                               RemoteBufferInfo &out_info) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
 
-    printf("MPComm: Querying buffers from %s at %s:%d\n",
+    MPCOMM_LOG_INFO("MPComm: Querying buffers from %s at %s:%d\n",
            remote_host_id.c_str(), remote_tcp_addr.c_str(), remote_tcp_port);
 
     // Create TCP connection
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0) {
-        perror("MPComm: Failed to create socket");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to create socket");
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -2121,7 +2131,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
     if (inet_pton(AF_INET, remote_tcp_addr.c_str(), &addr.sin_addr) <= 0) {
         struct hostent *he = gethostbyname(remote_tcp_addr.c_str());
         if (!he) {
-            fprintf(stderr, "MPComm: Failed to resolve %s\n",
+            MPCOMM_LOG_ERROR("MPComm: Failed to resolve %s\n",
                     remote_tcp_addr.c_str());
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
@@ -2130,7 +2140,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
     }
 
     if (::connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("MPComm: Failed to connect for buffer query");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to connect for buffer query");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2141,7 +2151,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
     // Send message type: buffer query
     uint32_t msg_type = kMsgTypeBufferQuery;
     if (send(sock_fd, &msg_type, sizeof(msg_type), 0) != sizeof(msg_type)) {
-        perror("MPComm: Failed to send message type");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to send message type");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2149,23 +2159,23 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
     // Receive response: number of buffers (0 = no published buffers)
     uint32_t num_buffers;
     if (recv(sock_fd, &num_buffers, sizeof(num_buffers), MSG_WAITALL) != sizeof(num_buffers)) {
-        perror("MPComm: Failed to receive buffer count");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to receive buffer count");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
 
     if (num_buffers == 0) {
-        fprintf(stderr, "MPComm: Remote host has no published buffers\n");
+        MPCOMM_LOG_ERROR("MPComm: Remote host has no published buffers\n");
         close(sock_fd);
         return MPCOMM_ERR_INVALID_ARG;
     }
 
-    printf("MPComm: Remote has %u published buffer(s)\n", num_buffers);
+    MPCOMM_LOG_INFO("MPComm: Remote has %u published buffer(s)\n", num_buffers);
 
     // Receive number of NICs (same for all buffers)
     uint32_t num_nics;
     if (recv(sock_fd, &num_nics, sizeof(num_nics), MSG_WAITALL) != sizeof(num_nics)) {
-        perror("MPComm: Failed to receive num_nics");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to receive num_nics");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2175,7 +2185,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
     for (uint32_t i = 0; i < num_nics; ++i) {
         char gid_buf[64];
         if (recv(sock_fd, gid_buf, sizeof(gid_buf), MSG_WAITALL) != sizeof(gid_buf)) {
-            perror("MPComm: Failed to receive GID");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive GID");
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
         }
@@ -2192,14 +2202,14 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
 
         // Receive buffer address
         if (recv(sock_fd, &entry.addr, sizeof(entry.addr), MSG_WAITALL) != sizeof(entry.addr)) {
-            perror("MPComm: Failed to receive buffer address");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive buffer address");
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
         }
 
         // Receive buffer length
         if (recv(sock_fd, &entry.length, sizeof(entry.length), MSG_WAITALL) != sizeof(entry.length)) {
-            perror("MPComm: Failed to receive buffer length");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive buffer length");
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
         }
@@ -2207,7 +2217,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
         // Receive NUMA node
         int32_t numa_node;
         if (recv(sock_fd, &numa_node, sizeof(numa_node), MSG_WAITALL) != sizeof(numa_node)) {
-            perror("MPComm: Failed to receive NUMA node");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive NUMA node");
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
         }
@@ -2218,19 +2228,22 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
         for (uint32_t nic_idx = 0; nic_idx < num_nics; ++nic_idx) {
             uint32_t rkey;
             if (recv(sock_fd, &rkey, sizeof(rkey), MSG_WAITALL) != sizeof(rkey)) {
-                perror("MPComm: Failed to receive rkey");
+                MPCOMM_PLOG_ERROR("MPComm: Failed to receive rkey");
                 close(sock_fd);
                 return MPCOMM_ERR_CONNECTION;
             }
             entry.rkeys[nic_idx] = rkey;
         }
 
-        printf("MPComm: Buffer %u: addr=0x%lx, length=%lu, numa=%d, rkeys=[",
-               buf_idx, entry.addr, entry.length, entry.numa_node);
-        for (size_t i = 0; i < entry.rkeys.size(); ++i) {
-            printf("%u%s", entry.rkeys[i], i < entry.rkeys.size() - 1 ? "," : "");
+        {
+            std::string rkeys_str;
+            for (size_t i = 0; i < entry.rkeys.size(); ++i) {
+                if (i > 0) rkeys_str += ",";
+                rkeys_str += std::to_string(entry.rkeys[i]);
+            }
+            MPCOMM_LOG_INFO("MPComm: Buffer %u: addr=0x%lx, length=%lu, numa=%d, rkeys=[%s]\n",
+                   buf_idx, entry.addr, entry.length, entry.numa_node, rkeys_str.c_str());
         }
-        printf("]\n");
 
         out_info.buffers.push_back(std::move(entry));
     }
@@ -2243,7 +2256,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
         std::lock_guard<std::mutex> lock(connections_mutex_);
         auto conn_it = connections_.find(remote_host_id);
         if (conn_it != connections_.end()) {
-            printf("MPComm: Matching rkeys for %zu endpoints\n", 
+            MPCOMM_LOG_INFO("MPComm: Matching rkeys for %zu endpoints\n", 
                    conn_it->second.nic_endpoints.size());
             
             // Store all remote buffers for multi-NUMA parallel access
@@ -2268,13 +2281,13 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
                 }
                 
                 conn_it->second.remote_buffers[buf.addr] = reordered_entry;
-                printf("MPComm: Stored remote buffer: addr=0x%lx, numa=%d, rkeys=[",
+                MPCOMM_LOG_INFO("MPComm: Stored remote buffer: addr=0x%lx, numa=%d, rkeys=[",
                        buf.addr, buf.numa_node);
                 for (size_t i = 0; i < reordered_entry.rkeys.size(); ++i) {
-                    printf("%u%s", reordered_entry.rkeys[i], 
+                    MPCOMM_LOG_INFO("%u%s", reordered_entry.rkeys[i], 
                            i < reordered_entry.rkeys.size() - 1 ? "," : "");
                 }
-                printf("]\n");
+                MPCOMM_LOG_INFO("]\n");
             }
             
             // Also update nic_endpoints with first buffer's rkeys for backward compatibility
@@ -2285,20 +2298,20 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
                 for (uint32_t remote_idx = 0; remote_idx < num_nics; ++remote_idx) {
                     if (remote_gids[remote_idx] == ep_gid) {
                         conn_it->second.nic_endpoints[ep_idx].rkey = first_buf.rkeys[remote_idx];
-                        printf("MPComm: Matched endpoint %zu (GID=%s) -> rkey=%u\n",
+                        MPCOMM_LOG_INFO("MPComm: Matched endpoint %zu (GID=%s) -> rkey=%u\n",
                                ep_idx, ep_gid.c_str(), first_buf.rkeys[remote_idx]);
                         matched = true;
                         break;
                     }
                 }
                 if (!matched) {
-                    printf("MPComm: WARNING: No matching GID found for endpoint %zu\n", ep_idx);
+                    MPCOMM_LOG_INFO("MPComm: WARNING: No matching GID found for endpoint %zu\n", ep_idx);
                 }
             }
         }
     }
 
-    printf("MPComm: Received %zu buffer(s) from %s\n",
+    MPCOMM_LOG_INFO("MPComm: Received %zu buffer(s) from %s\n",
            out_info.buffers.size(), remote_host_id.c_str());
 
     return MPCOMM_SUCCESS;
@@ -2334,7 +2347,7 @@ int MPComm::Impl::queryRemoteBufferByNuma(const std::string &remote_host_id,
     }
 
     // Not found, return first buffer as fallback
-    fprintf(stderr, "MPComm: No buffer found for NUMA node %d, using first buffer\n", numa_node);
+    MPCOMM_LOG_WARN("MPComm: No buffer found for NUMA node %d, using first buffer\n", numa_node);
     out_entry = all_buffers.buffers[0];
     return MPCOMM_SUCCESS;
 }
@@ -2355,7 +2368,7 @@ void MPComm::Impl::handleBufferQuery(int client_fd) {
 
     // Send number of buffers (0 = no published buffers)
     if (send(client_fd, &num_buffers, sizeof(num_buffers), 0) != sizeof(num_buffers)) {
-        perror("MPComm: Failed to send buffer count");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to send buffer count");
         return;
     }
 
@@ -2366,7 +2379,7 @@ void MPComm::Impl::handleBufferQuery(int client_fd) {
     // Send number of NICs (same for all buffers)
     uint32_t num_nics = static_cast<uint32_t>(nic_contexts_.size());
     if (send(client_fd, &num_nics, sizeof(num_nics), 0) != sizeof(num_nics)) {
-        perror("MPComm: Failed to send num_nics");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to send num_nics");
         return;
     }
 
@@ -2377,7 +2390,7 @@ void MPComm::Impl::handleBufferQuery(int client_fd) {
         memset(gid_buf, 0, sizeof(gid_buf));
         strncpy(gid_buf, gid_str.c_str(), sizeof(gid_buf) - 1);
         if (send(client_fd, gid_buf, sizeof(gid_buf), 0) != sizeof(gid_buf)) {
-            perror("MPComm: Failed to send GID");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send GID");
             return;
         }
     }
@@ -2388,20 +2401,20 @@ void MPComm::Impl::handleBufferQuery(int client_fd) {
 
         // Send buffer address
         if (send(client_fd, &entry.addr, sizeof(entry.addr), 0) != sizeof(entry.addr)) {
-            perror("MPComm: Failed to send buffer address");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send buffer address");
             return;
         }
 
         // Send buffer length
         if (send(client_fd, &entry.length, sizeof(entry.length), 0) != sizeof(entry.length)) {
-            perror("MPComm: Failed to send buffer length");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send buffer length");
             return;
         }
 
         // Send NUMA node
         int32_t numa_node = entry.numa_node;
         if (send(client_fd, &numa_node, sizeof(numa_node), 0) != sizeof(numa_node)) {
-            perror("MPComm: Failed to send NUMA node");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send NUMA node");
             return;
         }
 
@@ -2409,16 +2422,16 @@ void MPComm::Impl::handleBufferQuery(int client_fd) {
         for (uint32_t nic_idx = 0; nic_idx < num_nics; ++nic_idx) {
             uint32_t rkey = entry.rkeys[nic_idx];
             if (send(client_fd, &rkey, sizeof(rkey), 0) != sizeof(rkey)) {
-                perror("MPComm: Failed to send rkey");
+                MPCOMM_PLOG_ERROR("MPComm: Failed to send rkey");
                 return;
             }
         }
 
-        printf("MPComm: Sent buffer %u: addr=0x%lx, length=%lu, numa=%d\n",
+        MPCOMM_LOG_INFO("MPComm: Sent buffer %u: addr=0x%lx, length=%lu, numa=%d\n",
                buf_idx, entry.addr, entry.length, entry.numa_node);
     }
 
-    printf("MPComm: Sent %u buffer(s) to client\n", num_buffers);
+    MPCOMM_LOG_INFO("MPComm: Sent %u buffer(s) to client\n", num_buffers);
 }
 
 // ============================================================================
@@ -2440,7 +2453,7 @@ int MPComm::Impl::createQP(NicContext &ctx, struct ibv_qp **qp) {
 
     *qp = ibv_create_qp(ctx.pd, &init_attr);
     if (!*qp) {
-        perror("MPComm: Failed to create QP");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to create QP");
         return MPCOMM_ERR_CONTEXT;
     }
 
@@ -2461,7 +2474,7 @@ int MPComm::Impl::modifyQPToInit(NicContext &ctx, struct ibv_qp *qp) {
                 IBV_QP_ACCESS_FLAGS;
     
     if (ibv_modify_qp(qp, &attr, flags) != 0) {
-        perror("MPComm: Failed to modify QP to INIT");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to modify QP to INIT");
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -2494,7 +2507,7 @@ int MPComm::Impl::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 
     if (ibv_modify_qp(qp, &attr, flags) != 0) {
-        perror("MPComm: Failed to modify QP to RTR");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to modify QP to RTR");
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -2516,7 +2529,7 @@ int MPComm::Impl::modifyQPToRTS(struct ibv_qp *qp) {
                 IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
 
     if (ibv_modify_qp(qp, &attr, flags) != 0) {
-        perror("MPComm: Failed to modify QP to RTS");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to modify QP to RTS");
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -2552,13 +2565,13 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                     int remote_tcp_port) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
 
-    printf("MPComm: Connecting to %s at %s:%d\n",
+    MPCOMM_LOG_INFO("MPComm: Connecting to %s at %s:%d\n",
            remote_host_id.c_str(), remote_tcp_addr.c_str(), remote_tcp_port);
 
     // Create TCP connection
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0) {
-        perror("MPComm: Failed to create socket");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to create socket");
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -2571,7 +2584,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         // Try hostname resolution
         struct hostent *he = gethostbyname(remote_tcp_addr.c_str());
         if (!he) {
-            fprintf(stderr, "MPComm: Failed to resolve %s\n",
+            MPCOMM_LOG_ERROR("MPComm: Failed to resolve %s\n",
                     remote_tcp_addr.c_str());
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
@@ -2580,7 +2593,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     }
 
     if (::connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("MPComm: Failed to connect");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to connect");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2597,7 +2610,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     // Send number of local NICs
     uint32_t num_nics = static_cast<uint32_t>(nic_contexts_.size());
     if (send(sock_fd, &num_nics, sizeof(num_nics), 0) != sizeof(num_nics)) {
-        perror("MPComm: Failed to send num_nics");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to send num_nics");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2606,19 +2619,19 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     uint32_t remote_num_nics;
     if (recv(sock_fd, &remote_num_nics, sizeof(remote_num_nics), MSG_WAITALL) !=
         sizeof(remote_num_nics)) {
-        perror("MPComm: Failed to receive remote_num_nics");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_num_nics");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
 
-    printf("MPComm: Local NICs=%u, Remote NICs=%u, QPs per connection=%zu\n",
+    MPCOMM_LOG_INFO("MPComm: Local NICs=%u, Remote NICs=%u, QPs per connection=%zu\n",
            num_nics, remote_num_nics, qps_per_connection_);
 
     // Exchange NUMA topology information for NUMA-aware NIC selection
     // Send local NUMA count and per-NIC NUMA node info
     int32_t local_numa_count = static_cast<int32_t>(numa_topology_.size());
     if (send(sock_fd, &local_numa_count, sizeof(local_numa_count), 0) != sizeof(local_numa_count)) {
-        perror("MPComm: Failed to send local_numa_count");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to send local_numa_count");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2630,7 +2643,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     }
     if (send(sock_fd, local_nic_numa.data(), num_nics * sizeof(int32_t), 0) !=
         static_cast<ssize_t>(num_nics * sizeof(int32_t))) {
-        perror("MPComm: Failed to send local_nic_numa");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to send local_nic_numa");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2639,7 +2652,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     int32_t remote_numa_count;
     if (recv(sock_fd, &remote_numa_count, sizeof(remote_numa_count), MSG_WAITALL) !=
         sizeof(remote_numa_count)) {
-        perror("MPComm: Failed to receive remote_numa_count");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_numa_count");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2647,7 +2660,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     std::vector<int32_t> remote_nic_numa(remote_num_nics);
     if (recv(sock_fd, remote_nic_numa.data(), remote_num_nics * sizeof(int32_t), MSG_WAITALL) !=
         static_cast<ssize_t>(remote_num_nics * sizeof(int32_t))) {
-        perror("MPComm: Failed to receive remote_nic_numa");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_nic_numa");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2659,9 +2672,9 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         conn_info.remote_nic_numa_nodes[i] = remote_nic_numa[i];
     }
 
-    printf("MPComm: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
+    MPCOMM_LOG_INFO("MPComm: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
     for (size_t i = 0; i < remote_num_nics; ++i) {
-        printf("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
+        MPCOMM_LOG_INFO("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
                (i < remote_num_nics - 1) ? ", " : "\n");
     }
 
@@ -2671,12 +2684,12 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         const std::string& name = nic_contexts_[i]->device_name;
         uint32_t name_len = static_cast<uint32_t>(name.size());
         if (send(sock_fd, &name_len, sizeof(name_len), 0) != sizeof(name_len)) {
-            perror("MPComm: Failed to send nic_name length");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send nic_name length");
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
         }
         if (name_len > 0 && send(sock_fd, name.c_str(), name_len, 0) != static_cast<ssize_t>(name_len)) {
-            perror("MPComm: Failed to send nic_name");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send nic_name");
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
         }
@@ -2687,14 +2700,14 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     for (size_t i = 0; i < remote_num_nics; ++i) {
         uint32_t name_len;
         if (recv(sock_fd, &name_len, sizeof(name_len), MSG_WAITALL) != sizeof(name_len)) {
-            perror("MPComm: Failed to receive nic_name length");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive nic_name length");
             close(sock_fd);
             return MPCOMM_ERR_CONNECTION;
         }
         if (name_len > 0) {
             std::vector<char> buf(name_len + 1, 0);
             if (recv(sock_fd, buf.data(), name_len, MSG_WAITALL) != static_cast<ssize_t>(name_len)) {
-                perror("MPComm: Failed to receive nic_name");
+                MPCOMM_PLOG_ERROR("MPComm: Failed to receive nic_name");
                 close(sock_fd);
                 return MPCOMM_ERR_CONNECTION;
             }
@@ -2712,10 +2725,10 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         }
     }
 
-    printf("MPComm: Remote NIC names: ");
+    MPCOMM_LOG_INFO("MPComm: Remote NIC names: ");
     for (size_t i = 0; i < remote_num_nics; ++i) {
         int suffix = extractNicSuffix(remote_nic_names[i]);
-        printf("%s(suffix=%d)%s", remote_nic_names[i].c_str(), suffix,
+        MPCOMM_LOG_INFO("%s(suffix=%d)%s", remote_nic_names[i].c_str(), suffix,
                (i < remote_num_nics - 1) ? ", " : "\n");
     }
 
@@ -2738,7 +2751,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         }
     }
     
-    printf("MPComm: Remote NICs span %zu distinct NUMA node(s)\n", actual_remote_numa_count);
+    MPCOMM_LOG_INFO("MPComm: Remote NICs span %zu distinct NUMA node(s)\n", actual_remote_numa_count);
     
     // Store all remote endpoints (one per remote NIC)
     conn_info.nic_endpoints.resize(remote_num_nics);
@@ -2746,7 +2759,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     // First, send number of QPs per connection
     uint32_t qps_per_conn = static_cast<uint32_t>(qps_per_connection_);
     if (send(sock_fd, &qps_per_conn, sizeof(qps_per_conn), 0) != sizeof(qps_per_conn)) {
-        perror("MPComm: Failed to send qps_per_conn");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to send qps_per_conn");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -2755,14 +2768,14 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     uint32_t remote_qps_per_conn;
     if (recv(sock_fd, &remote_qps_per_conn, sizeof(remote_qps_per_conn), MSG_WAITALL) !=
         sizeof(remote_qps_per_conn)) {
-        perror("MPComm: Failed to receive remote_qps_per_conn");
+        MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_qps_per_conn");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
 
     size_t actual_qps = std::min(static_cast<size_t>(qps_per_conn),
                                   static_cast<size_t>(remote_qps_per_conn));
-    printf("MPComm: Using %zu QPs per NIC connection\n", actual_qps);
+    MPCOMM_LOG_INFO("MPComm: Using %zu QPs per NIC connection\n", actual_qps);
 
     // Name-based NUMA-aware connection strategy:
     // - Match local and remote NICs by their name suffix (e.g., mlx5_bond_0 matches with mlx5_0)
@@ -2781,7 +2794,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     // Example: local mlx5_bond_5 -> remote mlx5_bond_5 (same NUMA) + mlx5_bond_1 (cross NUMA)
     //          local mlx5_bond_1 -> remote mlx5_bond_1 (same NUMA) + mlx5_bond_5 (cross NUMA)
     
-    printf("MPComm: Using suffix-based matching (N -> N and N%%4 for cross-NUMA)\n");
+    MPCOMM_LOG_INFO("MPComm: Using suffix-based matching (N -> N and N%%4 for cross-NUMA)\n");
     
     for (size_t local_nic = 0; local_nic < num_nics; ++local_nic) {
         auto &ctx = *nic_contexts_[local_nic];
@@ -2807,7 +2820,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         
         if (target_remote_nics.empty()) {
             // No matching suffix found, skip this local NIC
-            printf("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC (checked %d and %d), skipping\n",
+            MPCOMM_LOG_INFO("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC (checked %d and %d), skipping\n",
                    local_nic, local_name.c_str(), local_suffix, local_suffix, cross_numa_suffix);
             continue;
         }
@@ -2816,11 +2829,11 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
             continue;  // No remote NICs to connect to
         }
         
-        printf("MPComm: Local NIC%zu (%s, suffix=%d) connecting to remote NICs: ", 
+        MPCOMM_LOG_INFO("MPComm: Local NIC%zu (%s, suffix=%d) connecting to remote NICs: ", 
                local_nic, local_name.c_str(), local_suffix);
         for (size_t idx = 0; idx < target_remote_nics.size(); ++idx) {
             size_t r = target_remote_nics[idx];
-            printf("%zu(%s)%s", r, remote_nic_names[r].c_str(),
+            MPCOMM_LOG_INFO("%zu(%s)%s", r, remote_nic_names[r].c_str(),
                    (idx < target_remote_nics.size() - 1) ? ", " : "\n");
         }
         
@@ -2873,7 +2886,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                 // Send local info
                 if (send(sock_fd, &local_info, sizeof(local_info), 0) !=
                     sizeof(local_info)) {
-                    perror("MPComm: Failed to send local_info");
+                    MPCOMM_PLOG_ERROR("MPComm: Failed to send local_info");
                     destroyQP(qp);
                     for (auto *created_qp : qp_list) {
                         destroyQP(created_qp);
@@ -2886,7 +2899,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                 RemoteEndpointInfo remote_info;
                 if (recv(sock_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) !=
                     sizeof(remote_info)) {
-                    perror("MPComm: Failed to receive remote_info");
+                    MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_info");
                     destroyQP(qp);
                     for (auto *created_qp : qp_list) {
                         destroyQP(created_qp);
@@ -2895,7 +2908,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                     return MPCOMM_ERR_CONNECTION;
                 }
 
-                printf("MPComm: NIC %s->%s QP[%zu]: Local QPN=%u, Remote QPN=%u\n",
+                MPCOMM_LOG_INFO("MPComm: NIC %s->%s QP[%zu]: Local QPN=%u, Remote QPN=%u\n",
                        nic_contexts_[local_nic]->device_name.c_str(),
                        remote_nic_names[remote_nic].c_str(),
                        qp_idx, local_info.qp_num, remote_info.qp_num);
@@ -2946,7 +2959,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         connections_[remote_host_id] = conn_info;
     }
 
-    printf("MPComm: Connected to %s with %zu NIC connections (NUMA-aware), %zu QPs each\n",
+    MPCOMM_LOG_INFO("MPComm: Connected to %s with %zu NIC connections (NUMA-aware), %zu QPs each\n",
            remote_host_id.c_str(), total_connections, actual_qps);
     
     return MPCOMM_SUCCESS;
@@ -2954,7 +2967,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
 
 int MPComm::Impl::startAcceptThread() {
     if (listen_fd_ < 0) {
-        fprintf(stderr, "MPComm: TCP listener not initialized\n");
+        MPCOMM_LOG_ERROR("MPComm: TCP listener not initialized\n");
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -2995,7 +3008,7 @@ void MPComm::Impl::acceptLoop() {
                                &addr_len);
         if (client_fd < 0) {
             if (accept_running_) {
-                perror("MPComm: Accept failed");
+                MPCOMM_PLOG_ERROR("MPComm: Accept failed");
             }
             continue;
         }
@@ -3006,7 +3019,7 @@ void MPComm::Impl::acceptLoop() {
         }
 
         // Handle client in same thread (simple implementation)
-        printf("MPComm: Accepted connection from %s:%d\n",
+        MPCOMM_LOG_INFO("MPComm: Accepted connection from %s:%d\n",
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
         // Disable Nagle's algorithm
@@ -3017,7 +3030,7 @@ void MPComm::Impl::acceptLoop() {
         uint32_t msg_type;
         if (recv(client_fd, &msg_type, sizeof(msg_type), MSG_WAITALL) !=
             sizeof(msg_type)) {
-            perror("MPComm: Failed to receive message type");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive message type");
             close(client_fd);
             continue;
         }
@@ -3036,7 +3049,7 @@ void MPComm::Impl::acceptLoop() {
         uint32_t num_nics = static_cast<uint32_t>(nic_contexts_.size());
         if (send(client_fd, &num_nics, sizeof(num_nics), 0) !=
             sizeof(num_nics)) {
-            perror("MPComm: Failed to send num_nics");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send num_nics");
             close(client_fd);
             continue;
         }
@@ -3055,7 +3068,7 @@ void MPComm::Impl::acceptLoop() {
         int32_t remote_numa_count;
         if (recv(client_fd, &remote_numa_count, sizeof(remote_numa_count), MSG_WAITALL) !=
             sizeof(remote_numa_count)) {
-            perror("MPComm: Failed to receive remote_numa_count");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_numa_count");
             close(client_fd);
             continue;
         }
@@ -3063,7 +3076,7 @@ void MPComm::Impl::acceptLoop() {
         std::vector<int32_t> remote_nic_numa(remote_num_nics);
         if (recv(client_fd, remote_nic_numa.data(), remote_num_nics * sizeof(int32_t), MSG_WAITALL) !=
             static_cast<ssize_t>(remote_num_nics * sizeof(int32_t))) {
-            perror("MPComm: Failed to receive remote_nic_numa");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_nic_numa");
             close(client_fd);
             continue;
         }
@@ -3072,7 +3085,7 @@ void MPComm::Impl::acceptLoop() {
         int32_t local_numa_count = static_cast<int32_t>(numa_topology_.size());
         if (send(client_fd, &local_numa_count, sizeof(local_numa_count), 0) !=
             sizeof(local_numa_count)) {
-            perror("MPComm: Failed to send local_numa_count");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send local_numa_count");
             close(client_fd);
             continue;
         }
@@ -3083,7 +3096,7 @@ void MPComm::Impl::acceptLoop() {
         }
         if (send(client_fd, local_nic_numa.data(), num_nics * sizeof(int32_t), 0) !=
             static_cast<ssize_t>(num_nics * sizeof(int32_t))) {
-            perror("MPComm: Failed to send local_nic_numa");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send local_nic_numa");
             close(client_fd);
             continue;
         }
@@ -3095,9 +3108,9 @@ void MPComm::Impl::acceptLoop() {
             conn_info.remote_nic_numa_nodes[i] = remote_nic_numa[i];
         }
 
-        printf("MPComm: Passive side: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
+        MPCOMM_LOG_INFO("MPComm: Passive side: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
         for (size_t i = 0; i < remote_num_nics; ++i) {
-            printf("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
+            MPCOMM_LOG_INFO("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
                    (i < remote_num_nics - 1) ? ", " : "\n");
         }
 
@@ -3106,14 +3119,14 @@ void MPComm::Impl::acceptLoop() {
         for (size_t i = 0; i < remote_num_nics; ++i) {
             uint32_t name_len;
             if (recv(client_fd, &name_len, sizeof(name_len), MSG_WAITALL) != sizeof(name_len)) {
-                perror("MPComm: Failed to receive nic_name length");
+                MPCOMM_PLOG_ERROR("MPComm: Failed to receive nic_name length");
                 close(client_fd);
                 continue;
             }
             if (name_len > 0) {
                 std::vector<char> buf(name_len + 1, 0);
                 if (recv(client_fd, buf.data(), name_len, MSG_WAITALL) != static_cast<ssize_t>(name_len)) {
-                    perror("MPComm: Failed to receive nic_name");
+                    MPCOMM_PLOG_ERROR("MPComm: Failed to receive nic_name");
                     close(client_fd);
                     continue;
                 }
@@ -3127,12 +3140,12 @@ void MPComm::Impl::acceptLoop() {
             const std::string& name = nic_contexts_[i]->device_name;
             uint32_t name_len = static_cast<uint32_t>(name.size());
             if (send(client_fd, &name_len, sizeof(name_len), 0) != sizeof(name_len)) {
-                perror("MPComm: Failed to send nic_name length");
+                MPCOMM_PLOG_ERROR("MPComm: Failed to send nic_name length");
                 close(client_fd);
                 continue;
             }
             if (name_len > 0 && send(client_fd, name.c_str(), name_len, 0) != static_cast<ssize_t>(name_len)) {
-                perror("MPComm: Failed to send nic_name");
+                MPCOMM_PLOG_ERROR("MPComm: Failed to send nic_name");
                 close(client_fd);
                 continue;
             }
@@ -3147,10 +3160,10 @@ void MPComm::Impl::acceptLoop() {
             }
         }
 
-        printf("MPComm: Passive side: Remote NIC names: ");
+        MPCOMM_LOG_INFO("MPComm: Passive side: Remote NIC names: ");
         for (size_t i = 0; i < remote_num_nics; ++i) {
             int suffix = extractNicSuffix(remote_nic_names[i]);
-            printf("%s(suffix=%d)%s", remote_nic_names[i].c_str(), suffix,
+            MPCOMM_LOG_INFO("%s(suffix=%d)%s", remote_nic_names[i].c_str(), suffix,
                    (i < remote_num_nics - 1) ? ", " : "\n");
         }
 
@@ -3161,7 +3174,7 @@ void MPComm::Impl::acceptLoop() {
         uint32_t remote_qps_per_conn;
         if (recv(client_fd, &remote_qps_per_conn, sizeof(remote_qps_per_conn),
                  MSG_WAITALL) != sizeof(remote_qps_per_conn)) {
-            perror("MPComm: Failed to receive remote_qps_per_conn");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_qps_per_conn");
             close(client_fd);
             continue;
         }
@@ -3170,14 +3183,14 @@ void MPComm::Impl::acceptLoop() {
         uint32_t qps_per_conn = static_cast<uint32_t>(qps_per_connection_);
         if (send(client_fd, &qps_per_conn, sizeof(qps_per_conn), 0) !=
             sizeof(qps_per_conn)) {
-            perror("MPComm: Failed to send qps_per_conn");
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send qps_per_conn");
             close(client_fd);
             continue;
         }
 
         size_t actual_qps = std::min(static_cast<size_t>(qps_per_conn),
                                       static_cast<size_t>(remote_qps_per_conn));
-        printf("MPComm: Passive side: Using %zu QPs per NIC connection\n", actual_qps);
+        MPCOMM_LOG_INFO("MPComm: Passive side: Using %zu QPs per NIC connection\n", actual_qps);
 
         // Check how many distinct NUMA nodes the remote NICs actually span
         // Must match the logic in connect() on active side
@@ -3206,7 +3219,7 @@ void MPComm::Impl::acceptLoop() {
             }
         }
         
-        printf("MPComm: Passive side: Using suffix-based matching (N -> N and cross-NUMA)\n");
+        MPCOMM_LOG_INFO("MPComm: Passive side: Using suffix-based matching (N -> N and cross-NUMA)\n");
         
         // Calculate expected number of connections (must match active side exactly)
         // Active side: for each local NIC with suffix N, connects to remote NICs with suffix N and cross-NUMA
@@ -3231,7 +3244,7 @@ void MPComm::Impl::acceptLoop() {
             }
         }
         
-        printf("MPComm: Passive side: Expecting %zu connections\n", expected_connections);
+        MPCOMM_LOG_INFO("MPComm: Passive side: Expecting %zu connections\n", expected_connections);
 
         bool success = true;
         size_t total_connections = 0;
@@ -3245,7 +3258,7 @@ void MPComm::Impl::acceptLoop() {
             RemoteEndpointInfo remote_info;
             if (recv(client_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) !=
                 sizeof(remote_info)) {
-                perror("MPComm: Failed to receive remote_info");
+                MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_info");
                 success = false;
                 break;
             }
@@ -3253,7 +3266,7 @@ void MPComm::Impl::acceptLoop() {
             // Decode: remote_info.addr contains the target local NIC index on passive side
             size_t local_nic = static_cast<size_t>(remote_info.addr);
             if (local_nic >= num_nics) {
-                fprintf(stderr, "MPComm: Invalid local NIC index %zu from active side\n", local_nic);
+                MPCOMM_LOG_WARN("MPComm: Invalid local NIC index %zu from active side\n", local_nic);
                 success = false;
                 break;
             }
@@ -3261,7 +3274,7 @@ void MPComm::Impl::acceptLoop() {
             // Decode: remote_info.length contains the source remote NIC (active side's local NIC)
             size_t remote_nic = static_cast<size_t>(remote_info.length);
             if (remote_nic >= remote_num_nics) {
-                fprintf(stderr, "MPComm: Invalid remote NIC index %zu from active side\n", remote_nic);
+                MPCOMM_LOG_WARN("MPComm: Invalid remote NIC index %zu from active side\n", remote_nic);
                 success = false;
                 break;
             }
@@ -3278,7 +3291,7 @@ void MPComm::Impl::acceptLoop() {
                 if (qp_idx > 0) {
                     if (recv(client_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) !=
                         sizeof(remote_info)) {
-                        perror("MPComm: Failed to receive remote_info");
+                        MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_info");
                         success = false;
                         break;
                     }
@@ -3308,7 +3321,7 @@ void MPComm::Impl::acceptLoop() {
                 // Send local info
                 if (send(client_fd, &local_info, sizeof(local_info), 0) !=
                     sizeof(local_info)) {
-                    perror("MPComm: Failed to send local_info");
+                    MPCOMM_PLOG_ERROR("MPComm: Failed to send local_info");
                     destroyQP(qp);
                     success = false;
                     break;
@@ -3331,7 +3344,7 @@ void MPComm::Impl::acceptLoop() {
                     conn_info.nic_endpoints[remote_nic] = remote_info;
                 }
 
-                printf("MPComm: Passive NIC %s<-%s QP[%zu]: Local QPN=%u, Remote QPN=%u\n",
+                MPCOMM_LOG_INFO("MPComm: Passive NIC %s<-%s QP[%zu]: Local QPN=%u, Remote QPN=%u\n",
                        nic_contexts_[local_nic]->device_name.c_str(),
                        remote_nic_names[remote_nic].c_str(),
                        qp_idx, local_info.qp_num, remote_info.qp_num);
@@ -3359,7 +3372,7 @@ void MPComm::Impl::acceptLoop() {
         if (success) {
             std::lock_guard<std::mutex> lock(connections_mutex_);
             connections_[remote_host_id] = conn_info;
-            printf("MPComm: Passive connection established with %s (%zu NIC connections, NUMA-aware)\n",
+            MPCOMM_LOG_INFO("MPComm: Passive connection established with %s (%zu NIC connections, NUMA-aware)\n",
                    remote_host_id.c_str(), total_connections);
         }
     }
@@ -3411,11 +3424,11 @@ TransferHandle MPComm::Impl::broadcastAsync(uintptr_t local_addr,
     // Broadcast: same length for all hosts, expand to lengths vector
     size_t host_count = host_list.size();
     if (host_count == 0 || remote_addrs.size() != host_count) {
-        fprintf(stderr, "MPComm: BroadcastAsync failed - invalid arguments\n");
+        MPCOMM_LOG_ERROR("MPComm: BroadcastAsync failed - invalid arguments\n");
         return INVALID_TRANSFER_HANDLE;
     }
     if (length == 0) {
-        fprintf(stderr, "MPComm: BroadcastAsync failed - zero length\n");
+        MPCOMM_LOG_ERROR("MPComm: BroadcastAsync failed - zero length\n");
         return INVALID_TRANSFER_HANDLE;
     }
     std::vector<size_t> lengths(host_count, length);
@@ -3436,7 +3449,7 @@ TransferHandle MPComm::Impl::putAsync(uintptr_t local_addr,
                                 uintptr_t remote_addr,
                                 size_t length) {
     if (length == 0) {
-        fprintf(stderr, "MPComm: PutAsync failed - zero length\n");
+        MPCOMM_LOG_ERROR("MPComm: PutAsync failed - zero length\n");
         return INVALID_TRANSFER_HANDLE;
     }
     // Put = RDMA WRITE to a single host, reuse scatter path with 1 host
@@ -3452,7 +3465,7 @@ TransferHandle MPComm::Impl::getAsync(uintptr_t local_addr,
                                 uintptr_t remote_addr,
                                 size_t length) {
     if (length == 0) {
-        fprintf(stderr, "MPComm: GetAsync failed - zero length\n");
+        MPCOMM_LOG_ERROR("MPComm: GetAsync failed - zero length\n");
         return INVALID_TRANSFER_HANDLE;
     }
     // Get = RDMA READ from a single host, reuse gather path with 1 host
@@ -3473,20 +3486,20 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     
     // Validation
     if (!initialized_) {
-        fprintf(stderr, "MPComm: %s failed - not initialized\n", op_name);
+        MPCOMM_LOG_ERROR("MPComm: %s failed - not initialized\n", op_name);
         return INVALID_TRANSFER_HANDLE;
     }
     
     size_t host_count = host_list.size();
     if (host_count == 0 || remote_addrs.size() != host_count ||
         lengths.size() != host_count) {
-        fprintf(stderr, "MPComm: %s failed - invalid arguments\n", op_name);
+        MPCOMM_LOG_ERROR("MPComm: %s failed - invalid arguments\n", op_name);
         return INVALID_TRANSFER_HANDLE;
     }
 
     size_t num_nics = nic_contexts_.size();
     if (num_nics == 0) {
-        fprintf(stderr, "MPComm: %s failed - no NICs available\n", op_name);
+        MPCOMM_LOG_ERROR("MPComm: %s failed - no NICs available\n", op_name);
         return INVALID_TRANSFER_HANDLE;
     }
 
@@ -3499,7 +3512,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     auto ctx = make_numa_unique<TransferContext>(transfer_numa_id);
     ctx->handle = handle_pool_.allocate();
     if (ctx->handle == INVALID_TRANSFER_HANDLE) {
-        fprintf(stderr, "MPComm: %s failed - handle pool exhausted "
+        MPCOMM_LOG_ERROR("MPComm: %s failed - handle pool exhausted "
                 "(all %u handles in use, call releaseTransfer to free handles)\n",
                 op_name, (unsigned)HandlePool::kMaxHandle);
         return INVALID_TRANSFER_HANDLE;
@@ -3603,7 +3616,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     ctx->prep_flowctrl_time = std::chrono::steady_clock::now();
     
     
-    // printf("MPComm: %s queued with %zu chunks across %zu candidate NICs (handle=%lu, numa=%d)\n",
+    // MPCOMM_LOG_INFO("MPComm: %s queued with %zu chunks across %zu candidate NICs (handle=%lu, numa=%d)\n",
     //        op_name, total_chunks, ctx->candidate_nic_indices.size(), ctx->handle, memory_numa_node);
     
     // Fully async mode: submit task to a worker thread via lock-free queue
@@ -3688,12 +3701,12 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
         auto &nic_ctx = *nic_contexts_[nic];
         int n = ibv_poll_cq(nic_ctx.cq, poll_batch_size, wc_array);
         if (n < 0) {
-            fprintf(stderr, "MPComm: ibv_poll_cq failed on NIC %zu in async transfer\n", nic);
+            MPCOMM_LOG_ERROR("MPComm: ibv_poll_cq failed on NIC %zu in async transfer\n", nic);
             return MPCOMM_ERR_TRANSFER;
         }
         for (int i = 0; i < n; ++i) {
             if (wc_array[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "MPComm: WC error on NIC %zu in async transfer: status=%d, wr_id=0x%lx\n",
+                MPCOMM_LOG_ERROR("MPComm: WC error on NIC %zu in async transfer: status=%d, wr_id=0x%lx\n",
                         nic, wc_array[i].status, wc_array[i].wr_id);
                 // Mark error on the transfer that owns this completion
                 TransferHandle wc_handle = WrIdEncoding::decodeHandle(wc_array[i].wr_id);
@@ -3872,25 +3885,25 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
             
             if (transfer_stats_enabled_ && !ctx.timing_breakdown_str.empty()) {
                 // Print timing breakdown first (buffered from worker thread)
-                fputs(ctx.timing_breakdown_str.c_str(), stdout);
-                printf("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
-                printf("%-20s %15s %12s %12s %12s\n", 
+                MPCOMM_LOG_INFO("%s", ctx.timing_breakdown_str.c_str());
+                MPCOMM_LOG_INFO("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
+                MPCOMM_LOG_INFO("%-20s %15s %12s %12s %12s\n", 
                        "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
-                printf("------------------------------------------------------------------------\n");
+                MPCOMM_LOG_INFO("------------------------------------------------------------------------\n");
                 size_t num_nics = nic_contexts_.size();
                 for (size_t nic = 0; nic < num_nics; ++nic) {
                     double share_pct = (total_bytes > 0) ? 
                                        (100.0 * ctx.per_nic_bytes[nic] / total_bytes) : 0.0;
                     double nic_bandwidth_gbps = (ctx.per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
-                    printf("%-20s %15zu %12zu %11.1f%% %12.2f\n",
+                    MPCOMM_LOG_INFO("%-20s %15zu %12zu %11.1f%% %12.2f\n",
                            nic_contexts_[nic]->device_name.c_str(),
                            ctx.per_nic_bytes[nic], ctx.per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
                 }
-                printf("------------------------------------------------------------------------\n");
-                printf("%-20s %15zu %12zu %12s %12.2f\n",
+                MPCOMM_LOG_INFO("------------------------------------------------------------------------\n");
+                MPCOMM_LOG_INFO("%-20s %15zu %12zu %12s %12.2f\n",
                        "Total", total_bytes, ctx.total_chunks.load(), "-", total_bandwidth_gbps);
-                printf("Time: %.2f ms\n", transfer_ms);
-                printf("==============================================================\n\n");
+                MPCOMM_LOG_INFO("Time: %.2f ms\n", transfer_ms);
+                MPCOMM_LOG_INFO("==============================================================\n\n");
             }
         }
         
@@ -3913,7 +3926,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
         CPU_ZERO(&cpuset);
         CPU_SET(cpu_id, &cpuset);
         if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
-            printf("MPComm: Worker %zu (NUMA %d) bound to CPU %d\n", 
+            MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) bound to CPU %d\n", 
                    worker_id, numa_id, cpu_id);
         }
     }
@@ -3921,7 +3934,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     (void)cpu_id;  // Suppress unused parameter warning
 #endif
     
-    printf("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n", 
+    MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n", 
            worker_id, numa_id, static_cast<unsigned long>(pthread_self()));
     
     const size_t kMaxIdleSpins = max_idle_spins_;
@@ -4094,13 +4107,13 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 // Validate lkey, rkey, qp
                 if (lkey == 0 || rkey == 0 || !qp) {
                     if (lkey == 0)
-                        fprintf(stderr, "MPComm: Worker: No lkey for address %p on NIC %zu\n",
+                        MPCOMM_LOG_ERROR("MPComm: Worker: No lkey for address %p on NIC %zu\n",
                                 reinterpret_cast<void *>(chunk.local_addr), best_nic);
                     else if (rkey == 0)
-                        fprintf(stderr, "MPComm: Worker: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
+                        MPCOMM_LOG_ERROR("MPComm: Worker: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
                                 remote_nic, chunk.remote_addr);
                     else
-                        fprintf(stderr, "MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
+                        MPCOMM_LOG_ERROR("MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
                                 best_nic, remote_nic);
                     int err = (lkey == 0) ? MPCOMM_ERR_MEMORY : MPCOMM_ERR_CONNECTION;
                     ctx.error_code.store(err);
@@ -4129,7 +4142,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 struct ibv_send_wr *bad_wr = nullptr;
                 int ret = ibv_post_send(qp, &wr, &bad_wr);
                 if (ret != 0) {
-                    fprintf(stderr, "MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
+                    MPCOMM_LOG_ERROR("MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
                     ctx.error_code.store(MPCOMM_ERR_TRANSFER);
                     ctx.finished.store(true);
                     ctx.end_time = std::chrono::steady_clock::now();
@@ -4233,7 +4246,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
         }
     }
     
-    printf("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
+    MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
 }
 
 void MPComm::Impl::processTransfer(TransferContext& ctx) {
@@ -4403,7 +4416,7 @@ void MPComm::Impl::processTransfer(TransferContext& ctx) {
             }
             
             if (lkey == 0) {
-                fprintf(stderr, "MPComm: Worker: No lkey for address %p on NIC %zu\n",
+                MPCOMM_LOG_ERROR("MPComm: Worker: No lkey for address %p on NIC %zu\n",
                         reinterpret_cast<void *>(chunk.local_addr), best_nic);
                 ctx.error_code.store(MPCOMM_ERR_MEMORY);
                 ctx.finished.store(true);
@@ -4412,7 +4425,7 @@ void MPComm::Impl::processTransfer(TransferContext& ctx) {
             }
             
             if (rkey == 0) {
-                fprintf(stderr, "MPComm: Worker: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
+                MPCOMM_LOG_ERROR("MPComm: Worker: No rkey for remote NIC %zu (remote_addr=0x%lx)\n",
                         remote_nic, chunk.remote_addr);
                 ctx.error_code.store(MPCOMM_ERR_CONNECTION);
                 ctx.finished.store(true);
@@ -4421,7 +4434,7 @@ void MPComm::Impl::processTransfer(TransferContext& ctx) {
             }
             
             if (!qp) {
-                fprintf(stderr, "MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
+                MPCOMM_LOG_ERROR("MPComm: Worker: No QP for local NIC %zu -> remote NIC %zu\n",
                         best_nic, remote_nic);
                 ctx.error_code.store(MPCOMM_ERR_CONNECTION);
                 ctx.finished.store(true);
@@ -4449,7 +4462,7 @@ void MPComm::Impl::processTransfer(TransferContext& ctx) {
             struct ibv_send_wr *bad_wr = nullptr;
             int ret = ibv_post_send(qp, &wr, &bad_wr);
             if (ret != 0) {
-                fprintf(stderr, "MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
+                MPCOMM_LOG_ERROR("MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
                 ctx.error_code.store(MPCOMM_ERR_TRANSFER);
                 ctx.finished.store(true);
                 ctx.end_time = std::chrono::steady_clock::now();
@@ -4611,7 +4624,7 @@ int MPComm::Impl::pollAllNicsForWorker(
         auto &nic_ctx = *nic_contexts_[nic];
         int n = ibv_poll_cq(nic_ctx.cq, poll_batch_size, wc_array);
         if (n < 0) {
-            fprintf(stderr, "MPComm: ibv_poll_cq failed on NIC %zu in worker\n", nic);
+            MPCOMM_LOG_ERROR("MPComm: ibv_poll_cq failed on NIC %zu in worker\n", nic);
             return MPCOMM_ERR_TRANSFER;
         }
         for (int i = 0; i < n; ++i) {
@@ -4652,7 +4665,7 @@ int MPComm::Impl::pollAllNicsForWorker(
             }
             
             if (wc_array[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "MPComm: WC error on NIC %zu in worker: status=%d, wr_id=0x%lx\n",
+                MPCOMM_LOG_ERROR("MPComm: WC error on NIC %zu in worker: status=%d, wr_id=0x%lx\n",
                         nic, wc_array[i].status, wc_array[i].wr_id);
                 target_ctx->error_code.store(MPCOMM_ERR_TRANSFER);
                 target_ctx->finished.store(true);

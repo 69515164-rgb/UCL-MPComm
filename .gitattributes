@@ -1,0 +1,21 @@
+# Set default behavior to automatically normalize line endings
+* text=auto eol=lf
+
+# Ensure shell scripts always use LF (even on Windows checkout)
+*.sh text eol=lf
+
+# Binary files - do not touch
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.so binary
+*.a binary
+*.o binary
+*.dll binary
+*.lib binary
+*.exe binary

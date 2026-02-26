@@ -20,6 +20,7 @@
 #include <linux/limits.h>  // For PATH_MAX
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <numa.h>
 #include <numaif.h>
 #include <pthread.h>
 #include <sched.h>
@@ -81,6 +82,48 @@ namespace mpcomm {
 // in the submit hot path (~0.8 us per call saved).
 static constexpr size_t kMaxNics = 16;
 static constexpr size_t kMaxQPsPerNic = 16;
+
+// =====================================================================
+// NUMA-aware allocation utilities
+// =====================================================================
+
+// Custom deleter that calls destructor + numa_free (for objects allocated
+// via numa_alloc_onnode).  Falls back to plain delete when the object was
+// allocated with operator new (indicated by alloc_bytes == 0).
+template<typename T>
+struct NumaDeleter {
+    size_t alloc_bytes = 0;  // 0 means normal delete
+    void operator()(T* ptr) const noexcept {
+        if (!ptr) return;
+        if (alloc_bytes > 0) {
+            ptr->~T();
+            numa_free(ptr, alloc_bytes);
+        } else {
+            delete ptr;
+        }
+    }
+};
+
+template<typename T>
+using NumaUniquePtr = std::unique_ptr<T, NumaDeleter<T>>;
+
+// Allocate an object of type T on a specific NUMA node using
+// numa_alloc_onnode + placement new.  Returns a NumaUniquePtr with the
+// matching deleter.  If numa_node < 0, falls back to normal allocation.
+template<typename T>
+NumaUniquePtr<T> make_numa_unique(int numa_node) {
+    if (numa_node < 0 || numa_available() < 0) {
+        // Fallback: normal heap allocation (current NUMA policy)
+        return NumaUniquePtr<T>(new T(), NumaDeleter<T>{0});
+    }
+    void* mem = numa_alloc_onnode(sizeof(T), numa_node);
+    if (!mem) {
+        // Fallback on allocation failure
+        return NumaUniquePtr<T>(new T(), NumaDeleter<T>{0});
+    }
+    T* obj = new (mem) T();
+    return NumaUniquePtr<T>(obj, NumaDeleter<T>{sizeof(T)});
+}
 
 struct WrIdEncoding {
     static constexpr uint64_t NIC_SHIFT = 56;
@@ -496,7 +539,7 @@ private:
     size_t max_rdma_transfer_size_;
     size_t qps_per_connection_;
 
-    std::vector<std::unique_ptr<NicContext>> nic_contexts_;
+    std::vector<NumaUniquePtr<NicContext>> nic_contexts_;
 
     std::unordered_map<std::string, ConnectionInfo> connections_;
     mutable std::mutex connections_mutex_;
@@ -509,7 +552,7 @@ private:
 
     // Per-NUMA transfer state to avoid cross-NUMA lock contention
     struct alignas(64) NumaTransferState {
-        std::unordered_map<TransferHandle, std::unique_ptr<TransferContext>> active_transfers;
+        std::unordered_map<TransferHandle, NumaUniquePtr<TransferContext>> active_transfers;
         mutable std::mutex mutex;
     };
     std::array<NumaTransferState, kMaxNumaNodes> per_numa_transfers_;
@@ -567,6 +610,8 @@ private:
 
     bool initialized_;
     bool transfer_stats_enabled_;
+    size_t transfer_stats_interval_;              // Print stats every N transfers (0 = every transfer)
+    std::atomic<size_t> transfer_stats_counter_;  // Global transfer completion counter
 
     std::vector<NumaTopology> numa_topology_;
     std::vector<NicTopologyInfo> nic_topology_;
@@ -588,6 +633,7 @@ static const char* kMaxIdleSpinsEnvVar = "MPCOMM_MAX_IDLE_SPINS";
 static const char* kMaxSendWREnvVar = "MPCOMM_MAX_SEND_WR";
 static const char* kMaxOutstandingPerQPEnvVar = "MPCOMM_MAX_OUTSTANDING_PER_QP";
 static const char* kTransferStatsEnvVar = "MPCOMM_TRANSFER_STATS";
+static const char* kTransferStatsIntervalEnvVar = "MPCOMM_TRANSFER_STATS_INTERVAL";
 
 // Constants for QP setup
 static const uint8_t kMaxHopLimit = 16;
@@ -668,7 +714,9 @@ MPComm::Impl::Impl()
       max_send_wr_(512),
       max_outstanding_per_qp_(256),
       initialized_(false),
-      transfer_stats_enabled_(false) {
+      transfer_stats_enabled_(false),
+      transfer_stats_interval_(0),
+      transfer_stats_counter_(0) {
     // Read max RDMA transfer size from environment variable
     const char* env_val = std::getenv(kMaxRdmaTransferSizeEnvVar);
     if (env_val && env_val[0] != '\0') {
@@ -765,6 +813,23 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kTransferStatsEnvVar);
     if (env_val && env_val[0] != '\0') {
         transfer_stats_enabled_ = (std::string(env_val) == "1" || std::string(env_val) == "true");
+    }
+
+    // Read transfer stats sampling interval from environment variable
+    // When set to N (N > 0), only print stats for every Nth transfer.
+    // Default 0 means print stats for every transfer (original behavior).
+    env_val = std::getenv(kTransferStatsIntervalEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        unsigned long long val = strtoull(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0') {
+            transfer_stats_interval_ = static_cast<size_t>(val);
+            printf("MPComm: Using transfer stats interval from %s: %zu\n",
+                   kTransferStatsIntervalEnvVar, transfer_stats_interval_);
+        } else {
+            fprintf(stderr, "MPComm: Invalid %s value '%s', using default 0 (every transfer)\n",
+                    kTransferStatsIntervalEnvVar, env_val);
+        }
     }
 }
 
@@ -1099,7 +1164,11 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
             if (!found) continue;
         }
 
-        auto ctx = std::make_unique<NicContext>();
+        // Allocate NicContext on the NUMA node where this NIC physically resides.
+        // This ensures the worker thread on that NUMA node accesses local memory
+        // when polling CQ, posting WRs, and reading NIC metadata.
+        int nic_numa = readNicNumaNode(name);
+        auto ctx = make_numa_unique<NicContext>(nic_numa);
         ctx->device_name = name;
         ctx->context = nullptr;
         ctx->pd = nullptr;
@@ -1109,8 +1178,8 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
 
         int ret = setupNicContext(name, *ctx);
         if (ret == 0) {
-            printf("MPComm: Opened device %s, GID=%s\n",
-                   name, gidToString(ctx->gid).c_str());
+            printf("MPComm: Opened device %s, GID=%s (NUMA %d)\n",
+                   name, gidToString(ctx->gid).c_str(), nic_numa);
             nic_contexts_.push_back(std::move(ctx));
         }
     }
@@ -3421,8 +3490,13 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         return INVALID_TRANSFER_HANDLE;
     }
 
-    // Create transfer context
-    auto ctx = std::make_unique<TransferContext>();
+    // Determine NUMA node for this transfer early so we can allocate
+    // TransferContext on the correct NUMA node (avoids cross-NUMA accesses
+    // from the worker thread that processes this transfer).
+    int transfer_numa_id = getNumaForAddr(local_addr);
+
+    // Create transfer context on the target NUMA node
+    auto ctx = make_numa_unique<TransferContext>(transfer_numa_id);
     ctx->handle = handle_pool_.allocate();
     if (ctx->handle == INVALID_TRANSFER_HANDLE) {
         fprintf(stderr, "MPComm: %s failed - handle pool exhausted "
@@ -3477,15 +3551,14 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         ctx->end_time = now;
         
         TransferHandle handle = ctx->handle;
-        int zero_numa = getNumaForAddr(local_addr);
-        ctx->numa_id = zero_numa;
+        ctx->numa_id = transfer_numa_id;
         {
-            std::lock_guard<std::mutex> lock(per_numa_transfers_[zero_numa].mutex);
-            per_numa_transfers_[zero_numa].active_transfers[handle] = std::move(ctx);
+            std::lock_guard<std::mutex> lock(per_numa_transfers_[transfer_numa_id].mutex);
+            per_numa_transfers_[transfer_numa_id].active_transfers[handle] = std::move(ctx);
         }
         {
             std::lock_guard<std::mutex> lock(handle_numa_mutex_);
-            handle_numa_map_[handle] = zero_numa;
+            handle_numa_map_[handle] = transfer_numa_id;
         }
         return handle;
     }
@@ -3537,8 +3610,8 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     // Worker thread will handle all post and poll operations
     TransferHandle handle = ctx->handle;
     
-    // Determine which NUMA node should handle this transfer
-    int numa_id = getNumaForAddr(local_addr);
+    // Use the NUMA node determined earlier (before allocation)
+    int numa_id = transfer_numa_id;
     ctx->numa_id = numa_id;
     
     // Record queued time before moving ctx
@@ -3797,11 +3870,9 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
             }
             double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
             
-            if (transfer_stats_enabled_) {
+            if (transfer_stats_enabled_ && !ctx.timing_breakdown_str.empty()) {
                 // Print timing breakdown first (buffered from worker thread)
-                if (!ctx.timing_breakdown_str.empty()) {
-                    fputs(ctx.timing_breakdown_str.c_str(), stdout);
-                }
+                fputs(ctx.timing_breakdown_str.c_str(), stdout);
                 printf("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
                 printf("%-20s %15s %12s %12s %12s\n", 
                        "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
@@ -4437,7 +4508,12 @@ void MPComm::Impl::processTransfer(TransferContext& ctx) {
     double total_time_us = to_us(ctx.start_time, ctx.end_time);
     double bandwidth_gbps = (total_bytes * 8.0) / (total_time_us * 1000.0);  // Gbps
     
-    if (transfer_stats_enabled_) {
+    // Sampling: only generate stats for every Nth transfer (0 = every transfer)
+    size_t stats_seq = transfer_stats_counter_.fetch_add(1, std::memory_order_relaxed);
+    bool should_print_stats = transfer_stats_enabled_ &&
+        (transfer_stats_interval_ == 0 || (stats_seq % transfer_stats_interval_ == 0));
+
+    if (should_print_stats) {
         // Buffer timing breakdown into ctx.timing_breakdown_str instead of printing directly.
         // This avoids interleaved output from concurrent worker threads.
         // The buffered string will be printed by releaseTransfer() on the user thread.
@@ -4599,6 +4675,10 @@ int MPComm::Impl::pollAllNicsForWorker(
 
 void MPComm::Impl::finalizeTransferStats(TransferContext& ctx) {
     if (!transfer_stats_enabled_) return;
+
+    // Sampling: only generate stats for every Nth transfer (0 = every transfer)
+    size_t stats_seq = transfer_stats_counter_.fetch_add(1, std::memory_order_relaxed);
+    if (transfer_stats_interval_ > 0 && (stats_seq % transfer_stats_interval_ != 0)) return;
     
     auto to_us = [](const std::chrono::steady_clock::time_point& start,
                     const std::chrono::steady_clock::time_point& end) -> double {

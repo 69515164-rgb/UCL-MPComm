@@ -11,9 +11,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_library(IBVERBS_LIBRARY ibverbs REQUIRED)
 find_path(IBVERBS_INCLUDE_DIR infiniband/verbs.h REQUIRED)
 
-# Find numa library (for NUMA topology detection)
+# Find numa library (for NUMA topology detection and NUMA-aware allocation)
 find_library(NUMA_LIBRARY numa REQUIRED)
-find_path(NUMA_INCLUDE_DIR numaif.h REQUIRED)
+find_path(NUMA_INCLUDE_DIR numa.h REQUIRED)
 
 # Vendor-specific options for QP UDP source port modification
 # USE_MLNX: NVIDIA/Mellanox NICs (mlx5dv_modify_qp_udp_sport)

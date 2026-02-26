@@ -122,6 +122,7 @@ struct TransferResult {
  *   MPCOMM_MAX_SEND_WR             - QP send queue depth (default: 512).
  *   MPCOMM_MAX_OUTSTANDING_PER_QP  - Max outstanding WRs per QP (default: 256).
  *   MPCOMM_TRANSFER_STATS          - Enable transfer statistics ("1" or "true").
+ *   MPCOMM_TRANSFER_STATS_INTERVAL - Print stats every N transfers (default: 0 = every transfer).
  */
 class MPComm {
 public:

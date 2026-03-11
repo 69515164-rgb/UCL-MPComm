@@ -59,6 +59,9 @@ Usage:
     # Single specific NUMA node
     python test_mpcomm.py --mode scatter --num-numas 1 --targets target1:192.168.1.100:12345
 
+    # Batch mode: submit multiple async requests per NUMA per iteration
+    python test_mpcomm.py --mode scatter --batch-size 4 --test-mode performance --iterations 10 --targets target1:192.168.1.100:12345
+
     # Explicit buffer info (legacy)
     python test_mpcomm.py --mode scatter --targets target1:192.168.1.100:12345:0x7f1234:12345678
 
@@ -254,6 +257,7 @@ class MPCommTestHarness:
         numa_nodes: List[int],
         performance_mode: bool = False,
         gpu_device: int = -1,
+        batch_size: int = 1,
     ) -> None:
         self.host_id = host_id
         self.device_name = device_name
@@ -264,6 +268,7 @@ class MPCommTestHarness:
         self.performance_mode = performance_mode
         self.gpu_device = gpu_device
         self.use_gpu = gpu_device >= 0
+        self.batch_size = max(1, batch_size)
 
         if min_chunk_size <= 0 or max_chunk_size <= 0:
             raise ValueError("Chunk sizes must be positive integers")
@@ -659,12 +664,17 @@ class MPCommTestHarness:
 
         All operations happen on the main thread.  The C++ async layer
         dispatches work to its own internal worker threads.
+
+        When batch_size > 1, submits batch_size async requests per NUMA
+        buffer per iteration, then waits for all to complete. The total
+        data volume is multiplied by batch_size.
         """
         if plan is None:
             plan = self.build_replication_plan(seed, mode=direction)
 
         host_list = [t.host_id for t in self.targets]
-        total_bytes = sum(plan.lengths) * self.num_numas
+        batch_size = self.batch_size
+        total_bytes = sum(plan.lengths) * self.num_numas * batch_size
         use_polling = poll_interval_us > 0
 
         # Prepare buffers
@@ -678,43 +688,52 @@ class MPCommTestHarness:
                     for offset, length in zip(plan.offsets, plan.lengths):
                         self._clear_chunk(numa_idx, offset, length)
 
-        # Submit all async transfers from main thread
-        handles: List[Tuple[int, int]] = []  # (numa_idx, handle)
+        # Submit batch_size async requests per NUMA buffer from main thread
+        # batch_handles[b] = [(numa_idx, handle), ...] for batch request b
+        batch_handles: List[List[Tuple[int, int]]] = []
         wall_start = time.perf_counter()
 
-        for numa_idx in range(self.num_numas):
-            local_addr = self.local_buffer_addrs[numa_idx]
-            remote_addrs = self.get_remote_addresses_for_numa(numa_idx)
+        for b in range(batch_size):
+            handles_for_batch: List[Tuple[int, int]] = []
+            for numa_idx in range(self.num_numas):
+                local_addr = self.local_buffer_addrs[numa_idx]
+                remote_addrs = self.get_remote_addresses_for_numa(numa_idx)
 
-            if direction == "scatter":
-                handle = self.comm.scatter_async(
-                    local_addr, host_list, remote_addrs, plan.lengths)
-            else:
-                handle = self.comm.gather_async(
-                    local_addr, host_list, remote_addrs, plan.lengths)
+                if direction == "scatter":
+                    handle = self.comm.scatter_async(
+                        local_addr, host_list, remote_addrs, plan.lengths)
+                else:
+                    handle = self.comm.gather_async(
+                        local_addr, host_list, remote_addrs, plan.lengths)
 
-            if handle == mpcomm.INVALID_TRANSFER_HANDLE:
-                # Release already-submitted handles before raising
-                for _, h in handles:
-                    self.comm.release_transfer(h)
-                raise RuntimeError(
-                    f"{direction}_async failed for buffer {numa_idx} "
-                    f"(NUMA {self.numa_nodes[numa_idx]})")
+                if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+                    # Release already-submitted handles before raising
+                    for prev_handles in batch_handles:
+                        for _, h in prev_handles:
+                            self.comm.release_transfer(h)
+                    for _, h in handles_for_batch:
+                        self.comm.release_transfer(h)
+                    raise RuntimeError(
+                        f"{direction}_async failed for buffer {numa_idx} "
+                        f"batch {b} (NUMA {self.numa_nodes[numa_idx]})")
 
-            handles.append((numa_idx, handle))
+                handles_for_batch.append((numa_idx, handle))
+            batch_handles.append(handles_for_batch)
 
         # Wait for all transfers to complete
-        per_numa_results: Dict[int, Dict] = {}
         total_polls = 0
 
         if use_polling:
-            # Polling: round-robin check all handles until all done
-            pending = set(range(len(handles)))
-            poll_counts = {i: 0 for i in range(len(handles))}
+            # Flatten all handles for polling
+            all_handles = [(b, numa_idx, handle)
+                           for b, bh in enumerate(batch_handles)
+                           for numa_idx, handle in bh]
+            pending = set(range(len(all_handles)))
+            poll_counts = {i: 0 for i in range(len(all_handles))}
             while pending:
                 done = set()
                 for i in list(pending):
-                    numa_idx, handle = handles[i]
+                    _, _, handle = all_handles[i]
                     poll_counts[i] += 1
                     if self.comm.is_transfer_complete(handle):
                         done.add(i)
@@ -724,40 +743,44 @@ class MPCommTestHarness:
             total_polls = sum(poll_counts.values())
         else:
             # Blocking wait for each handle
-            for numa_idx, handle in handles:
-                ret = self.comm.wait_transfer(handle, timeout_ms)
-                if ret != 0:
-                    # Release all handles before raising
-                    for _, h in handles:
-                        self.comm.release_transfer(h)
-                    raise RuntimeError(
-                        f"wait_transfer failed for buffer {numa_idx} "
-                        f"(NUMA {self.numa_nodes[numa_idx]}): {ret}")
+            for b_handles in batch_handles:
+                for numa_idx, handle in b_handles:
+                    ret = self.comm.wait_transfer(handle, timeout_ms)
+                    if ret != 0:
+                        # Release all handles before raising
+                        for bh in batch_handles:
+                            for _, h in bh:
+                                self.comm.release_transfer(h)
+                        raise RuntimeError(
+                            f"wait_transfer failed for buffer {numa_idx} "
+                            f"(NUMA {self.numa_nodes[numa_idx]}): {ret}")
 
         wall_duration = time.perf_counter() - wall_start
 
-        # Collect results and release handles
-        for numa_idx, handle in handles:
-            result = self.comm.get_transfer_result(handle)
-            self.comm.release_transfer(handle)
-            if result["error_code"] != 0:
-                raise RuntimeError(
-                    f"Transfer error on buffer {numa_idx} "
-                    f"(NUMA {self.numa_nodes[numa_idx]}): {result['error_code']}")
-            per_numa_results[numa_idx] = {
-                "elapsed_ms": result["elapsed_ms"],
-            }
+        # Collect per-NUMA results: take max elapsed_ms across all batch requests
+        per_numa_max_ms: Dict[int, float] = {i: 0.0 for i in range(self.num_numas)}
+        for b_handles in batch_handles:
+            for numa_idx, handle in b_handles:
+                result = self.comm.get_transfer_result(handle)
+                self.comm.release_transfer(handle)
+                if result["error_code"] != 0:
+                    raise RuntimeError(
+                        f"Transfer error on buffer {numa_idx} "
+                        f"(NUMA {self.numa_nodes[numa_idx]}): {result['error_code']}")
+                elapsed = result["elapsed_ms"]
+                if elapsed > per_numa_max_ms[numa_idx]:
+                    per_numa_max_ms[numa_idx] = elapsed
 
         per_numa_durations = [
-            per_numa_results.get(i, {}).get("elapsed_ms", 0) / 1000.0
+            per_numa_max_ms.get(i, 0) / 1000.0
             for i in range(self.num_numas)
         ]
 
         if use_polling:
             print(f"  [async polling] completed after {total_polls} total polls")
 
-        # Verification
-        if verify:
+        # Verification (only meaningful for batch_size=1 since batch>1 overwrites same buffer)
+        if verify and batch_size == 1:
             for numa_idx in range(self.num_numas):
                 if direction == "scatter":
                     self._verify_scatter(numa_idx, plan)
@@ -793,8 +816,9 @@ class MPCommTestHarness:
             plan = self.build_broadcast_plan(seed)
 
         host_list = [t.host_id for t in self.targets]
-        # Total bytes = length * num_targets * num_numas
-        total_bytes = plan.length * len(self.targets) * self.num_numas
+        batch_size = self.batch_size
+        # Total bytes = length * num_targets * num_numas * batch_size
+        total_bytes = plan.length * len(self.targets) * self.num_numas * batch_size
         use_polling = poll_interval_us > 0
 
         # Prepare buffers – write the broadcast payload at offset 0
@@ -802,37 +826,45 @@ class MPCommTestHarness:
             if prepare_payload and plan.payload:
                 self._write_chunk(numa_idx, 0, plan.payload)
 
-        # Submit one broadcast_async per NUMA buffer
-        handles: List[Tuple[int, int]] = []  # (numa_idx, handle)
+        # Submit batch_size broadcast_async requests per NUMA buffer
+        batch_handles: List[List[Tuple[int, int]]] = []
         wall_start = time.perf_counter()
 
-        for numa_idx in range(self.num_numas):
-            local_addr = self.local_buffer_addrs[numa_idx]
-            remote_addrs = self.get_remote_addresses_for_numa(numa_idx)
+        for b in range(batch_size):
+            handles_for_batch: List[Tuple[int, int]] = []
+            for numa_idx in range(self.num_numas):
+                local_addr = self.local_buffer_addrs[numa_idx]
+                remote_addrs = self.get_remote_addresses_for_numa(numa_idx)
 
-            handle = self.comm.broadcast_async(
-                local_addr, plan.length, host_list, remote_addrs)
+                handle = self.comm.broadcast_async(
+                    local_addr, plan.length, host_list, remote_addrs)
 
-            if handle == mpcomm.INVALID_TRANSFER_HANDLE:
-                for _, h in handles:
-                    self.comm.release_transfer(h)
-                raise RuntimeError(
-                    f"broadcast_async failed for buffer {numa_idx} "
-                    f"(NUMA {self.numa_nodes[numa_idx]})")
+                if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+                    for prev_handles in batch_handles:
+                        for _, h in prev_handles:
+                            self.comm.release_transfer(h)
+                    for _, h in handles_for_batch:
+                        self.comm.release_transfer(h)
+                    raise RuntimeError(
+                        f"broadcast_async failed for buffer {numa_idx} "
+                        f"batch {b} (NUMA {self.numa_nodes[numa_idx]})")
 
-            handles.append((numa_idx, handle))
+                handles_for_batch.append((numa_idx, handle))
+            batch_handles.append(handles_for_batch)
 
         # Wait for completion
-        per_numa_results: Dict[int, Dict] = {}
         total_polls = 0
 
         if use_polling:
-            pending = set(range(len(handles)))
-            poll_counts = {i: 0 for i in range(len(handles))}
+            all_handles = [(b, numa_idx, handle)
+                           for b, bh in enumerate(batch_handles)
+                           for numa_idx, handle in bh]
+            pending = set(range(len(all_handles)))
+            poll_counts = {i: 0 for i in range(len(all_handles))}
             while pending:
                 done = set()
                 for i in list(pending):
-                    numa_idx, handle = handles[i]
+                    _, _, handle = all_handles[i]
                     poll_counts[i] += 1
                     if self.comm.is_transfer_complete(handle):
                         done.add(i)
@@ -841,39 +873,43 @@ class MPCommTestHarness:
                     time.sleep(poll_interval_us / 1_000_000)
             total_polls = sum(poll_counts.values())
         else:
-            for numa_idx, handle in handles:
-                ret = self.comm.wait_transfer(handle, timeout_ms)
-                if ret != 0:
-                    for _, h in handles:
-                        self.comm.release_transfer(h)
-                    raise RuntimeError(
-                        f"wait_transfer failed for buffer {numa_idx} "
-                        f"(NUMA {self.numa_nodes[numa_idx]}): {ret}")
+            for b_handles in batch_handles:
+                for numa_idx, handle in b_handles:
+                    ret = self.comm.wait_transfer(handle, timeout_ms)
+                    if ret != 0:
+                        for bh in batch_handles:
+                            for _, h in bh:
+                                self.comm.release_transfer(h)
+                        raise RuntimeError(
+                            f"wait_transfer failed for buffer {numa_idx} "
+                            f"(NUMA {self.numa_nodes[numa_idx]}): {ret}")
 
         wall_duration = time.perf_counter() - wall_start
 
-        # Collect results and release handles
-        for numa_idx, handle in handles:
-            result = self.comm.get_transfer_result(handle)
-            self.comm.release_transfer(handle)
-            if result["error_code"] != 0:
-                raise RuntimeError(
-                    f"Transfer error on buffer {numa_idx} "
-                    f"(NUMA {self.numa_nodes[numa_idx]}): {result['error_code']}")
-            per_numa_results[numa_idx] = {
-                "elapsed_ms": result["elapsed_ms"],
-            }
+        # Collect per-NUMA results: take max elapsed_ms across all batch requests
+        per_numa_max_ms: Dict[int, float] = {i: 0.0 for i in range(self.num_numas)}
+        for b_handles in batch_handles:
+            for numa_idx, handle in b_handles:
+                result = self.comm.get_transfer_result(handle)
+                self.comm.release_transfer(handle)
+                if result["error_code"] != 0:
+                    raise RuntimeError(
+                        f"Transfer error on buffer {numa_idx} "
+                        f"(NUMA {self.numa_nodes[numa_idx]}): {result['error_code']}")
+                elapsed = result["elapsed_ms"]
+                if elapsed > per_numa_max_ms[numa_idx]:
+                    per_numa_max_ms[numa_idx] = elapsed
 
         per_numa_durations = [
-            per_numa_results.get(i, {}).get("elapsed_ms", 0) / 1000.0
+            per_numa_max_ms.get(i, 0) / 1000.0
             for i in range(self.num_numas)
         ]
 
         if use_polling:
             print(f"  [async polling] completed after {total_polls} total polls")
 
-        # Verification: read back from each target and compare
-        if verify:
+        # Verification (only meaningful for batch_size=1)
+        if verify and batch_size == 1:
             for numa_idx in range(self.num_numas):
                 self._verify_broadcast(numa_idx, plan)
 
@@ -1022,6 +1058,7 @@ class MPCommTestHarness:
         rng = random.Random(seed)
         length = rng.randint(self.min_chunk_size, self.max_chunk_size)
         target = self.targets[rng.randint(0, len(self.targets) - 1)]
+        batch_size = self.batch_size
         use_polling = poll_interval_us > 0
 
         # Build expected payload
@@ -1029,75 +1066,89 @@ class MPCommTestHarness:
         if not self.performance_mode:
             payload = self._base_buffer_pattern[:length]
 
-        total_bytes = length * self.num_numas
+        total_bytes = length * self.num_numas * batch_size
 
         # Prepare buffers
         for numa_idx in range(self.num_numas):
             if prepare_payload and payload:
                 self._write_chunk(numa_idx, 0, payload)
 
-        # Submit put_async for each NUMA buffer
-        handles: List[Tuple[int, int]] = []
+        # Submit batch_size put_async requests per NUMA buffer
+        batch_handles: List[List[Tuple[int, int]]] = []
         wall_start = time.perf_counter()
 
-        for numa_idx in range(self.num_numas):
-            local_addr = self.local_buffer_addrs[numa_idx]
-            if target.remote_buffers:
-                buf = target.get_buffer_for_numa(self.numa_nodes[numa_idx])
-                remote_addr = buf['addr']
-            else:
-                remote_addr = target.remote_addr
+        for b in range(batch_size):
+            handles_for_batch: List[Tuple[int, int]] = []
+            for numa_idx in range(self.num_numas):
+                local_addr = self.local_buffer_addrs[numa_idx]
+                if target.remote_buffers:
+                    buf = target.get_buffer_for_numa(self.numa_nodes[numa_idx])
+                    remote_addr = buf['addr']
+                else:
+                    remote_addr = target.remote_addr
 
-            handle = self.comm.put_async(
-                local_addr, target.host_id, remote_addr, length)
+                handle = self.comm.put_async(
+                    local_addr, target.host_id, remote_addr, length)
 
-            if handle == mpcomm.INVALID_TRANSFER_HANDLE:
-                for _, h in handles:
-                    self.comm.release_transfer(h)
-                raise RuntimeError(
-                    f"put_async failed for buffer {numa_idx} "
-                    f"(NUMA {self.numa_nodes[numa_idx]})")
-            handles.append((numa_idx, handle))
+                if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+                    for prev_handles in batch_handles:
+                        for _, h in prev_handles:
+                            self.comm.release_transfer(h)
+                    for _, h in handles_for_batch:
+                        self.comm.release_transfer(h)
+                    raise RuntimeError(
+                        f"put_async failed for buffer {numa_idx} "
+                        f"batch {b} (NUMA {self.numa_nodes[numa_idx]})")
+                handles_for_batch.append((numa_idx, handle))
+            batch_handles.append(handles_for_batch)
 
         # Wait for completion
-        per_numa_results: Dict[int, Dict] = {}
         if use_polling:
-            pending = set(range(len(handles)))
+            all_handles = [(b, numa_idx, handle)
+                           for b, bh in enumerate(batch_handles)
+                           for numa_idx, handle in bh]
+            pending = set(range(len(all_handles)))
             while pending:
                 done = set()
                 for i in list(pending):
-                    _, handle = handles[i]
+                    _, _, handle = all_handles[i]
                     if self.comm.is_transfer_complete(handle):
                         done.add(i)
                 pending -= done
                 if pending:
                     time.sleep(poll_interval_us / 1_000_000)
         else:
-            for numa_idx, handle in handles:
-                ret = self.comm.wait_transfer(handle, timeout_ms)
-                if ret != 0:
-                    for _, h in handles:
-                        self.comm.release_transfer(h)
-                    raise RuntimeError(
-                        f"wait_transfer failed for put buffer {numa_idx}: {ret}")
+            for b_handles in batch_handles:
+                for numa_idx, handle in b_handles:
+                    ret = self.comm.wait_transfer(handle, timeout_ms)
+                    if ret != 0:
+                        for bh in batch_handles:
+                            for _, h in bh:
+                                self.comm.release_transfer(h)
+                        raise RuntimeError(
+                            f"wait_transfer failed for put buffer {numa_idx}: {ret}")
 
         wall_duration = time.perf_counter() - wall_start
 
-        for numa_idx, handle in handles:
-            result = self.comm.get_transfer_result(handle)
-            self.comm.release_transfer(handle)
-            if result["error_code"] != 0:
-                raise RuntimeError(
-                    f"Put transfer error on buffer {numa_idx}: {result['error_code']}")
-            per_numa_results[numa_idx] = {"elapsed_ms": result["elapsed_ms"]}
+        per_numa_max_ms: Dict[int, float] = {i: 0.0 for i in range(self.num_numas)}
+        for b_handles in batch_handles:
+            for numa_idx, handle in b_handles:
+                result = self.comm.get_transfer_result(handle)
+                self.comm.release_transfer(handle)
+                if result["error_code"] != 0:
+                    raise RuntimeError(
+                        f"Put transfer error on buffer {numa_idx}: {result['error_code']}")
+                elapsed = result["elapsed_ms"]
+                if elapsed > per_numa_max_ms[numa_idx]:
+                    per_numa_max_ms[numa_idx] = elapsed
 
         per_numa_durations = [
-            per_numa_results.get(i, {}).get("elapsed_ms", 0) / 1000.0
+            per_numa_max_ms.get(i, 0) / 1000.0
             for i in range(self.num_numas)
         ]
 
-        # Verify: read back from remote via get_async and compare
-        if verify:
+        # Verify: read back from remote via get_async and compare (only for batch_size=1)
+        if verify and batch_size == 1:
             for numa_idx in range(self.num_numas):
                 self._verify_put(numa_idx, target, length, payload)
 
@@ -1127,77 +1178,92 @@ class MPCommTestHarness:
         rng = random.Random(seed)
         length = rng.randint(self.min_chunk_size, self.max_chunk_size)
         target = self.targets[rng.randint(0, len(self.targets) - 1)]
+        batch_size = self.batch_size
         use_polling = poll_interval_us > 0
 
-        total_bytes = length * self.num_numas
+        total_bytes = length * self.num_numas * batch_size
 
         # Clear local buffers before get
         for numa_idx in range(self.num_numas):
             if prepare_payload:
                 self._clear_chunk(numa_idx, 0, length)
 
-        # Submit get_async for each NUMA buffer
-        handles: List[Tuple[int, int]] = []
+        # Submit batch_size get_async requests per NUMA buffer
+        batch_handles: List[List[Tuple[int, int]]] = []
         wall_start = time.perf_counter()
 
-        for numa_idx in range(self.num_numas):
-            local_addr = self.local_buffer_addrs[numa_idx]
-            if target.remote_buffers:
-                buf = target.get_buffer_for_numa(self.numa_nodes[numa_idx])
-                remote_addr = buf['addr']
-            else:
-                remote_addr = target.remote_addr
+        for b in range(batch_size):
+            handles_for_batch: List[Tuple[int, int]] = []
+            for numa_idx in range(self.num_numas):
+                local_addr = self.local_buffer_addrs[numa_idx]
+                if target.remote_buffers:
+                    buf = target.get_buffer_for_numa(self.numa_nodes[numa_idx])
+                    remote_addr = buf['addr']
+                else:
+                    remote_addr = target.remote_addr
 
-            handle = self.comm.get_async(
-                local_addr, target.host_id, remote_addr, length)
+                handle = self.comm.get_async(
+                    local_addr, target.host_id, remote_addr, length)
 
-            if handle == mpcomm.INVALID_TRANSFER_HANDLE:
-                for _, h in handles:
-                    self.comm.release_transfer(h)
-                raise RuntimeError(
-                    f"get_async failed for buffer {numa_idx} "
-                    f"(NUMA {self.numa_nodes[numa_idx]})")
-            handles.append((numa_idx, handle))
+                if handle == mpcomm.INVALID_TRANSFER_HANDLE:
+                    for prev_handles in batch_handles:
+                        for _, h in prev_handles:
+                            self.comm.release_transfer(h)
+                    for _, h in handles_for_batch:
+                        self.comm.release_transfer(h)
+                    raise RuntimeError(
+                        f"get_async failed for buffer {numa_idx} "
+                        f"batch {b} (NUMA {self.numa_nodes[numa_idx]})")
+                handles_for_batch.append((numa_idx, handle))
+            batch_handles.append(handles_for_batch)
 
         # Wait for completion
-        per_numa_results: Dict[int, Dict] = {}
         if use_polling:
-            pending = set(range(len(handles)))
+            all_handles = [(b, numa_idx, handle)
+                           for b, bh in enumerate(batch_handles)
+                           for numa_idx, handle in bh]
+            pending = set(range(len(all_handles)))
             while pending:
                 done = set()
                 for i in list(pending):
-                    _, handle = handles[i]
+                    _, _, handle = all_handles[i]
                     if self.comm.is_transfer_complete(handle):
                         done.add(i)
                 pending -= done
                 if pending:
                     time.sleep(poll_interval_us / 1_000_000)
         else:
-            for numa_idx, handle in handles:
-                ret = self.comm.wait_transfer(handle, timeout_ms)
-                if ret != 0:
-                    for _, h in handles:
-                        self.comm.release_transfer(h)
-                    raise RuntimeError(
-                        f"wait_transfer failed for get buffer {numa_idx}: {ret}")
+            for b_handles in batch_handles:
+                for numa_idx, handle in b_handles:
+                    ret = self.comm.wait_transfer(handle, timeout_ms)
+                    if ret != 0:
+                        for bh in batch_handles:
+                            for _, h in bh:
+                                self.comm.release_transfer(h)
+                        raise RuntimeError(
+                            f"wait_transfer failed for get buffer {numa_idx}: {ret}")
 
         wall_duration = time.perf_counter() - wall_start
 
-        for numa_idx, handle in handles:
-            result = self.comm.get_transfer_result(handle)
-            self.comm.release_transfer(handle)
-            if result["error_code"] != 0:
-                raise RuntimeError(
-                    f"Get transfer error on buffer {numa_idx}: {result['error_code']}")
-            per_numa_results[numa_idx] = {"elapsed_ms": result["elapsed_ms"]}
+        per_numa_max_ms: Dict[int, float] = {i: 0.0 for i in range(self.num_numas)}
+        for b_handles in batch_handles:
+            for numa_idx, handle in b_handles:
+                result = self.comm.get_transfer_result(handle)
+                self.comm.release_transfer(handle)
+                if result["error_code"] != 0:
+                    raise RuntimeError(
+                        f"Get transfer error on buffer {numa_idx}: {result['error_code']}")
+                elapsed = result["elapsed_ms"]
+                if elapsed > per_numa_max_ms[numa_idx]:
+                    per_numa_max_ms[numa_idx] = elapsed
 
         per_numa_durations = [
-            per_numa_results.get(i, {}).get("elapsed_ms", 0) / 1000.0
+            per_numa_max_ms.get(i, 0) / 1000.0
             for i in range(self.num_numas)
         ]
 
-        # Verify: compare local data with expected remote pattern
-        if verify:
+        # Verify: compare local data with expected remote pattern (only for batch_size=1)
+        if verify and batch_size == 1:
             for numa_idx in range(self.num_numas):
                 self._verify_get(numa_idx, target, length)
 
@@ -1372,6 +1438,10 @@ Examples:
     # Single specific NUMA node
     python test_mpcomm.py --mode scatter --num-numas 1 --targets target1:192.168.1.100:12345
 
+    # Batch mode (multiple concurrent async requests per NUMA per iteration)
+    python test_mpcomm.py --mode scatter --batch-size 4 --test-mode performance --iterations 10 \\
+        --targets target1:192.168.1.100:12345
+
     # Multiple targets
     python test_mpcomm.py --mode both \\
         --targets target1:192.168.1.100:12345 \\
@@ -1489,6 +1559,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of async requests per NUMA per iteration (default: 1)",
+    )
+
+    parser.add_argument(
         "--async-mode",
         choices=["wait", "polling"],
         default="wait",
@@ -1560,9 +1637,12 @@ def run_tests(
 
     perf_tracker = PerformanceTracker() if is_perf else None
 
+    batch_size = harness.batch_size
     mode_tag = f"{harness.num_numas}-NUMA"
     if harness.use_gpu:
         mode_tag = f"GPU:{harness.gpu_device}"
+    if batch_size > 1:
+        mode_tag += f", batch={batch_size}"
     completion = "polling" if poll_us > 0 else "wait"
 
     # --- Scatter / Gather tests (share ReplicationPlan) ---
@@ -1745,7 +1825,7 @@ def main() -> None:
     is_performance_mode = args.test_mode == "performance"
 
     print(f"[test] NUMA nodes: {numa_nodes}, GPU: {gpu_device}, "
-          f"async-mode: {args.async_mode}")
+          f"batch-size: {args.batch_size}, async-mode: {args.async_mode}")
 
     harness = MPCommTestHarness(
         host_id=args.host_id,
@@ -1757,6 +1837,7 @@ def main() -> None:
         numa_nodes=numa_nodes,
         performance_mode=is_performance_mode,
         gpu_device=gpu_device,
+        batch_size=args.batch_size,
     )
 
     try:

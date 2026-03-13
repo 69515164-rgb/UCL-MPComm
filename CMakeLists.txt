@@ -180,17 +180,6 @@ if(BUILD_MPCOMM_PYTHON)
         ${Python3_LIBRARIES}
     )
 
-    # Get Python site-packages path
-    execute_process(
-        COMMAND ${Python3_EXECUTABLE} -c "import site; print(site.getsitepackages()[0])"
-        OUTPUT_VARIABLE PYTHON_SITE_PACKAGES
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-
-    # Install Python module
-    install(TARGETS mpcomm_py
-        LIBRARY DESTINATION ${PYTHON_SITE_PACKAGES}
-    )
 endif()
 
 # Example executable (optional)

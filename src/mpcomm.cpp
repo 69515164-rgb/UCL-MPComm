@@ -4107,8 +4107,8 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                                 best_nic, remote_nic);
                     int err = (lkey == 0) ? MPCOMM_ERR_MEMORY : MPCOMM_ERR_CONNECTION;
                     ctx.error_code.store(err);
-                    ctx.finished.store(true);
                     ctx.end_time = std::chrono::steady_clock::now();
+                    ctx.finished.store(true);  // Must be last write to ctx (release fence)
                     break;  // Skip this context, will be removed in Phase 4
                 }
                 
@@ -4134,8 +4134,8 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 if (ret != 0) {
                     MPCOMM_LOG_ERROR("MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
                     ctx.error_code.store(MPCOMM_ERR_TRANSFER);
-                    ctx.finished.store(true);
                     ctx.end_time = std::chrono::steady_clock::now();
+                    ctx.finished.store(true);  // Must be last write to ctx (release fence)
                     break;
                 }
                 
@@ -4181,8 +4181,8 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 for (auto& ac : active_contexts) {
                     if (!ac.ctx->finished.load()) {
                         ac.ctx->error_code.store(poll_ret);
-                        ac.ctx->finished.store(true);
                         ac.ctx->end_time = std::chrono::steady_clock::now();
+                        ac.ctx->finished.store(true);  // Must be last write to ctx (release fence)
                     }
                 }
                 active_contexts.clear();
@@ -4209,10 +4209,10 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 if (ctx.next_chunk_idx.load() >= total_chunks &&
                     ctx.total_completed.load() >= total_chunks) {
                     // All chunks posted and completed — mark finished
-                    ctx.finished.store(true);
                     ctx.error_code.store(MPCOMM_SUCCESS);
                     ctx.end_time = std::chrono::steady_clock::now();
                     finalizeTransferStats(ctx);
+                    ctx.finished.store(true);  // Must be last write to ctx (release fence)
                     active_contexts.erase(active_contexts.begin() + i);
                     any_removed = true;
                     continue;

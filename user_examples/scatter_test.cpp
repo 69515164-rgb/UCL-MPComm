@@ -1,6 +1,7 @@
-// MPComm C++ Scatter Performance Test
+// MPComm C++ Scatter / Gather / Broadcast Performance Test
 //
-// Demonstrates scatter_async API usage with DRAM and HBM (GPU) memory.
+// Demonstrates scatter_async, gather_async, and broadcast_async API usage
+// with DRAM and HBM (GPU) memory.
 // Supports both initiator and target modes in a single binary.
 // No data correctness verification — purely performance-oriented.
 //
@@ -28,6 +29,12 @@
 //
 //   # Multi-NUMA initiator (dual NUMA buffers, each NUMA sends via its local NICs):
 //   ./scatter_test --target t1:10.0.0.1:12345 --target t2:10.0.0.2:12345 --num-numas 0,1
+//
+//   # Run specific test types (default: all):
+//   ./scatter_test --target t1:10.0.0.1:12345 --test-type scatter
+//   ./scatter_test --target t1:10.0.0.1:12345 --test-type gather
+//   ./scatter_test --target t1:10.0.0.1:12345 --test-type broadcast
+//   ./scatter_test --target t1:10.0.0.1:12345 --test-type scatter,gather,broadcast
 
 #include <mpcomm.h>
 
@@ -49,6 +56,25 @@
 #endif
 
 using namespace mpcomm;
+
+// =====================================================================
+// Transfer operation type
+// =====================================================================
+
+enum class TestOpType {
+    SCATTER = 0,
+    GATHER,
+    BROADCAST,
+};
+
+static const char *opTypeName(TestOpType op) {
+    switch (op) {
+        case TestOpType::SCATTER:   return "scatter";
+        case TestOpType::GATHER:    return "gather";
+        case TestOpType::BROADCAST: return "broadcast";
+    }
+    return "unknown";
+}
 
 // =====================================================================
 // Signal handling for target mode graceful shutdown
@@ -93,6 +119,7 @@ struct TestConfig {
     int gpu_device = -1;               // -1 = CPU only
     bool run_both = false;             // run both DRAM and HBM
     std::vector<int> initiator_numas;  // NUMA nodes for initiator buffers
+    std::vector<TestOpType> test_types; // which operations to benchmark
 
     // --- Target mode ---
     size_t target_buffer_size = 2ULL * 1024 * 1024 * 1024;  // 2 GB default
@@ -177,6 +204,8 @@ static void printUsage(const char *prog) {
     printf("  --batch-size N               Async requests per batch (default: 1)\n");
     printf("  --gpu DEVICE_ID              GPU device for HBM test (default: -1, CPU only)\n");
     printf("  --both                       Run both DRAM and HBM tests\n");
+    printf("  --test-type TYPES            Comma-separated test types: scatter,gather,broadcast\n");
+    printf("                               (default: all three)\n");
     printf("\nExamples:\n");
     printf("  # Target (remote host):\n");
     printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G\n", prog);
@@ -245,6 +274,23 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
             cfg.gpu_device = std::stoi(argv[++i]);
         } else if (arg == "--both") {
             cfg.run_both = true;
+        } else if (arg == "--test-type" && i + 1 < argc) {
+            std::string types_str = argv[++i];
+            std::istringstream tss(types_str);
+            std::string token;
+            while (std::getline(tss, token, ',')) {
+                if (token == "scatter") {
+                    cfg.test_types.push_back(TestOpType::SCATTER);
+                } else if (token == "gather") {
+                    cfg.test_types.push_back(TestOpType::GATHER);
+                } else if (token == "broadcast") {
+                    cfg.test_types.push_back(TestOpType::BROADCAST);
+                } else {
+                    fprintf(stderr, "Error: unknown test type '%s' "
+                            "(must be scatter, gather, or broadcast)\n", token.c_str());
+                    return false;
+                }
+            }
         } else if (arg == "--verbose" || arg == "-v") {
             cfg.verbose = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -265,6 +311,11 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
         }
         if (cfg.initiator_numas.empty()) {
             cfg.initiator_numas.push_back(0);
+        }
+        if (cfg.test_types.empty()) {
+            cfg.test_types.push_back(TestOpType::SCATTER);
+            cfg.test_types.push_back(TestOpType::GATHER);
+            cfg.test_types.push_back(TestOpType::BROADCAST);
         }
     } else {
         // Target mode defaults
@@ -526,7 +577,8 @@ target_cleanup:
 }
 
 // =====================================================================
-// Scatter performance benchmark (multi-NUMA aware)
+// Transfer performance benchmark (multi-NUMA aware)
+// Supports scatter, gather, and broadcast operations.
 // =====================================================================
 
 // Per-NUMA buffer info for initiator
@@ -536,9 +588,33 @@ struct InitiatorNumaBuffer {
     int numa_node = -1;
 };
 
-static int runScatterBenchmark(
+// Helper: issue a single async transfer based on the operation type
+static TransferHandle issueTransferAsync(
+    MPComm &comm,
+    TestOpType op,
+    uintptr_t local_addr,
+    const std::vector<std::string> &host_list,
+    const std::vector<uintptr_t> &remote_addrs,
+    const std::vector<size_t> &lengths)
+{
+    switch (op) {
+        case TestOpType::SCATTER:
+            return comm.scatterAsync(local_addr, host_list, remote_addrs, lengths);
+        case TestOpType::GATHER:
+            return comm.gatherAsync(local_addr, host_list, remote_addrs, lengths);
+        case TestOpType::BROADCAST:
+            // broadcastAsync uses a single length (same data to all targets)
+            // Use the first element of lengths as the broadcast length.
+            if (lengths.empty()) return INVALID_TRANSFER_HANDLE;
+            return comm.broadcastAsync(local_addr, lengths[0], host_list, remote_addrs);
+    }
+    return INVALID_TRANSFER_HANDLE;
+}
+
+static int runTransferBenchmark(
     MPComm &comm,
     const TestConfig &cfg,
+    TestOpType op_type,
     const std::vector<InitiatorNumaBuffer> &numa_buffers,
     const std::vector<std::string> &host_list,
     // per-NUMA remote addresses: remote_addrs_per_numa[numa_idx][target_idx]
@@ -546,13 +622,38 @@ static int runScatterBenchmark(
     const std::vector<size_t> &lengths,
     const char *mem_type_label)
 {
+    const char *op_name_upper = "";
+    const char *op_direction = "";
+    switch (op_type) {
+        case TestOpType::SCATTER:
+            op_name_upper = "Scatter";
+            op_direction = "local -> remote";
+            break;
+        case TestOpType::GATHER:
+            op_name_upper = "Gather";
+            op_direction = "remote -> local";
+            break;
+        case TestOpType::BROADCAST:
+            op_name_upper = "Broadcast";
+            op_direction = "local -> all remotes (same data)";
+            break;
+    }
+
+    // For broadcast, the effective per-NUMA size is length * num_targets
+    // (same data sent to each target), but the "data moved" is length * num_targets.
     size_t per_numa_size = 0;
-    for (size_t l : lengths) per_numa_size += l;
+    if (op_type == TestOpType::BROADCAST) {
+        // Broadcast sends the same block to all targets
+        per_numa_size = (lengths.empty() ? 0 : lengths[0]) * host_list.size();
+    } else {
+        for (size_t l : lengths) per_numa_size += l;
+    }
     size_t total_size = per_numa_size * numa_buffers.size();
     size_t num_numas = numa_buffers.size();
 
     printf("\n========================================\n");
-    printf(" Scatter Performance: %s\n", mem_type_label);
+    printf(" %s Performance: %s\n", op_name_upper, mem_type_label);
+    printf(" Direction: %s\n", op_direction);
     printf(" Targets: %zu\n", host_list.size());
     printf(" Per-target size: %zu bytes (%.2f MB)\n",
            cfg.buffer_size, cfg.buffer_size / 1e6);
@@ -575,16 +676,17 @@ static int runScatterBenchmark(
     // ---- Warmup ----
     printf("Warming up (%d iterations)...\n", cfg.warmup);
     for (int i = 0; i < cfg.warmup; ++i) {
-        // Submit one scatterAsync per NUMA
+        // Submit one async transfer per NUMA
         std::vector<TransferHandle> handles;
         handles.reserve(num_numas);
         for (size_t n = 0; n < num_numas; ++n) {
             uintptr_t local_addr = reinterpret_cast<uintptr_t>(numa_buffers[n].ptr);
-            TransferHandle handle = comm.scatterAsync(
-                local_addr, host_list, remote_addrs_per_numa[n], lengths);
+            TransferHandle handle = issueTransferAsync(
+                comm, op_type, local_addr, host_list,
+                remote_addrs_per_numa[n], lengths);
             if (handle == INVALID_TRANSFER_HANDLE) {
-                fprintf(stderr, "scatterAsync failed during warmup (NUMA %d)\n",
-                        numa_buffers[n].numa_node);
+                fprintf(stderr, "%sAsync failed during warmup (NUMA %d)\n",
+                        op_name_upper, numa_buffers[n].numa_node);
                 for (auto h : handles) comm.releaseTransfer(h);
                 return 1;
             }
@@ -631,11 +733,12 @@ static int runScatterBenchmark(
             batch_handles[b].reserve(num_numas);
             for (size_t n = 0; n < num_numas; ++n) {
                 uintptr_t local_addr = reinterpret_cast<uintptr_t>(numa_buffers[n].ptr);
-                TransferHandle handle = comm.scatterAsync(
-                    local_addr, host_list, remote_addrs_per_numa[n], lengths);
+                TransferHandle handle = issueTransferAsync(
+                    comm, op_type, local_addr, host_list,
+                    remote_addrs_per_numa[n], lengths);
                 if (handle == INVALID_TRANSFER_HANDLE) {
-                    fprintf(stderr, "scatterAsync failed at iter %d, batch %d (NUMA %d)\n",
-                            iter, b, numa_buffers[n].numa_node);
+                    fprintf(stderr, "%sAsync failed at iter %d, batch %d (NUMA %d)\n",
+                            op_name_upper, iter, b, numa_buffers[n].numa_node);
                     // Cleanup already-submitted handles
                     for (int bb = 0; bb <= b; ++bb) {
                         for (auto h : batch_handles[bb]) {
@@ -747,8 +850,8 @@ static int runScatterBenchmark(
     double avg_ms = sum_ms / total_iters;
     double avg_bw_gbs = sum_bw_gbs / total_iters;
 
-    printf("\n--- %s Summary (%zu targets, %zu NUMAs, batch_size=%d) ---\n",
-           mem_type_label, host_list.size(), num_numas, batch_size);
+    printf("\n--- %s %s Summary (%zu targets, %zu NUMAs, batch_size=%d) ---\n",
+           op_name_upper, mem_type_label, host_list.size(), num_numas, batch_size);
     printf("  Iterations: %d (%d async reqs per NUMA per iter, %d total reqs per iter)\n",
            total_iters, batch_size, batch_size * (int)num_numas);
     printf("  Data per iter: %s (%.2f MB per NUMA)\n",
@@ -1007,18 +1110,35 @@ int main(int argc, char *argv[]) {
 
         printf("\nAll %zu targets connected and ready.\n", num_targets);
 
-        // ---- Run DRAM scatter benchmark ----
-        if (run_dram) {
-            ret = runScatterBenchmark(comm, cfg, dram_numa_buffers,
-                                      host_list, dram_remote_addrs, lengths, "DRAM");
-            if (ret != 0) goto cleanup;
-        }
+        // ---- Run benchmarks for each requested test type ----
+        for (TestOpType op : cfg.test_types) {
+            printf("\n>>> Running %s test <<<\n", opTypeName(op));
 
-        // ---- Run HBM scatter benchmark ----
-        if (run_hbm) {
-            ret = runScatterBenchmark(comm, cfg, hbm_numa_buffers,
-                                      host_list, hbm_remote_addrs, lengths, "HBM (GPU)");
-            if (ret != 0) goto cleanup;
+            // For broadcast, we use buffer_size as the single length
+            // (same block sent to all targets), so prepare a matching lengths vector.
+            std::vector<size_t> bench_lengths;
+            if (op == TestOpType::BROADCAST) {
+                // broadcastAsync takes a single length; the bench function
+                // passes lengths[0] to broadcastAsync, but we still build a
+                // per-target lengths vector so the benchmark can compute data volume.
+                bench_lengths.assign(num_targets, cfg.buffer_size);
+            } else {
+                bench_lengths = lengths;
+            }
+
+            if (run_dram) {
+                ret = runTransferBenchmark(comm, cfg, op, dram_numa_buffers,
+                                          host_list, dram_remote_addrs,
+                                          bench_lengths, "DRAM");
+                if (ret != 0) goto cleanup;
+            }
+
+            if (run_hbm) {
+                ret = runTransferBenchmark(comm, cfg, op, hbm_numa_buffers,
+                                          host_list, hbm_remote_addrs,
+                                          bench_lengths, "HBM (GPU)");
+                if (ret != 0) goto cleanup;
+            }
         }
     }
 

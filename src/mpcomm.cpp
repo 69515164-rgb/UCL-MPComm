@@ -995,7 +995,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
     // Generate MPComm version config file
     {
         namespace fs = std::filesystem;
-        std::string MPCOMM_VERSION = "R01C02";
+        std::string MPCOMM_VERSION = MPCOMM_VERSION_STRING;
         std::string platform = "cuda";
         std::string target_dir = "/dockerdata/.trmt/";
         fs::path full_path = fs::path(target_dir) / "mpcomm.config.json";

@@ -1,0 +1,23 @@
+# Source files needed for building
+include CMakeLists.txt
+include pyproject.toml
+include VERSION
+
+# C++ source and headers
+recursive-include src *.cpp *.h
+recursive-include include *.h
+
+# Python binding source
+recursive-include python *.cpp *.py
+
+# CMake config template
+recursive-include cmake *.cmake.in
+
+# Documentation (for readme)
+include docs/MPComm_Introduction.md
+
+# Exclude build artifacts
+prune build
+prune mpcomm-install
+prune user_examples
+prune .codebuddy

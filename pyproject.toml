@@ -1,0 +1,41 @@
+[build-system]
+requires = ["scikit-build-core>=0.5", "pybind11>=2.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "mpcomm"
+# Version is synced from the VERSION file by build_wheel.sh before building.
+# To update, edit the VERSION file and re-run build_wheel.sh.
+version = "1.2.0"
+description = "MPComm: High-performance Memory Pooling Communication library with RDMA support"
+readme = "docs/MPComm_Introduction.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/kvcache-ai/mpcomm"
+
+[tool.scikit-build]
+# CMake install handles placing the Python extension into the wheel
+cmake.build-type = "Release"
+wheel.install-dir = "."
+
+[tool.scikit-build.cmake.define]
+BUILD_MPCOMM_PYTHON = "ON"
+BUILD_MPCOMM_EXAMPLES = "OFF"

@@ -1,5 +1,22 @@
-cmake_minimum_required(VERSION 3.14)
-project(mpcomm VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.15)
+
+# ---------------------------------------------------------------------------
+# Read version from the VERSION file (single source of truth)
+# ---------------------------------------------------------------------------
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _version_lines)
+foreach(_line IN LISTS _version_lines)
+    if(_line MATCHES "^MPCOMM_VERSION=(.+)$")
+        set(MPCOMM_VERSION_TAG "${CMAKE_MATCH_1}")
+    elseif(_line MATCHES "^MPCOMM_SEMVER=(.+)$")
+        set(MPCOMM_SEMVER "${CMAKE_MATCH_1}")
+    endif()
+endforeach()
+if(NOT MPCOMM_SEMVER)
+    message(FATAL_ERROR "Failed to parse MPCOMM_SEMVER from VERSION file")
+endif()
+message(STATUS "MPComm version: ${MPCOMM_VERSION_TAG} (${MPCOMM_SEMVER})")
+
+project(mpcomm VERSION ${MPCOMM_SEMVER} LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -128,6 +145,10 @@ endif()
 # Required when linking into shared libraries (e.g., Python modules)
 set_target_properties(mpcomm_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Inject version string into C++ code via compile definition
+target_compile_definitions(mpcomm_static PRIVATE MPCOMM_VERSION_STRING="${MPCOMM_VERSION_TAG}")
+target_compile_definitions(mpcomm_shared PRIVATE MPCOMM_VERSION_STRING="${MPCOMM_VERSION_TAG}")
+
 # Compiler flags
 foreach(_target mpcomm_static mpcomm_shared)
     target_compile_options(${_target} PRIVATE
@@ -195,52 +216,115 @@ endif()
 # Install rules
 # =====================================================================
 
-# Install header files
-install(FILES include/mpcomm.h include/mpcomm_log.h
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
+if(DEFINED SKBUILD)
+    # -----------------------------------------------------------------
+    # pip install / wheel build mode (scikit-build-core)
+    # Pack everything into the "mpcomm" Python package directory so that
+    # a single `pip install` provides both Python AND C++ interfaces.
+    # -----------------------------------------------------------------
+    set(_PKG_PREFIX mpcomm)
 
-# Install libraries
-install(TARGETS mpcomm_static mpcomm_shared
-    EXPORT mpcommTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
+    # Python extension module + __init__.py
+    if(BUILD_MPCOMM_PYTHON)
+        install(TARGETS mpcomm_py
+            LIBRARY DESTINATION ${_PKG_PREFIX}
+        )
+        install(FILES python/__init__.py
+            DESTINATION ${_PKG_PREFIX}
+        )
+    endif()
 
-# Install CMake package config files
-set(MPCOMM_CMAKE_INSTALL_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/mpcomm)
-
-install(EXPORT mpcommTargets
-    FILE mpcommTargets.cmake
-    NAMESPACE mpcomm::
-    DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
-)
-
-configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mpcommConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
-    INSTALL_DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
-)
-
-write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
-
-install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
-    DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
-)
-
-# Install Python module (when built)
-if(BUILD_MPCOMM_PYTHON)
-    install(TARGETS mpcomm_py
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python/mpcomm
+    # C++ header files  ->  mpcomm/include/
+    install(FILES include/mpcomm.h include/mpcomm_log.h
+        DESTINATION ${_PKG_PREFIX}/include
     )
-    install(FILES python/__init__.py
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/python/mpcomm
+
+    # C++ static & shared libraries  ->  mpcomm/lib/
+    install(TARGETS mpcomm_static mpcomm_shared
+        EXPORT mpcommTargets
+        ARCHIVE DESTINATION ${_PKG_PREFIX}/lib
+        LIBRARY DESTINATION ${_PKG_PREFIX}/lib
     )
+
+    # CMake package config  ->  mpcomm/lib/cmake/mpcomm/
+    set(MPCOMM_CMAKE_INSTALL_DIR ${_PKG_PREFIX}/lib/cmake/mpcomm)
+
+    install(EXPORT mpcommTargets
+        FILE mpcommTargets.cmake
+        NAMESPACE mpcomm::
+        DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+    )
+
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mpcommConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
+        INSTALL_DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+    )
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
+        DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+    )
+
+else()
+    # -----------------------------------------------------------------
+    # Standalone CMake build (the original behaviour)
+    # -----------------------------------------------------------------
+
+    # Install header files
+    install(FILES include/mpcomm.h include/mpcomm_log.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    # Install libraries
+    install(TARGETS mpcomm_static mpcomm_shared
+        EXPORT mpcommTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+
+    # Install CMake package config files
+    set(MPCOMM_CMAKE_INSTALL_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/mpcomm)
+
+    install(EXPORT mpcommTargets
+        FILE mpcommTargets.cmake
+        NAMESPACE mpcomm::
+        DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+    )
+
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mpcommConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
+        INSTALL_DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+    )
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
+        DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
+    )
+
+    # Install Python module
+    if(BUILD_MPCOMM_PYTHON)
+        install(TARGETS mpcomm_py
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python/mpcomm
+        )
+        install(FILES python/__init__.py
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/python/mpcomm
+        )
+    endif()
 endif()

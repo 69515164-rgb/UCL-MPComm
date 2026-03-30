@@ -393,6 +393,76 @@ public:
     /** Get the NUMA node for a specific GPU device */
     int getGpuNumaNode(int gpu_device_id) const;
 
+    // ==================== HBM-DRAM Mapping API ====================
+
+    /**
+     * Map a DRAM buffer to GPU address space via Zero-Copy (cudaHostRegister + Mapped)
+     *
+     * This registers a CPU DRAM buffer as pinned memory and obtains a GPU-accessible
+     * device pointer. The GPU can then access DRAM data directly through PCIe BAR
+     * without explicit cudaMemcpy.
+     *
+     * @param host_addr  CPU DRAM buffer address (should be page-aligned for best performance)
+     * @param length     Buffer length in bytes
+     * @return GPU-accessible device pointer (as uintptr_t), or 0 on failure
+     */
+    uintptr_t mapDRAMtoGPU(void *host_addr, size_t length);
+
+    /**
+     * Unmap a previously mapped DRAM buffer from GPU address space
+     *
+     * @param host_addr  The original CPU DRAM address passed to mapDRAMtoGPU
+     * @return 0 on success, negative error code on failure
+     */
+    int unmapDRAMfromGPU(void *host_addr);
+
+    // ==================== TMA Transfer API ====================
+
+    /**
+     * TMA Gather: Load scattered data blocks from DRAM (via mapped pointer) to GPU HBM
+     *
+     * Uses NVIDIA Hopper's TMA engine (cp.async.bulk) to efficiently transfer
+     * data from CPU DRAM (mapped as GPU-accessible) to GPU HBM, minimizing SM
+     * occupancy while saturating PCIe bandwidth.
+     *
+     * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
+     * @param indices        Array of block indices to gather (on GPU)
+     * @param gpu_dst        Destination GPU HBM buffer
+     * @param num_blocks     Number of blocks to gather
+     * @param block_size     Size of each block in bytes (must be aligned to 16 bytes)
+     * @param max_sm_count   Maximum number of SMs to use (0 = auto)
+     * @return 0 on success, negative error code on failure
+     */
+    int tmaGather(uintptr_t dram_dev_ptr,
+                  const long *indices,
+                  void *gpu_dst,
+                  int num_blocks,
+                  int block_size,
+                  int max_sm_count = 0);
+
+    /**
+     * TMA Scatter: Store data blocks from GPU HBM to DRAM (via mapped pointer)
+     *
+     * Uses NVIDIA Hopper's TMA engine to efficiently transfer data from GPU HBM
+     * to CPU DRAM (mapped as GPU-accessible).
+     *
+     * @param gpu_src        Source GPU HBM buffer
+     * @param indices        Array of block indices to scatter (on GPU)
+     * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
+     * @param num_blocks     Number of blocks to scatter
+     * @param block_size     Size of each block in bytes (must be aligned to 16 bytes)
+     * @param max_sm_count   Maximum number of SMs to use (0 = auto)
+     * @return 0 on success, negative error code on failure
+     */
+    int tmaScatter(void *gpu_src,
+                   const long *indices,
+                   uintptr_t dram_dev_ptr,
+                   int num_blocks,
+                   int block_size,
+                   int max_sm_count = 0);
+
+    // ==================== End HBM-DRAM Mapping & TMA API ====================
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

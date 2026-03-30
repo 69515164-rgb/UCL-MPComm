@@ -38,16 +38,35 @@ if(USE_BNXT)
 endif()
 
 if(USE_CUDA)
+    # Enable CUDA language for .cu file compilation
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # TMA requires Hopper (sm_90) architecture
+    set(CMAKE_CUDA_ARCHITECTURES "90")
+
     find_library(CUDA_DRIVER_LIBRARY cuda PATHS /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu QUIET)
     find_path(CUDA_INCLUDE_DIR cuda.h PATHS /usr/local/cuda/include QUIET)
+    find_library(CUDART_LIBRARY cudart PATHS /usr/local/cuda/lib64 QUIET)
     if(NOT CUDA_DRIVER_LIBRARY)
         message(WARNING "CUDA driver library not found, USE_CUDA features may not work")
     endif()
+    if(NOT CUDART_LIBRARY)
+        message(WARNING "CUDA runtime library not found, TMA features may not work")
+    endif()
+endif()
+
+# Source files
+set(MPCOMM_SOURCES src/mpcomm.cpp)
+
+# Add TMA kernel sources when CUDA is enabled
+if(USE_CUDA)
+    list(APPEND MPCOMM_SOURCES src/mpcomm_tma_kernels.cu)
 endif()
 
 # MPComm static library
 add_library(mpcomm_static STATIC
-    src/mpcomm.cpp
+    ${MPCOMM_SOURCES}
 )
 set_target_properties(mpcomm_static PROPERTIES
     OUTPUT_NAME mpcomm
@@ -68,7 +87,7 @@ target_link_libraries(mpcomm_static PUBLIC
 
 # MPComm shared library
 add_library(mpcomm_shared SHARED
-    src/mpcomm.cpp
+    ${MPCOMM_SOURCES}
 )
 set_target_properties(mpcomm_shared PROPERTIES
     OUTPUT_NAME mpcomm
@@ -122,6 +141,10 @@ if(USE_CUDA)
         target_link_libraries(mpcomm_static PUBLIC ${CUDA_DRIVER_LIBRARY})
         target_link_libraries(mpcomm_shared PRIVATE ${CUDA_DRIVER_LIBRARY})
     endif()
+    if(CUDART_LIBRARY)
+        target_link_libraries(mpcomm_static PUBLIC ${CUDART_LIBRARY})
+        target_link_libraries(mpcomm_shared PRIVATE ${CUDART_LIBRARY})
+    endif()
 endif()
 
 # Enable position independent code for static library
@@ -130,12 +153,16 @@ set_target_properties(mpcomm_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Compiler flags
 foreach(_target mpcomm_static mpcomm_shared)
+    # CXX flags (GCC/Clang)
     target_compile_options(${_target} PRIVATE
-        -Wall
-        -Wextra
-        -Werror
-        -O2
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror -O2>
     )
+    # CUDA flags (nvcc) — use nvcc-native equivalents
+    if(USE_CUDA)
+        target_compile_options(${_target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror -O2>
+        )
+    endif()
 endforeach()
 
 # Python bindings (optional)

@@ -81,13 +81,29 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 import torch
 
-# Import mpcomm module (built from C++)
+# ---------------------------------------------------------------------------
+# Auto-detect mpcomm install path so the script works without PYTHONPATH.
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, os.pardir))
+
+_CANDIDATE_PATHS = [
+    os.path.join(_PROJECT_ROOT, "mpcomm-install", "lib", "python"),
+    os.path.join(_PROJECT_ROOT, "build"),
+]
+
+for _p in _CANDIDATE_PATHS:
+    if os.path.isdir(os.path.join(_p, "mpcomm")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+        break
+
 try:
     import mpcomm
 except ImportError:
-    print("Error: mpcomm module not found. Please build it first:", file=sys.stderr)
-    print("  cd mpcomm && mkdir build && cd build", file=sys.stderr)
-    print("  cmake .. -DBUILD_MPCOMM_PYTHON=ON && make", file=sys.stderr)
+    print("Error: mpcomm module not found.", file=sys.stderr)
+    print("  cd trmt-mpcomm && sh build.sh", file=sys.stderr)
+    print("  Or: export PYTHONPATH=/path/to/mpcomm-install/lib/python:$PYTHONPATH", file=sys.stderr)
     sys.exit(1)
 
 

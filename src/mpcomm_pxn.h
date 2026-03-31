@@ -89,6 +89,7 @@ private:
 // Environment variable names
 inline constexpr const char* kPxnEnableEnvVar = "MPCOMM_PXN_ENABLE";
 inline constexpr const char* kPxnBufferSizeEnvVar = "MPCOMM_PXN_BUFFER_SIZE";
+inline constexpr const char* kPxnDirectRatioEnvVar = "MPCOMM_PXN_DIRECT_RATIO";
 
 // Default proxy buffer size per GPU: 256 MB
 static constexpr size_t kPxnDefaultBufferSize = 256ULL << 20;
@@ -193,6 +194,12 @@ struct PxnProxyBuffer {
     void free(size_t len) {
         size_t aligned_len = (len + 255) & ~255ULL;
         free_offset.fetch_add(aligned_len, std::memory_order_release);
+    }
+
+    // Reset allocator state (for reuse between rounds in static partition mode)
+    void resetAllocator() {
+        alloc_offset.store(0, std::memory_order_relaxed);
+        free_offset.store(0, std::memory_order_release);
     }
 };
 

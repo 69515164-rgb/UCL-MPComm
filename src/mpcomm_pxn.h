@@ -90,6 +90,7 @@ private:
 inline constexpr const char* kPxnEnableEnvVar = "MPCOMM_PXN_ENABLE";
 inline constexpr const char* kPxnBufferSizeEnvVar = "MPCOMM_PXN_BUFFER_SIZE";
 inline constexpr const char* kPxnDirectRatioEnvVar = "MPCOMM_PXN_DIRECT_RATIO";
+inline constexpr const char* kPxnBenchSequentialEnvVar = "MPCOMM_PXN_BENCH_SEQUENTIAL";
 
 // Default proxy buffer size per GPU: 256 MB
 static constexpr size_t kPxnDefaultBufferSize = 256ULL << 20;
@@ -204,7 +205,7 @@ struct PxnProxyBuffer {
 };
 
 // Pending NVLink copy that hasn't completed yet.
-// Worker thread checks the event to know when RDMA post can proceed.
+// Worker thread checks the atomic flag to know when RDMA post can proceed.
 struct PxnPendingChunk {
     size_t chunk_idx;           // Original chunk index in TransferContext
     size_t host_idx;            // Host index for connection lookup
@@ -214,7 +215,7 @@ struct PxnPendingChunk {
     size_t proxy_gpu_idx;       // Index into pxn_proxy_buffers_ (for free)
     uintptr_t remote_addr;      // Remote RDMA address
     size_t length;              // Chunk length
-    CUevent completion_event;   // CUDA event signaling NVLink copy done
+    std::atomic<bool>* copy_done_flag;  // Set by CUDA stream callback when copy completes
 };
 
 // =====================================================================
@@ -234,12 +235,12 @@ struct PxnCopyRequest {
 // Result returned by copy thread after NVLink copy is initiated
 struct PxnCopyResult {
     uint64_t request_id;        // Matches PxnCopyRequest::request_id
-    CUevent completion_event;   // CUDA event signaling copy done (nullptr on error)
+    std::atomic<bool>* copy_done_flag;  // Atomic flag set by cuLaunchHostFunc callback (nullptr on error)
     bool success;
     // Fine-grained timing from copy thread (for diagnosing submit->result_recv)
     std::chrono::steady_clock::time_point t_dequeued;       // When request was popped from SPSC queue
     std::chrono::steady_clock::time_point t_copy_launched;  // After cuMemcpyPeerAsync returned
-    std::chrono::steady_clock::time_point t_result_pushed;  // After cuEventRecord, just before result push
+    std::chrono::steady_clock::time_point t_result_pushed;  // After cuLaunchHostFunc, just before result push
 };
 
 // Per-GPU copy thread state
@@ -252,14 +253,9 @@ struct PxnCopyThreadState {
     SpscQueue<PxnCopyRequest, kPxnCopyQueueCapacity> request_queue;
     SpscQueue<PxnCopyResult, kPxnCopyQueueCapacity> result_queue;
 
-    // Recycle queue: worker (producer) -> copy thread (consumer) for returning events.
-    // Each entry is (gpu_device_id, event) so the copy thread can route events
-    // back to the correct per-GPU pool.
-    struct RecycledEvent {
-        int gpu_device_id;
-        CUevent event;
-    };
-    SpscQueue<RecycledEvent, kPxnCopyQueueCapacity> recycle_queue;
+    // Recycle queue: worker (producer) -> copy thread (consumer) for returning flags.
+    // Worker returns used atomic<bool>* flags so the copy thread can reuse them.
+    SpscQueue<std::atomic<bool>*, kPxnCopyQueueCapacity> recycle_queue;
 
     // Per-GPU resources managed by the single copy thread.
     // Indexed by gpu_topology_ index (not device_id).
@@ -268,8 +264,11 @@ struct PxnCopyThreadState {
         CUcontext cuda_ctx = nullptr;
         CUstream streams[kPxnStreamsPerThread] = {};
         size_t next_stream_idx = 0;
-        std::vector<CUevent> event_pool;
     };
+
+    // Pool of reusable atomic<bool> flags for copy completion notification.
+    // Managed by the copy thread (single-threaded access for alloc/recycle).
+    std::vector<std::atomic<bool>*> flag_pool;
     std::vector<PerGpuResources> gpu_resources;
 
     // Map from gpu_device_id to index in gpu_resources
@@ -353,11 +352,8 @@ public:
     // Returns total number of results retrieved.
     size_t pollAllCopyResults(std::vector<PxnCopyResult>& results);
 
-    // Check if a CUDA event has completed (non-blocking)
-    static bool isEventDone(CUevent event);
-
-    // Recycle a CUDA event back to the copy thread's local pool.
-    void recycleEventToThread(int gpu_device_id, CUevent event);
+    // Recycle a copy-done flag back to the copy thread's pool for reuse.
+    void recycleFlagToThread(std::atomic<bool>* flag);
 
     // Get lkey for a proxy buffer address on a specific NIC.
     // This is needed because the RDMA post must use the proxy buffer's lkey,
@@ -376,6 +372,9 @@ private:
 
     // Free proxy buffers
     void freeProxyBuffers();
+
+    // Run GPU-to-GPU copy bandwidth benchmark during init
+    void benchmarkGpuCopyBandwidth();
 
     // Start the single unified copy thread (called from init when PXN is enabled)
     bool startCopyThreads();

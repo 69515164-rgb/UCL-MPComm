@@ -93,6 +93,9 @@ bool PxnManager::init(
         return false;
     }
 
+    // Step 3.5: Run GPU-to-GPU copy bandwidth test to verify NVLink paths
+    benchmarkGpuCopyBandwidth();
+
     // Step 4: Start per-GPU copy threads (dedicated context, no switching)
     if (!startCopyThreads()) {
         MPCOMM_LOG_ERROR("MPComm PXN: Failed to start copy threads\n");
@@ -166,25 +169,19 @@ bool PxnManager::discoverNvlinkTopology() {
             res = cuDeviceCanAccessPeer(&can_access, i, j);
             if (res != CUDA_SUCCESS || !can_access) continue;
 
-            // Check if the link is NVLink (not just PCIe P2P)
+            // Check performance rank (informational only — unreliable for
+            // distinguishing NVLink vs PCIe P2P on some driver versions).
             int perf_rank = 0;
-            res = cuDeviceGetP2PAttribute(
+            cuDeviceGetP2PAttribute(
                 &perf_rank,
                 CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK,
                 i, j);
 
-            // perf_rank > 0 indicates a high-performance link (NVLink)
-            // perf_rank == 0 might be PCIe P2P which is too slow for PXN
-            if (res == CUDA_SUCCESS && perf_rank > 0) {
-                gpu_topology_[i].nvlink_peers.push_back(j);
-                MPCOMM_LOG_INFO("  GPU %d <-> GPU %d: NVLink (perf_rank=%d)\n",
-                                i, j, perf_rank);
-            } else if (can_access) {
-                // PCIe P2P — still usable but slower, include with a note
-                gpu_topology_[i].nvlink_peers.push_back(j);
-                MPCOMM_LOG_INFO("  GPU %d <-> GPU %d: P2P (perf_rank=%d, may be PCIe)\n",
-                                i, j, perf_rank);
-            }
+            // Add all P2P-accessible peers. The bandwidth benchmark
+            // (benchmarkGpuCopyBandwidth) will reveal the actual link type.
+            gpu_topology_[i].nvlink_peers.push_back(j);
+            MPCOMM_LOG_INFO("  GPU %d -> GPU %d: P2P accessible (perf_rank=%d)\n",
+                            i, j, perf_rank);
         }
     }
 
@@ -310,6 +307,151 @@ void PxnManager::freeProxyBuffers() {
 }
 
 // =====================================================================
+// GPU-to-GPU Copy Bandwidth Benchmark
+// =====================================================================
+
+void PxnManager::benchmarkGpuCopyBandwidth() {
+    // Test copy bandwidth between all NVLink-connected GPU pairs.
+    // Uses the already-allocated proxy buffers as src/dst to avoid extra allocs.
+    // Runs multiple iterations and reports the best bandwidth.
+
+    static constexpr size_t kBenchSize = 128ULL << 20;  // 128 MB test size
+    static constexpr int kWarmupIters = 3;
+    static constexpr int kBenchIters = 5;
+
+    MPCOMM_LOG_INFO("\nMPComm PXN: GPU-to-GPU copy bandwidth benchmark "
+                    "(size=%zu MB, %d iters):\n",
+                    kBenchSize >> 20, kBenchIters);
+    MPCOMM_LOG_INFO("  %-12s %-12s %12s %12s %s\n",
+                    "Src GPU", "Dst GPU", "BW (GB/s)", "BW (Gbps)", "Link Type");
+    MPCOMM_LOG_INFO("  %s\n",
+                    "--------------------------------------------------------------");
+
+    for (size_t i = 0; i < gpu_topology_.size(); ++i) {
+        for (int peer_dev : gpu_topology_[i].nvlink_peers) {
+            // Only test each pair once (i -> peer where i < peer)
+            if (gpu_topology_[i].device_id >= peer_dev) continue;
+
+            int src_dev = gpu_topology_[i].device_id;
+            int dst_dev = peer_dev;
+
+            auto src_it = device_id_to_idx_.find(src_dev);
+            auto dst_it = device_id_to_idx_.find(dst_dev);
+            if (src_it == device_id_to_idx_.end() ||
+                dst_it == device_id_to_idx_.end()) continue;
+
+            size_t src_idx = src_it->second;
+            size_t dst_idx = dst_it->second;
+
+            // Check that proxy buffers are large enough
+            if (proxy_buffers_[src_idx].size < kBenchSize ||
+                proxy_buffers_[dst_idx].size < kBenchSize) {
+                MPCOMM_LOG_WARN("  GPU %d -> GPU %d: skipped (buffer too small)\n",
+                                src_dev, dst_dev);
+                continue;
+            }
+
+            CUdeviceptr src_addr = proxy_buffers_[src_idx].buffer;
+            CUcontext src_ctx = proxy_buffers_[src_idx].cuda_ctx;
+            CUdeviceptr dst_addr = proxy_buffers_[dst_idx].buffer;
+            CUcontext dst_ctx = proxy_buffers_[dst_idx].cuda_ctx;
+
+            // Create a stream on the destination GPU for the copy
+            CUcontext old_ctx;
+            cuCtxPushCurrent(dst_ctx);
+            CUstream bench_stream;
+            CUresult res = cuStreamCreate(&bench_stream, CU_STREAM_NON_BLOCKING);
+            if (res != CUDA_SUCCESS) {
+                cuCtxPopCurrent(&old_ctx);
+                MPCOMM_LOG_WARN("  GPU %d -> GPU %d: skipped (stream create failed: %d)\n",
+                                src_dev, dst_dev, res);
+                continue;
+            }
+
+            // Warmup
+            for (int w = 0; w < kWarmupIters; ++w) {
+                cuMemcpyPeerAsync(dst_addr, dst_ctx, src_addr, src_ctx,
+                                  kBenchSize, bench_stream);
+            }
+            cuStreamSynchronize(bench_stream);
+
+            // Benchmark: measure each iteration independently, report best
+            double best_bw_gbps = 0.0;
+            double best_bw_gbs = 0.0;
+
+            for (int iter = 0; iter < kBenchIters; ++iter) {
+                auto t0 = std::chrono::steady_clock::now();
+                cuMemcpyPeerAsync(dst_addr, dst_ctx, src_addr, src_ctx,
+                                  kBenchSize, bench_stream);
+                cuStreamSynchronize(bench_stream);
+                auto t1 = std::chrono::steady_clock::now();
+
+                double elapsed_us = std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(t1 - t0).count() / 1000.0;
+                double bw_gbs = (kBenchSize / 1e9) / (elapsed_us / 1e6);
+                double bw_gbps = bw_gbs * 8.0;
+
+                if (bw_gbps > best_bw_gbps) {
+                    best_bw_gbps = bw_gbps;
+                    best_bw_gbs = bw_gbs;
+                }
+            }
+
+            // Determine link type: use measured bandwidth as primary signal.
+            // perf_rank is unreliable (returns 0 on some NVLink systems).
+            // NVLink: typically 50-400+ GB/s; PCIe P2P: typically 10-25 GB/s.
+            const char* link_type_fwd = (best_bw_gbs > 30.0) ? "NVLink" : "PCIe P2P";
+
+            MPCOMM_LOG_INFO("  GPU %-4d  -> GPU %-4d  %9.2f    %9.2f    %s\n",
+                            src_dev, dst_dev, best_bw_gbs, best_bw_gbps,
+                            link_type_fwd);
+
+            // Also test reverse direction
+            // Warmup reverse
+            for (int w = 0; w < kWarmupIters; ++w) {
+                cuMemcpyPeerAsync(src_addr, src_ctx, dst_addr, dst_ctx,
+                                  kBenchSize, bench_stream);
+            }
+            cuStreamSynchronize(bench_stream);
+
+            double best_bw_gbps_rev = 0.0;
+            double best_bw_gbs_rev = 0.0;
+            for (int iter = 0; iter < kBenchIters; ++iter) {
+                auto t0 = std::chrono::steady_clock::now();
+                cuMemcpyPeerAsync(src_addr, src_ctx, dst_addr, dst_ctx,
+                                  kBenchSize, bench_stream);
+                cuStreamSynchronize(bench_stream);
+                auto t1 = std::chrono::steady_clock::now();
+
+                double elapsed_us = std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(t1 - t0).count() / 1000.0;
+                double bw_gbs = (kBenchSize / 1e9) / (elapsed_us / 1e6);
+                double bw_gbps = bw_gbs * 8.0;
+
+                if (bw_gbps > best_bw_gbps_rev) {
+                    best_bw_gbps_rev = bw_gbps;
+                    best_bw_gbs_rev = bw_gbs;
+                }
+            }
+
+            const char* link_type_rev = (best_bw_gbs_rev > 30.0) ? "NVLink" : "PCIe P2P";
+
+            MPCOMM_LOG_INFO("  GPU %-4d  -> GPU %-4d  %9.2f    %9.2f    %s\n",
+                            dst_dev, src_dev, best_bw_gbs_rev, best_bw_gbps_rev,
+                            link_type_rev);
+
+            cuStreamDestroy(bench_stream);
+            cuCtxPopCurrent(&old_ctx);
+        }
+    }
+
+    MPCOMM_LOG_INFO("  %s\n",
+                    "--------------------------------------------------------------");
+    MPCOMM_LOG_INFO("  Link type inferred from bandwidth: >30 GB/s = NVLink, "
+                    "<30 GB/s = PCIe P2P\n\n");
+}
+
+// =====================================================================
 // NVLink Copy Event Utilities
 // =====================================================================
 const PxnGpuInfo* PxnManager::getGpuInfo(int device_id) const {
@@ -404,27 +546,26 @@ int PxnManager::unregisterProxyBuffers(
 }
 
 // =====================================================================
-// NVLink Copy Event Utilities
+// Copy-Done Flag Utilities
 // =====================================================================
 
-bool PxnManager::isEventDone(CUevent event) {
-    if (!event) return true;
-    CUresult res = cuEventQuery(event);
-    return (res == CUDA_SUCCESS);
+// CUDA host function callback: sets the atomic<bool> flag to true.
+// Called by CUDA runtime on a CUDA internal thread when the preceding
+// stream operations (cuMemcpyPeerAsync) complete.
+static void CUDA_CB pxnCopyDoneCallback(void* user_data) {
+    auto* flag = static_cast<std::atomic<bool>*>(user_data);
+    flag->store(true, std::memory_order_release);
 }
 
-void PxnManager::recycleEventToThread(int gpu_device_id, CUevent event) {
-    if (!event) return;
+void PxnManager::recycleFlagToThread(std::atomic<bool>* flag) {
+    if (!flag) return;
     if (copy_thread_) {
-        PxnCopyThreadState::RecycledEvent re;
-        re.gpu_device_id = gpu_device_id;
-        re.event = event;
-        if (copy_thread_->recycle_queue.tryPush(re)) {
+        if (copy_thread_->recycle_queue.tryPush(flag)) {
             return;
         }
     }
-    // Recycle queue full or thread not found — destroy the event
-    cuEventDestroy(event);
+    // Recycle queue full or thread not found — delete the flag
+    delete flag;
 }
 
 // =====================================================================
@@ -477,23 +618,16 @@ void PxnManager::stopCopyThreads() {
         copy_thread_->thread->join();
     }
 
-    // Destroy per-GPU event pools
-    for (auto& gpu_res : copy_thread_->gpu_resources) {
-        if (gpu_res.cuda_ctx) {
-            CUcontext old_ctx;
-            cuCtxPushCurrent(gpu_res.cuda_ctx);
-            for (CUevent ev : gpu_res.event_pool) {
-                cuEventDestroy(ev);
-            }
-            cuCtxPopCurrent(&old_ctx);
-        }
-        gpu_res.event_pool.clear();
+    // Free flag pool
+    for (auto* flag : copy_thread_->flag_pool) {
+        delete flag;
     }
+    copy_thread_->flag_pool.clear();
 
     // Drain recycle queue
-    PxnCopyThreadState::RecycledEvent recycled;
+    std::atomic<bool>* recycled;
     while (copy_thread_->recycle_queue.tryPop(recycled)) {
-        cuEventDestroy(recycled.event);
+        delete recycled;
     }
 
     copy_thread_.reset();
@@ -537,15 +671,10 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
                     static_cast<unsigned long>(pthread_self()));
 
     while (state->running.load(std::memory_order_acquire)) {
-        // Drain recycled events back to per-GPU event pools
-        PxnCopyThreadState::RecycledEvent recycled;
-        while (state->recycle_queue.tryPop(recycled)) {
-            auto rit = state->gpu_dev_to_res_idx.find(recycled.gpu_device_id);
-            if (rit != state->gpu_dev_to_res_idx.end()) {
-                state->gpu_resources[rit->second].event_pool.push_back(recycled.event);
-            } else {
-                cuEventDestroy(recycled.event);
-            }
+        // Drain recycled flags back to the pool for reuse
+        std::atomic<bool>* recycled_flag;
+        while (state->recycle_queue.tryPop(recycled_flag)) {
+            state->flag_pool.push_back(recycled_flag);
         }
 
         PxnCopyRequest req;
@@ -570,7 +699,7 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
         if (!gpu_res) {
             MPCOMM_LOG_ERROR("MPComm PXN: Unified copy thread: no GPU resources "
                             "for dst_ctx=%p\n", (void*)req.dst_ctx);
-            result.completion_event = nullptr;
+            result.copy_done_flag = nullptr;
             result.success = false;
             while (!state->result_queue.tryPush(result)) {
                 _mm_pause();
@@ -582,8 +711,12 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
         CUstream cur_stream = gpu_res->streams[gpu_res->next_stream_idx % kPxnStreamsPerThread];
         gpu_res->next_stream_idx++;
 
-        // cuMemcpyPeerAsync does NOT require the calling thread to have
-        // a matching current context — src/dst contexts are passed explicitly.
+        // Push the destination GPU's context so that cuMemcpyPeerAsync
+        // uses the correct NVLink path.  Without this, the driver may
+        // fall back to a PCIe staging copy (~32 GB/s instead of ~384 GB/s).
+        CUcontext prev_ctx;
+        cuCtxPushCurrent(gpu_res->cuda_ctx);
+
         CUresult res = cuMemcpyPeerAsync(
             req.dst_addr, req.dst_ctx,
             req.src_addr, req.src_ctx,
@@ -592,10 +725,11 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
         result.t_copy_launched = std::chrono::steady_clock::now();
 
         if (res != CUDA_SUCCESS) {
+            cuCtxPopCurrent(&prev_ctx);
             MPCOMM_LOG_ERROR("MPComm PXN: Unified copy thread GPU %d: "
                             "cuMemcpyPeerAsync failed: %d\n",
                             gpu_res->gpu_device_id, res);
-            result.completion_event = nullptr;
+            result.copy_done_flag = nullptr;
             result.success = false;
             while (!state->result_queue.tryPush(result)) {
                 _mm_pause();
@@ -603,39 +737,30 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
             continue;
         }
 
-        // Acquire event from per-GPU pool (no mutex — single thread)
-        CUevent event = nullptr;
-        if (!gpu_res->event_pool.empty()) {
-            event = gpu_res->event_pool.back();
-            gpu_res->event_pool.pop_back();
+        // Acquire an atomic<bool> flag from the pool (no mutex — single thread)
+        std::atomic<bool>* flag = nullptr;
+        if (!state->flag_pool.empty()) {
+            flag = state->flag_pool.back();
+            state->flag_pool.pop_back();
+            flag->store(false, std::memory_order_relaxed);
         } else {
-            // Create event under the destination GPU's context
-            CUcontext old_ctx;
-            cuCtxPushCurrent(gpu_res->cuda_ctx);
-            CUresult ev_res = cuEventCreate(&event, CU_EVENT_DISABLE_TIMING);
-            cuCtxPopCurrent(&old_ctx);
-            if (ev_res != CUDA_SUCCESS) {
-                MPCOMM_LOG_ERROR("MPComm PXN: Unified copy thread GPU %d: "
-                                "cuEventCreate failed: %d\n",
-                                gpu_res->gpu_device_id, ev_res);
-                result.completion_event = nullptr;
-                result.success = false;
-                while (!state->result_queue.tryPush(result)) {
-                    _mm_pause();
-                }
-                continue;
-            }
+            flag = new std::atomic<bool>(false);
         }
 
-        // cuEventRecord: event and stream must belong to the same context.
-        // Both were created under gpu_res->cuda_ctx, so this is safe.
-        res = cuEventRecord(event, cur_stream);
+        // cuLaunchHostFunc: enqueue a host callback on the stream.
+        // When all preceding operations (cuMemcpyPeerAsync) complete,
+        // CUDA calls pxnCopyDoneCallback which sets the flag to true.
+        // This eliminates the need for cuEventRecord + cuEventQuery polling.
+        res = cuLaunchHostFunc(cur_stream, pxnCopyDoneCallback, flag);
+
+        cuCtxPopCurrent(&prev_ctx);
+
         if (res != CUDA_SUCCESS) {
             MPCOMM_LOG_ERROR("MPComm PXN: Unified copy thread GPU %d: "
-                            "cuEventRecord failed: %d\n",
+                            "cuLaunchHostFunc failed: %d\n",
                             gpu_res->gpu_device_id, res);
-            gpu_res->event_pool.push_back(event);
-            result.completion_event = nullptr;
+            state->flag_pool.push_back(flag);
+            result.copy_done_flag = nullptr;
             result.success = false;
             while (!state->result_queue.tryPush(result)) {
                 _mm_pause();
@@ -643,8 +768,8 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
             continue;
         }
 
-        // Success — push result
-        result.completion_event = event;
+        // Success — push result with the flag pointer
+        result.copy_done_flag = flag;
         result.success = true;
         result.t_result_pushed = std::chrono::steady_clock::now();
         while (!state->result_queue.tryPush(result)) {

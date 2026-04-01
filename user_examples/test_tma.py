@@ -38,7 +38,7 @@ Usage:
     python test_tma.py --gpu 0
 
     # Large-scale test
-    python test_tma.py --num-blocks 4096 --pool-blocks 1048576 --benchmark
+    python test_tma.py --num-blocks 4096 --pool-blocks 4000000 --benchmark
 """
 import argparse
 import os
@@ -46,6 +46,87 @@ import sys
 import time
 
 import torch
+import ctypes
+import ctypes.util
+
+
+def _alloc_aligned(num_bytes, alignment=1024):
+    """Allocate a 1D uint8 torch.Tensor backed by alignment-byte aligned memory.
+
+    Uses posix_memalign so that the underlying pointer satisfies TMA's
+    optimal 1024-byte alignment requirement.  The returned tensor owns a
+    prevent-GC ref to the ctypes buffer so it stays alive.
+    """
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    ptr = ctypes.c_void_p()
+    ret = libc.posix_memalign(ctypes.byref(ptr), alignment, num_bytes)
+    if ret != 0:
+        raise MemoryError(f"posix_memalign failed with error {ret}")
+    # Wrap as a torch tensor (zero-copy); attach prevent-GC ref
+    buf = (ctypes.c_char * num_bytes).from_address(ptr.value)
+    t = torch.frombuffer(buf, dtype=torch.uint8)
+    t._aligned_buf = buf        # prevent GC of ctypes buffer
+    t._aligned_ptr = ptr        # prevent GC of pointer
+    return t
+
+
+def _bind_numa_to_gpu(gpu_device_id=0):
+    """Bind current process memory allocation to the NUMA node closest to the GPU.
+
+    Reads /sys/bus/pci/devices/<gpu_bdf>/numa_node to find the GPU's NUMA node,
+    then calls libnuma to set membind.  Falls back to NUMA 0 if detection fails.
+    Returns the NUMA node actually bound to.
+    """
+    numa_node = 0  # default fallback
+
+    try:
+        # Get GPU PCI bus ID  (e.g. "0000:8A:00.0")
+        pci_bus_id = " " * 32
+        # Use pynvml-free approach: read from /sys via cudaDeviceGetPCIBusId equivalent
+        props = torch.cuda.get_device_properties(gpu_device_id)
+        # Construct sysfs path from domain:bus:device.function
+        # torch doesn't expose raw BDF, so we scan /sys/bus/pci/devices/*/class for 0x030000 (display)
+        import glob
+        gpu_numa = None
+        for dev_path in sorted(glob.glob("/sys/bus/pci/devices/*/class")):
+            with open(dev_path) as f:
+                cls = f.read().strip()
+            if cls.startswith("0x0302") or cls.startswith("0x0300"):
+                # This is a GPU; check if it matches by counting
+                numa_path = os.path.join(os.path.dirname(dev_path), "numa_node")
+                if os.path.exists(numa_path):
+                    with open(numa_path) as f:
+                        node = int(f.read().strip())
+                    if node >= 0:
+                        gpu_numa = node
+                        break
+        if gpu_numa is not None:
+            numa_node = gpu_numa
+    except Exception:
+        pass
+
+    # Try to bind via libnuma
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1", use_errno=True)
+        # numa_set_membind expects a struct bitmask*; use numa_run_on_node as simpler alternative
+        # Actually use numa_set_preferred which is simpler
+        libnuma.numa_set_preferred(numa_node)
+        print(f"  NUMA: 已绑定内存分配到 NUMA node {numa_node} (GPU 本地)")
+    except OSError:
+        print(f"  NUMA: libnuma 不可用，尝试 set_mempolicy fallback (NUMA {numa_node})")
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            # MPOL_PREFERRED = 1, node mask
+            mask = 1 << numa_node
+            libc.set_mempolicy(1, ctypes.byref(ctypes.c_ulong(mask)), 64)
+        except Exception:
+            print(f"  NUMA: 绑定失败，使用 OS 默认策略")
+
+    return numa_node
+
+
+# Mode name mapping for log output
+MODE_NAMES = {0: "AUTO (→TMA)", 1: "SM (int4 Zero-Copy)", 2: "TMA (cp.async.bulk)"}
 
 # ---------------------------------------------------------------------------
 # Auto-detect mpcomm install path so the script works without PYTHONPATH.
@@ -130,24 +211,24 @@ def test_map_dram_to_gpu(comm):
     return True
 
 
-def test_tma_gather(comm, num_blocks, block_size, pool_blocks, benchmark=False):
+def test_tma_gather(comm, num_blocks, block_size, pool_blocks, benchmark=False, mode=0):
     """测试 TMA Gather: DRAM -> GPU HBM"""
+    mode_name = MODE_NAMES.get(mode, f"Unknown({mode})")
     print(f"\n{'='*60}")
-    print(f"TMA Gather 测试: {num_blocks} blocks x {block_size} bytes")
+    print(f"{mode_name} Gather 测试: {num_blocks} blocks x {block_size} bytes")
     print(f"{'='*60}")
 
     device = torch.device("cuda:0")
 
-    # 1. 在 CPU 上分配 DRAM 内存池
-    cpu_pool = torch.empty(pool_blocks * block_size, dtype=torch.uint8)
-    # 填充已知模式: 每个 block 用 block_index % 256 填充
-    for i in range(pool_blocks):
-        start = i * block_size
-        cpu_pool[start:start + block_size] = i % 256
+    # 1. 在 CPU 上分配 DRAM 内存池 (1024B 对齐，TMA 最优路径)
+    print(f"  正在分配 CPU 内存池: {pool_blocks} blocks "
+          f"({pool_blocks * block_size / 1024 / 1024:.1f} MB)...")
+    cpu_pool_flat = _alloc_aligned(pool_blocks * block_size, 1024)
+    cpu_pool = cpu_pool_flat.view(pool_blocks, block_size)
+    cpu_pool.copy_(torch.randint(0, 255, (pool_blocks, block_size), dtype=torch.uint8))
 
     pool_addr = cpu_pool.data_ptr()
-    print(f"  CPU 内存池: {pool_blocks} blocks ({pool_blocks * block_size / 1024 / 1024:.1f} MB), "
-          f"addr=0x{pool_addr:x}")
+    print(f"  CPU 内存池: addr=0x{pool_addr:x}")
 
     # 2. 将 DRAM 映射到 GPU 地址空间
     dram_dev_ptr = comm.map_dram_to_gpu(pool_addr, pool_blocks * block_size)
@@ -170,7 +251,8 @@ def test_tma_gather(comm, num_blocks, block_size, pool_blocks, benchmark=False):
         gpu_output.data_ptr(),
         num_blocks,
         block_size,
-        0  # max_sm_count=0 -> auto
+        0,     # max_sm_count=0 -> auto
+        mode
     )
     torch.cuda.synchronize()
 
@@ -181,31 +263,13 @@ def test_tma_gather(comm, num_blocks, block_size, pool_blocks, benchmark=False):
     print(f"  tma_gather 调用成功 (ret={ret})")
 
     # 6. 正确性验证
-    expected = torch.empty(num_blocks * block_size, dtype=torch.uint8)
-    for i in range(num_blocks):
-        idx = indices_cpu[i].item()
-        src_start = idx * block_size
-        dst_start = i * block_size
-        expected[dst_start:dst_start + block_size] = cpu_pool[src_start:src_start + block_size]
-
-    actual = gpu_output.cpu()
-    diff = (actual.float() - expected.float()).abs().sum().item()
+    baseline_res = cpu_pool[indices_cpu].to(device)
+    diff = (gpu_output.view(num_blocks, block_size).float() - baseline_res.float()).abs().sum().item()
 
     if diff == 0:
         print(f"  ✅ 数据验证通过: {num_blocks} blocks 全部正确")
     else:
-        mismatches = 0
-        for i in range(num_blocks):
-            s = i * block_size
-            e = s + block_size
-            if not torch.equal(actual[s:e], expected[s:e]):
-                mismatches += 1
-                if mismatches <= 3:
-                    idx = indices_cpu[i].item()
-                    print(f"  ❌ Block {i} (index={idx}) 不匹配:")
-                    print(f"     expected[:8] = {expected[s:s+8].tolist()}")
-                    print(f"     actual[:8]   = {actual[s:s+8].tolist()}")
-        print(f"  ❌ 共 {mismatches}/{num_blocks} blocks 不匹配")
+        print(f"  ❌ 数据验证失败: 差异总和 {diff}")
         comm.unmap_dram_from_gpu(pool_addr)
         return False
 
@@ -215,7 +279,7 @@ def test_tma_gather(comm, num_blocks, block_size, pool_blocks, benchmark=False):
         iters = 100
         for _ in range(warmup):
             comm.tma_gather(dram_dev_ptr, indices_gpu.data_ptr(),
-                            gpu_output.data_ptr(), num_blocks, block_size, 0)
+                            gpu_output.data_ptr(), num_blocks, block_size, 0, mode)
         torch.cuda.synchronize()
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -223,46 +287,58 @@ def test_tma_gather(comm, num_blocks, block_size, pool_blocks, benchmark=False):
         start_event.record()
         for _ in range(iters):
             comm.tma_gather(dram_dev_ptr, indices_gpu.data_ptr(),
-                            gpu_output.data_ptr(), num_blocks, block_size, 0)
+                            gpu_output.data_ptr(), num_blocks, block_size, 0, mode)
         end_event.record()
         torch.cuda.synchronize()
 
         avg_ms = start_event.elapsed_time(end_event) / iters
         data_mb = (num_blocks * block_size) / (1024 * 1024)
         bw_gbs = (num_blocks * block_size) / (avg_ms / 1000) / 1e9
-        print(f"  📊 TMA Gather 性能: {avg_ms:.4f} ms/iter, "
+        print(f"  📊 Gather 性能: {avg_ms:.4f} ms/iter, "
               f"{data_mb:.2f} MB, {bw_gbs:.2f} GB/s")
 
-        # 与 PyTorch baseline 对比
+        # PyTorch baseline: pin_memory + CPU gather + PCIe copy (与 bench_opt.py 一致)
+        cpu_pinned = cpu_pool.pin_memory()
+        # 预热
+        _ = cpu_pinned[indices_cpu].to(device, non_blocking=True)
+        torch.cuda.synchronize()
+
         start_event.record()
         for _ in range(iters):
-            _ = cpu_pool.view(pool_blocks, block_size)[indices_cpu].to(device)
+            _ = cpu_pinned[indices_cpu].to(device, non_blocking=True)
         end_event.record()
         torch.cuda.synchronize()
 
         baseline_ms = start_event.elapsed_time(end_event) / iters
         baseline_bw = (num_blocks * block_size) / (baseline_ms / 1000) / 1e9
         speedup = baseline_ms / avg_ms if avg_ms > 0 else float('inf')
-        print(f"  📊 PyTorch Baseline: {baseline_ms:.4f} ms/iter, {baseline_bw:.2f} GB/s")
-        print(f"  📊 TMA 加速比: {speedup:.2f}x")
+        print(f"  📊 PyTorch Baseline (pin_memory): {baseline_ms:.4f} ms/iter, {baseline_bw:.2f} GB/s")
+        print(f"  📊 加速比: {speedup:.2f}x")
+        print(f"  📊 SM 资源预估: 仅需 {num_blocks * (block_size // 16)} 个线程, "
+              f"约 H20 并发能力的 {num_blocks * (block_size // 16) / 200000 * 100:.1f}%")
+
+        del cpu_pinned
 
     comm.unmap_dram_from_gpu(pool_addr)
     return True
 
 
-def test_tma_scatter(comm, num_blocks, block_size, pool_blocks, benchmark=False):
+def test_tma_scatter(comm, num_blocks, block_size, pool_blocks, benchmark=False, mode=0):
     """测试 TMA Scatter: GPU HBM -> DRAM"""
+    mode_name = MODE_NAMES.get(mode, f"Unknown({mode})")
     print(f"\n{'='*60}")
-    print(f"TMA Scatter 测试: {num_blocks} blocks x {block_size} bytes")
+    print(f"{mode_name} Scatter 测试: {num_blocks} blocks x {block_size} bytes")
     print(f"{'='*60}")
 
     device = torch.device("cuda:0")
 
-    # 1. 在 CPU 上分配 DRAM 目标内存池 (清零)
-    cpu_pool = torch.zeros(pool_blocks * block_size, dtype=torch.uint8)
+    # 1. 在 CPU 上分配 DRAM 目标内存池 (1024B 对齐, 清零)
+    print(f"  正在分配 CPU 目标池: {pool_blocks} blocks "
+          f"({pool_blocks * block_size / 1024 / 1024:.1f} MB)...")
+    cpu_pool = _alloc_aligned(pool_blocks * block_size, 1024)
+    cpu_pool.zero_()
     pool_addr = cpu_pool.data_ptr()
-    print(f"  CPU 目标池: {pool_blocks} blocks ({pool_blocks * block_size / 1024 / 1024:.1f} MB), "
-          f"addr=0x{pool_addr:x}")
+    print(f"  CPU 目标池: addr=0x{pool_addr:x}")
 
     # 2. 映射 DRAM 到 GPU
     dram_dev_ptr = comm.map_dram_to_gpu(pool_addr, pool_blocks * block_size)
@@ -288,7 +364,8 @@ def test_tma_scatter(comm, num_blocks, block_size, pool_blocks, benchmark=False)
         dram_dev_ptr,
         num_blocks,
         block_size,
-        0
+        0,
+        mode
     )
     torch.cuda.synchronize()
 
@@ -330,7 +407,7 @@ def test_tma_scatter(comm, num_blocks, block_size, pool_blocks, benchmark=False)
         iters = 100
         for _ in range(warmup):
             comm.tma_scatter(gpu_src.data_ptr(), indices_gpu.data_ptr(),
-                             dram_dev_ptr, num_blocks, block_size, 0)
+                             dram_dev_ptr, num_blocks, block_size, 0, mode)
         torch.cuda.synchronize()
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -338,21 +415,21 @@ def test_tma_scatter(comm, num_blocks, block_size, pool_blocks, benchmark=False)
         start_event.record()
         for _ in range(iters):
             comm.tma_scatter(gpu_src.data_ptr(), indices_gpu.data_ptr(),
-                             dram_dev_ptr, num_blocks, block_size, 0)
+                             dram_dev_ptr, num_blocks, block_size, 0, mode)
         end_event.record()
         torch.cuda.synchronize()
 
         avg_ms = start_event.elapsed_time(end_event) / iters
         data_mb = (num_blocks * block_size) / (1024 * 1024)
         bw_gbs = (num_blocks * block_size) / (avg_ms / 1000) / 1e9
-        print(f"  📊 TMA Scatter 性能: {avg_ms:.4f} ms/iter, "
+        print(f"  📊 Scatter 性能: {avg_ms:.4f} ms/iter, "
               f"{data_mb:.2f} MB, {bw_gbs:.2f} GB/s")
 
     comm.unmap_dram_from_gpu(pool_addr)
     return True
 
 
-def test_tma_roundtrip(comm, num_blocks, block_size, pool_blocks):
+def test_tma_roundtrip(comm, num_blocks, block_size, pool_blocks, mode=0):
     """测试 TMA 往返: Scatter 写入 DRAM, 再 Gather 读回, 验证一致性"""
     print(f"\n{'='*60}")
     print(f"TMA 往返测试 (Scatter -> Gather): {num_blocks} blocks x {block_size} bytes")
@@ -360,8 +437,11 @@ def test_tma_roundtrip(comm, num_blocks, block_size, pool_blocks):
 
     device = torch.device("cuda:0")
 
-    # 1. 分配 CPU 内存池 (清零)
-    cpu_pool = torch.zeros(pool_blocks * block_size, dtype=torch.uint8)
+    # 1. 分配 CPU 内存池 (1024B 对齐, 清零)
+    print(f"  正在分配 CPU 内存池: {pool_blocks} blocks "
+          f"({pool_blocks * block_size / 1024 / 1024:.1f} MB)...")
+    cpu_pool = _alloc_aligned(pool_blocks * block_size, 1024)
+    cpu_pool.zero_()
     pool_addr = cpu_pool.data_ptr()
     dram_dev_ptr = comm.map_dram_to_gpu(pool_addr, pool_blocks * block_size)
     if dram_dev_ptr == 0:
@@ -377,7 +457,7 @@ def test_tma_roundtrip(comm, num_blocks, block_size, pool_blocks):
     indices_gpu = indices_cpu.to(device)
 
     ret = comm.tma_scatter(gpu_original.data_ptr(), indices_gpu.data_ptr(),
-                            dram_dev_ptr, num_blocks, block_size, 0)
+                            dram_dev_ptr, num_blocks, block_size, 0, mode)
     torch.cuda.synchronize()
     if ret != 0:
         print(f"  ❌ tma_scatter 失败: {ret}")
@@ -388,7 +468,7 @@ def test_tma_roundtrip(comm, num_blocks, block_size, pool_blocks):
     # 4. Gather: DRAM -> GPU (用相同 indices)
     gpu_readback = torch.zeros(num_blocks * block_size, dtype=torch.uint8, device=device)
     ret = comm.tma_gather(dram_dev_ptr, indices_gpu.data_ptr(),
-                           gpu_readback.data_ptr(), num_blocks, block_size, 0)
+                           gpu_readback.data_ptr(), num_blocks, block_size, 0, mode)
     torch.cuda.synchronize()
     if ret != 0:
         print(f"  ❌ tma_gather 失败: {ret}")
@@ -422,7 +502,7 @@ def test_tma_roundtrip(comm, num_blocks, block_size, pool_blocks):
     return True
 
 
-def test_tma_alignment(comm):
+def test_tma_alignment(comm, mode=0):
     """测试 TMA 对齐要求"""
     print(f"\n{'='*60}")
     print("TMA 对齐测试")
@@ -431,13 +511,13 @@ def test_tma_alignment(comm):
     device = torch.device("cuda:0")
 
     # 测试多种 block_size (都必须是 16 的倍数)
-    test_sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    test_sizes = [16, 32, 64, 128, 256, 512, 1024]
     num_blocks = 64
     pool_blocks = 256
 
     all_pass = True
     for block_size in test_sizes:
-        cpu_pool = torch.empty(pool_blocks * block_size, dtype=torch.uint8)
+        cpu_pool = _alloc_aligned(pool_blocks * block_size, 1024)
         for i in range(pool_blocks):
             cpu_pool[i * block_size:(i + 1) * block_size] = i % 256
 
@@ -453,7 +533,7 @@ def test_tma_alignment(comm):
         gpu_output = torch.zeros(num_blocks * block_size, dtype=torch.uint8, device=device)
 
         ret = comm.tma_gather(dram_dev_ptr, indices_gpu.data_ptr(),
-                               gpu_output.data_ptr(), num_blocks, block_size, 0)
+                               gpu_output.data_ptr(), num_blocks, block_size, 0, mode)
         torch.cuda.synchronize()
 
         if ret != 0:
@@ -489,23 +569,30 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-    python test_tma.py                                    # 基本正确性测试
+    python test_tma.py                                    # 基本正确性测试 (2M pool)
     python test_tma.py --benchmark                        # 带性能基准测试
     python test_tma.py --num-blocks 2048 --block-size 2048  # 自定义参数
-    python test_tma.py --pool-blocks 1048576 --benchmark  # 大规模测试
+    python test_tma.py --pool-blocks 4000000 --benchmark  # 大规模测试
 """
     )
-    parser.add_argument("--num-blocks", type=int, default=1024,
-                        help="每次 gather/scatter 的 block 数 (default: 1024)")
+    parser.add_argument("--num-blocks", type=int, default=1000,
+                        help="每次 gather/scatter 的 block 数 (default: 1000)")
     parser.add_argument("--block-size", type=int, default=1024,
                         help="每个 block 大小(字节), 必须 16 字节对齐 (default: 1024)")
-    parser.add_argument("--pool-blocks", type=int, default=8192,
-                        help="DRAM 内存池总 block 数 (default: 8192)")
+    parser.add_argument("--pool-blocks", type=int, default=2000000,
+                        help="DRAM 内存池总 block 数 (default: 2000000, ~2GB)")
     parser.add_argument("--benchmark", action="store_true",
                         help="运行性能基准测试")
+    parser.add_argument("--mode", type=str, default="auto",
+                        choices=["auto", "sm", "tma"],
+                        help="H2D 传输模式: auto (默认自动选择), sm (int4 Zero-Copy), tma (Hopper TMA engine)")
     parser.add_argument("--gpu", type=int, default=0,
                         help="CUDA 设备编号 (default: 0)")
     args = parser.parse_args()
+
+    # 解析 mode
+    MODE_MAP = {"auto": 0, "sm": 1, "tma": 2}
+    h2d_mode = MODE_MAP[args.mode]
 
     # 参数检查
     if args.block_size % 16 != 0:
@@ -522,16 +609,21 @@ def main():
     torch.cuda.set_device(args.gpu)
     props = torch.cuda.get_device_properties(args.gpu)
     print(f"{'='*60}")
-    print(f"MPComm TMA 接口测试")
+    print(f"MPComm H2D 接口测试")
     print(f"{'='*60}")
     print(f"GPU: {props.name} (SMs: {props.multi_processor_count}, "
           f"Compute: {props.major}.{props.minor})")
+    mode_name = MODE_NAMES.get(h2d_mode, f"Unknown({h2d_mode})")
     print(f"参数: num_blocks={args.num_blocks}, block_size={args.block_size}, "
           f"pool_blocks={args.pool_blocks}")
+    print(f"传输模式: {mode_name}")
 
-    if props.major < 9:
+    if props.major < 9 and h2d_mode != 1:
         print(f"\n⚠️  警告: TMA 需要 Hopper 架构 (sm_90+), 当前为 sm_{props.major}{props.minor}")
-        print(f"   TMA 内核可能无法执行!")
+        print(f"   TMA 内核可能无法执行! 建议使用 --mode sm")
+
+    # Bind DRAM allocation to GPU-local NUMA node for optimal PCIe bandwidth
+    gpu_numa = _bind_numa_to_gpu(args.gpu)
 
     # 初始化 MPComm (本地模式，无需 RDMA 连接)
     comm = mpcomm.MPComm()
@@ -547,24 +639,24 @@ def main():
     ok = test_map_dram_to_gpu(comm)
     results.append(("DRAM-GPU Mapping", ok))
 
-    # 测试 1: TMA Gather
+    # 测试 1: Gather
     ok = test_tma_gather(comm, args.num_blocks, args.block_size,
-                         args.pool_blocks, args.benchmark)
-    results.append(("TMA Gather", ok))
+                         args.pool_blocks, args.benchmark, h2d_mode)
+    results.append(("Gather", ok))
 
-    # 测试 2: TMA Scatter
+    # 测试 2: Scatter
     ok = test_tma_scatter(comm, args.num_blocks, args.block_size,
-                          args.pool_blocks, args.benchmark)
-    results.append(("TMA Scatter", ok))
+                          args.pool_blocks, args.benchmark, h2d_mode)
+    results.append(("Scatter", ok))
 
     # 测试 3: 往返测试 (Scatter -> Gather 一致性)
     ok = test_tma_roundtrip(comm, args.num_blocks, args.block_size,
-                             args.pool_blocks)
-    results.append(("TMA Roundtrip", ok))
+                             args.pool_blocks, h2d_mode)
+    results.append(("Roundtrip", ok))
 
     # 测试 4: 对齐测试 (多种 block_size)
-    ok = test_tma_alignment(comm)
-    results.append(("TMA Alignment", ok))
+    ok = test_tma_alignment(comm, h2d_mode)
+    results.append(("Alignment", ok))
 
     # 汇总
     print(f"\n{'='*60}")

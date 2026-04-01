@@ -512,40 +512,44 @@ public:
     // ==================== TMA Transfer API ====================
 
     /**
-     * TMA Gather: Load scattered blocks from DRAM to GPU HBM
+     * Gather: Load scattered blocks from DRAM to GPU HBM
      * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
      * @param indices_ptr    Pointer to block indices array (on GPU)
      * @param gpu_dst_ptr    GPU HBM destination address
      * @param num_blocks     Number of blocks to gather
      * @param block_size     Size of each block in bytes
      * @param max_sm_count   Maximum SMs to use (0 = auto)
+     * @param mode           Transfer mode: 0=AUTO, 1=SM, 2=TMA
      * @return 0 on success, negative error code on failure
      */
     int tmaGather(uintptr_t dram_dev_ptr, uintptr_t indices_ptr,
                   uintptr_t gpu_dst_ptr, int num_blocks, int block_size,
-                  int max_sm_count = 0) {
+                  int max_sm_count = 0, int mode = 0) {
         return comm_.tmaGather(dram_dev_ptr,
                                reinterpret_cast<const long *>(indices_ptr),
                                reinterpret_cast<void *>(gpu_dst_ptr),
-                               num_blocks, block_size, max_sm_count);
+                               num_blocks, block_size, max_sm_count,
+                               static_cast<H2DMode>(mode));
     }
 
     /**
-     * TMA Scatter: Store data blocks from GPU HBM to DRAM
+     * Scatter: Store data blocks from GPU HBM to DRAM
      * @param gpu_src_ptr    GPU HBM source address
      * @param indices_ptr    Pointer to block indices array (on GPU)
      * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
      * @param num_blocks     Number of blocks to scatter
      * @param block_size     Size of each block in bytes
      * @param max_sm_count   Maximum SMs to use (0 = auto)
+     * @param mode           Transfer mode: 0=AUTO, 1=SM, 2=TMA
      * @return 0 on success, negative error code on failure
      */
     int tmaScatter(uintptr_t gpu_src_ptr, uintptr_t indices_ptr,
                    uintptr_t dram_dev_ptr, int num_blocks, int block_size,
-                   int max_sm_count = 0) {
+                   int max_sm_count = 0, int mode = 0) {
         return comm_.tmaScatter(reinterpret_cast<void *>(gpu_src_ptr),
                                 reinterpret_cast<const long *>(indices_ptr),
-                                dram_dev_ptr, num_blocks, block_size, max_sm_count);
+                                dram_dev_ptr, num_blocks, block_size,
+                                max_sm_count, static_cast<H2DMode>(mode));
     }
 
 private:
@@ -728,7 +732,7 @@ m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
         .def("unmap_dram_from_gpu", &MPCommPy::unmapDRAMfromGPU,
              py::arg("host_addr"),
              "Unmap a previously mapped DRAM buffer from GPU address space")
-        // TMA Transfer API
+        // H2D Transfer API (supports SM and TMA modes)
         .def("tma_gather", &MPCommPy::tmaGather,
              py::arg("dram_dev_ptr"),
              py::arg("indices_ptr"),
@@ -736,7 +740,9 @@ m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
              py::arg("num_blocks"),
              py::arg("block_size"),
              py::arg("max_sm_count") = 0,
-             "TMA Gather: Load scattered blocks from DRAM (mapped) to GPU HBM using TMA engine")
+             py::arg("mode") = 0,
+             "Gather: Load scattered blocks from DRAM to GPU HBM.\n"
+             "mode: 0=AUTO (default), 1=SM (int4 Zero-Copy), 2=TMA (cp.async.bulk)")
         .def("tma_scatter", &MPCommPy::tmaScatter,
              py::arg("gpu_src_ptr"),
              py::arg("indices_ptr"),
@@ -744,7 +750,14 @@ m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
              py::arg("num_blocks"),
              py::arg("block_size"),
              py::arg("max_sm_count") = 0,
-             "TMA Scatter: Store blocks from GPU HBM to DRAM (mapped) using TMA engine");
+             py::arg("mode") = 0,
+             "Scatter: Store blocks from GPU HBM to DRAM.\n"
+             "mode: 0=AUTO (default), 1=SM (int4 Zero-Copy), 2=TMA (cp.async.bulk)");
+
+    // Expose H2DMode constants
+    m.attr("H2D_MODE_AUTO") = static_cast<int>(H2D_MODE_AUTO);
+    m.attr("H2D_MODE_SM")   = static_cast<int>(H2D_MODE_SM);
+    m.attr("H2D_MODE_TMA")  = static_cast<int>(H2D_MODE_TMA);
 }
 
 }  // namespace mpcomm

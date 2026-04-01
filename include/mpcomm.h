@@ -48,6 +48,26 @@ enum MPCommError {
 using TransferHandle = uint64_t;
 static constexpr TransferHandle INVALID_TRANSFER_HANDLE = 0;
 
+/**
+ * H2D (Host-to-Device) transfer mode for gather/scatter operations.
+ *
+ *   AUTO - Automatically select the best kernel based on hardware.
+ *          On Hopper (sm_90+), defaults to TMA for optimal PCIe bandwidth
+ *          with minimal SM occupancy.
+ *   SM   - int4 vectorized Zero-Copy.  GPU SM threads directly read/write DRAM
+ *          via PCIe using 128-bit LDG/STG instructions.  Optional optimization
+ *          that trades SM compute resources for simplicity (no Smem staging).
+ *          Requires block_size to be 16-byte aligned.
+ *   TMA  - Hopper TMA engine (cp.async.bulk).  Data goes through Shared Memory
+ *          staging with mbarrier synchronization.  Minimal SM occupancy; best
+ *          for large contiguous transfers.  Requires sm_90+ (H100/H800/H20).
+ */
+enum H2DMode {
+    H2D_MODE_AUTO = 0,   // Auto-select best kernel (default)
+    H2D_MODE_SM   = 1,   // int4 vectorized Zero-Copy (SM-driven)
+    H2D_MODE_TMA  = 2,   // Hopper TMA engine (cp.async.bulk via Smem)
+};
+
 // Maximum size for a single RDMA transfer (default: 1 GB)
 // Can be configured via environment variable MPCOMM_MAX_RDMA_TRANSFER_SIZE
 static constexpr size_t MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE = 1ULL << 30;
@@ -416,14 +436,15 @@ public:
      */
     int unmapDRAMfromGPU(void *host_addr);
 
-    // ==================== TMA Transfer API ====================
+    // ==================== H2D Transfer API ====================
 
     /**
-     * TMA Gather: Load scattered data blocks from DRAM (via mapped pointer) to GPU HBM
+     * Gather: Load scattered data blocks from DRAM (via mapped pointer) to GPU HBM
      *
-     * Uses NVIDIA Hopper's TMA engine (cp.async.bulk) to efficiently transfer
-     * data from CPU DRAM (mapped as GPU-accessible) to GPU HBM, minimizing SM
-     * occupancy while saturating PCIe bandwidth.
+     * Supports two kernel backends selectable via `mode`:
+     *   H2D_MODE_AUTO (default) - auto-select based on block_size and hardware
+     *   H2D_MODE_SM   - int4 vectorized Zero-Copy (LDG.E.128, SM-driven)
+     *   H2D_MODE_TMA  - Hopper TMA engine (cp.async.bulk, requires sm_90+)
      *
      * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
      * @param indices        Array of block indices to gather (on GPU)
@@ -431,6 +452,7 @@ public:
      * @param num_blocks     Number of blocks to gather
      * @param block_size     Size of each block in bytes (must be aligned to 16 bytes)
      * @param max_sm_count   Maximum number of SMs to use (0 = auto)
+     * @param mode           Transfer mode: H2D_MODE_AUTO, H2D_MODE_SM, or H2D_MODE_TMA
      * @return 0 on success, negative error code on failure
      */
     int tmaGather(uintptr_t dram_dev_ptr,
@@ -438,13 +460,16 @@ public:
                   void *gpu_dst,
                   int num_blocks,
                   int block_size,
-                  int max_sm_count = 0);
+                  int max_sm_count = 0,
+                  H2DMode mode = H2D_MODE_AUTO);
 
     /**
-     * TMA Scatter: Store data blocks from GPU HBM to DRAM (via mapped pointer)
+     * Scatter: Store data blocks from GPU HBM to DRAM (via mapped pointer)
      *
-     * Uses NVIDIA Hopper's TMA engine to efficiently transfer data from GPU HBM
-     * to CPU DRAM (mapped as GPU-accessible).
+     * Supports two kernel backends selectable via `mode`:
+     *   H2D_MODE_AUTO (default) - auto-select based on block_size and hardware
+     *   H2D_MODE_SM   - int4 vectorized Zero-Copy (STG.E.128, SM-driven)
+     *   H2D_MODE_TMA  - Hopper TMA engine (cp.async.bulk, requires sm_90+)
      *
      * @param gpu_src        Source GPU HBM buffer
      * @param indices        Array of block indices to scatter (on GPU)
@@ -452,6 +477,7 @@ public:
      * @param num_blocks     Number of blocks to scatter
      * @param block_size     Size of each block in bytes (must be aligned to 16 bytes)
      * @param max_sm_count   Maximum number of SMs to use (0 = auto)
+     * @param mode           Transfer mode: H2D_MODE_AUTO, H2D_MODE_SM, or H2D_MODE_TMA
      * @return 0 on success, negative error code on failure
      */
     int tmaScatter(void *gpu_src,
@@ -459,7 +485,8 @@ public:
                    uintptr_t dram_dev_ptr,
                    int num_blocks,
                    int block_size,
-                   int max_sm_count = 0);
+                   int max_sm_count = 0,
+                   H2DMode mode = H2D_MODE_AUTO);
 
     // ==================== End HBM-DRAM Mapping & TMA API ====================
 

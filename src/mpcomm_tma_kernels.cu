@@ -20,28 +20,39 @@
 // and GPU HBM. The TMA engine operates independently of SM compute
 // resources, minimizing SM occupancy while saturating PCIe bandwidth.
 //
+// TMA kernels use a multi-warp, multi-task-per-warp design where each
+// warp drives multiple independent TMA transactions concurrently,
+// maximizing in-flight PCIe requests per CTA.
+//
 // Based on HD_comm/bench_H2D_TMA/kv_gather_tma.cu
 // ==========================================================================
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <vector_types.h>  // int4
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
 
 namespace mpcomm {
 
-// ==========================================================================
-// Configuration Constants
-// ==========================================================================
-
-static constexpr int kWarpsPerBlock = 32;
-static constexpr int kTasksPerWarp = 4;
-static constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;
-
 // L2 Cache eviction hints for TMA operations
 // EvictFirst: data will be evicted from L2 first (good for streaming/one-shot access)
 static constexpr uint64_t kL2EvictFirst = 0x12f0000000000000ULL;
+
+// ==========================================================================
+// TMA multi-warp configuration
+//
+// Each CTA launches warps_per_block warps.  Within each warp, the first
+// tasks_per_warp lanes each independently issue TMA load → wait → store
+// sequences.  This gives warps_per_block * tasks_per_warp concurrent
+// in-flight TMA transactions per CTA, which is critical for saturating
+// PCIe bandwidth with small (1 KB) blocks.
+// ==========================================================================
+static constexpr int kTMAWarpsPerBlock = 32;
+static constexpr int kTMATasksPerWarp  = 4;
+static constexpr int kTMAThreadsPerBlock = kTMAWarpsPerBlock * 32;
+static constexpr int kTMATasksPerBlock = kTMAWarpsPerBlock * kTMATasksPerWarp;
 
 // ==========================================================================
 // PTX Wrappers for TMA Operations
@@ -93,7 +104,7 @@ __device__ __forceinline__ void tma_store(
     );
 }
 
-// Wait for mbarrier with parity phase
+// Wait for mbarrier with parity phase (pure busy-wait, no nanosleep)
 __device__ __forceinline__ void mbarrier_wait(uint64_t* barrier_ptr, uint32_t phase) {
     uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
     asm volatile(
@@ -120,63 +131,60 @@ __device__ __forceinline__ void tma_store_wait() {
 // ==========================================================================
 // TMA Gather Kernel: DRAM (mapped) -> GPU HBM
 //
-// Each warp processes kTasksPerWarp tasks simultaneously.
-// Only the first kTasksPerWarp lanes of each warp are active.
-// Flow per task:
-//   1. TMA Load: DRAM[indices[i]] -> Shared Memory
-//   2. Wait for load completion (mbarrier)
-//   3. TMA Store: Shared Memory -> HBM[i]
-//   4. Wait for store completion
+// Multi-warp, multi-task-per-warp design.  Each CTA has
+// kTMAWarpsPerBlock warps; within each warp, the first kTMATasksPerWarp
+// lanes each independently drive a TMA load→wait→store pipeline.
+// This gives kTMATasksPerBlock (128) concurrent in-flight TMA
+// transactions per CTA, matching the HD_comm reference implementation.
+//
+// Shared memory layout per CTA:
+//   Data:     kTMATasksPerBlock * block_size_bytes
+//   Barriers: kTMATasksPerBlock * 8  (one mbarrier per task slot)
 // ==========================================================================
 __global__ void tma_gather_kernel(
-    const char* __restrict__ src_base,      // DRAM device pointer (mapped)
-    const long* __restrict__ indices,        // Block indices to gather
-    char* __restrict__ dst_base,             // GPU HBM destination
-    int block_size_bytes,                    // Size of each block
-    int total_tasks                          // Total number of blocks to gather
+    const char* __restrict__ src_base,
+    const long* __restrict__ indices,
+    char* __restrict__ dst_base,
+    int block_size_bytes,
+    int total_tasks
 ) {
-    // Shared memory layout:
-    //   [0 .. warps*tasks*block_size) : data blocks
-    //   [warps*tasks*block_size .. +warps*tasks*8) : mbarrier array
     extern __align__(1024) __shared__ char smem_buffer[];
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
 
-    // Each warp's task slot in shared memory
-    char* my_data_block = smem_buffer +
-        (warp_id * kTasksPerWarp + lane_id) * block_size_bytes;
-    uint64_t* my_barrier_ptr = reinterpret_cast<uint64_t*>(
-        smem_buffer + kWarpsPerBlock * kTasksPerWarp * block_size_bytes +
-        (warp_id * kTasksPerWarp + lane_id) * 8
+    // Each active lane gets its own data slot and barrier in shared memory
+    const int slot_id = warp_id * kTMATasksPerWarp + lane_id;
+    char* my_data = smem_buffer + slot_id * block_size_bytes;
+    uint64_t* my_barrier = reinterpret_cast<uint64_t*>(
+        smem_buffer + kTMATasksPerBlock * block_size_bytes + slot_id * 8
     );
 
-    // Task ID: each block processes warps_per_block * tasks_per_warp tasks
-    int first_task_id = blockIdx.x * kWarpsPerBlock * kTasksPerWarp +
-                        warp_id * kTasksPerWarp + lane_id;
-    int stride = gridDim.x * kWarpsPerBlock * kTasksPerWarp;
-    uint32_t phase_id = 1;
+    // Task assignment: grid-stride over all tasks
+    const int first_task = blockIdx.x * kTMATasksPerBlock + slot_id;
+    const int stride = gridDim.x * kTMATasksPerBlock;
+    uint32_t phase = 1;
 
-    // Initialize mbarrier (only active lanes)
-    if (lane_id < kTasksPerWarp) {
-        mbarrier_init(my_barrier_ptr, 1);
+    // Only the first kTMATasksPerWarp lanes per warp are active
+    if (lane_id < kTMATasksPerWarp) {
+        mbarrier_init(my_barrier, 1);
     }
 
-    for (int i = first_task_id; i < total_tasks; i += stride) {
-        if (lane_id < kTasksPerWarp) {
-            long target_idx = indices[i];
+    for (int i = first_task; i < total_tasks; i += stride) {
+        if (lane_id < kTMATasksPerWarp) {
+            const long target_idx = indices[i];
             const char* src_addr = src_base + target_idx * block_size_bytes;
-            char* dst_addr = dst_base + i * block_size_bytes;
+            char* dst_addr = dst_base + (long)i * block_size_bytes;
 
-            // Step 1: TMA Load (DRAM -> Shared Memory)
-            mbarrier_expect_tx(my_barrier_ptr, block_size_bytes);
-            tma_load(my_data_block, src_addr, block_size_bytes, my_barrier_ptr);
+            // 1. TMA Load: DRAM (mapped) -> Shared Memory
+            mbarrier_expect_tx(my_barrier, block_size_bytes);
+            tma_load(my_data, src_addr, block_size_bytes, my_barrier);
 
-            // Step 2: Wait for load completion
-            mbarrier_wait(my_barrier_ptr, (++phase_id) % 2);
+            // 2. Wait for Load to complete
+            mbarrier_wait(my_barrier, (++phase) % 2);
 
-            // Step 3: TMA Store (Shared Memory -> GPU HBM)
-            tma_store(dst_addr, my_data_block, block_size_bytes);
+            // 3. TMA Store: Shared Memory -> GPU HBM
+            tma_store(dst_addr, my_data, block_size_bytes);
             tma_store_commit();
             tma_store_wait();
         }
@@ -186,52 +194,52 @@ __global__ void tma_gather_kernel(
 // ==========================================================================
 // TMA Scatter Kernel: GPU HBM -> DRAM (mapped)
 //
-// Reverse of gather: reads from contiguous HBM blocks and writes to
-// scattered DRAM locations through the mapped device pointer.
+// Same multi-warp, multi-task-per-warp design as gather, but reversed:
+// reads from contiguous HBM and writes to scattered DRAM locations.
 // ==========================================================================
 __global__ void tma_scatter_kernel(
-    const char* __restrict__ src_base,      // GPU HBM source
-    const long* __restrict__ indices,        // Block indices for scatter
-    char* __restrict__ dst_base,             // DRAM device pointer (mapped)
-    int block_size_bytes,                    // Size of each block
-    int total_tasks                          // Total number of blocks to scatter
+    const char* __restrict__ src_base,
+    const long* __restrict__ indices,
+    char* __restrict__ dst_base,
+    int block_size_bytes,
+    int total_tasks
 ) {
     extern __align__(1024) __shared__ char smem_buffer[];
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
 
-    char* my_data_block = smem_buffer +
-        (warp_id * kTasksPerWarp + lane_id) * block_size_bytes;
-    uint64_t* my_barrier_ptr = reinterpret_cast<uint64_t*>(
-        smem_buffer + kWarpsPerBlock * kTasksPerWarp * block_size_bytes +
-        (warp_id * kTasksPerWarp + lane_id) * 8
+    const int slot_id = warp_id * kTMATasksPerWarp + lane_id;
+    char* my_data = smem_buffer + slot_id * block_size_bytes;
+    uint64_t* my_barrier = reinterpret_cast<uint64_t*>(
+        smem_buffer + kTMATasksPerBlock * block_size_bytes + slot_id * 8
     );
 
-    int first_task_id = blockIdx.x * kWarpsPerBlock * kTasksPerWarp +
-                        warp_id * kTasksPerWarp + lane_id;
-    int stride = gridDim.x * kWarpsPerBlock * kTasksPerWarp;
-    uint32_t phase_id = 1;
+    const int first_task = blockIdx.x * kTMATasksPerBlock + slot_id;
+    const int stride = gridDim.x * kTMATasksPerBlock;
+    uint32_t phase = 1;
 
-    if (lane_id < kTasksPerWarp) {
-        mbarrier_init(my_barrier_ptr, 1);
+    if (lane_id < kTMATasksPerWarp) {
+        mbarrier_init(my_barrier, 1);
     }
 
-    for (int i = first_task_id; i < total_tasks; i += stride) {
-        if (lane_id < kTasksPerWarp) {
-            long target_idx = indices[i];
-            const char* src_addr = src_base + i * block_size_bytes;
+    for (int i = first_task; i < total_tasks; i += stride) {
+        if (lane_id < kTMATasksPerWarp) {
+            // Source is contiguous in HBM
+            const char* src_addr = src_base + (long)i * block_size_bytes;
+            // Destination is scattered in DRAM
+            const long target_idx = indices[i];
             char* dst_addr = dst_base + target_idx * block_size_bytes;
 
-            // Step 1: TMA Load (GPU HBM -> Shared Memory)
-            mbarrier_expect_tx(my_barrier_ptr, block_size_bytes);
-            tma_load(my_data_block, src_addr, block_size_bytes, my_barrier_ptr);
+            // 1. TMA Load: GPU HBM -> Shared Memory
+            mbarrier_expect_tx(my_barrier, block_size_bytes);
+            tma_load(my_data, src_addr, block_size_bytes, my_barrier);
 
-            // Step 2: Wait for load completion
-            mbarrier_wait(my_barrier_ptr, (++phase_id) % 2);
+            // 2. Wait for Load to complete
+            mbarrier_wait(my_barrier, (++phase) % 2);
 
-            // Step 3: TMA Store (Shared Memory -> DRAM mapped)
-            tma_store(dst_addr, my_data_block, block_size_bytes);
+            // 3. TMA Store: Shared Memory -> DRAM (mapped)
+            tma_store(dst_addr, my_data, block_size_bytes);
             tma_store_commit();
             tma_store_wait();
         }
@@ -239,17 +247,73 @@ __global__ void tma_scatter_kernel(
 }
 
 // ==========================================================================
+// int4 Zero-Copy Gather Kernel: DRAM (mapped) -> GPU HBM
+//
+// Each thread reads a single int4 (16 bytes) directly from DRAM via PCIe
+// and writes it to HBM.  No Shared Memory staging — one LDG.E.128 + one
+// STG.E.128 per thread.  This is faster than TMA for small-block random
+// gather because it avoids the mbarrier + Smem round-trip overhead.
+//
+// Grid-stride loop so a limited number of blocks can process all tasks.
+// ==========================================================================
+__global__ void zerocopy_gather_int4_kernel(
+    const int4* __restrict__ src_base,   // DRAM device pointer (int4-aligned)
+    const long* __restrict__ indices,    // Block indices to gather
+    int4* __restrict__ dst_base,         // GPU HBM destination (int4-aligned)
+    int block_size_int4,                 // block_size_bytes / 16
+    int total_int4_tasks                 // num_blocks * block_size_int4
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    for (int i = idx; i < total_int4_tasks; i += stride) {
+        int block_idx = i / block_size_int4;
+        int offset    = i % block_size_int4;
+        long target_id = indices[block_idx];
+        dst_base[i] = src_base[target_id * block_size_int4 + offset];
+    }
+}
+
+// ==========================================================================
+// int4 Zero-Copy Scatter Kernel: GPU HBM -> DRAM (mapped)
+//
+// Reverse of gather: reads int4 from contiguous HBM blocks and writes to
+// scattered DRAM locations via PCIe.
+// ==========================================================================
+__global__ void zerocopy_scatter_int4_kernel(
+    const int4* __restrict__ src_base,   // GPU HBM source (int4-aligned)
+    const long* __restrict__ indices,    // Block indices for scatter
+    int4* __restrict__ dst_base,         // DRAM device pointer (int4-aligned)
+    int block_size_int4,                 // block_size_bytes / 16
+    int total_int4_tasks                 // num_blocks * block_size_int4
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    for (int i = idx; i < total_int4_tasks; i += stride) {
+        int block_idx = i / block_size_int4;
+        int offset    = i % block_size_int4;
+        long target_id = indices[block_idx];
+        dst_base[target_id * block_size_int4 + offset] = src_base[i];
+    }
+}
+
+// ==========================================================================
 // Host-side Launch Wrappers
 // ==========================================================================
 
-// Get the number of SMs on the current device
+// Get the number of SMs on the current device (cached)
 static int getDeviceSMCount() {
+    static int cached_sm_count = 0;
+    if (cached_sm_count > 0) return cached_sm_count;
+
     int device = 0;
     cudaGetDevice(&device);
 
     int sm_count = 0;
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
-    return sm_count > 0 ? sm_count : 132;  // Default to H100's 132 SMs
+    cached_sm_count = sm_count > 0 ? sm_count : 132;
+    return cached_sm_count;
 }
 
 void launch_tma_gather_kernel(
@@ -258,27 +322,71 @@ void launch_tma_gather_kernel(
     char* dst_base,
     int block_size_bytes,
     int total_tasks,
-    int max_sm_count
+    int max_sm_count,
+    int mode   // 0=AUTO, 1=SM (int4 Zero-Copy), 2=TMA (cp.async.bulk)
 ) {
-    // Calculate shared memory size:
-    //   Data: warps_per_block * tasks_per_warp * block_size_bytes
-    //   Barriers: warps_per_block * tasks_per_warp * 8 bytes
-    int smem_size = kWarpsPerBlock * kTasksPerWarp * (block_size_bytes + 8);
-
-    // Calculate grid dimensions
-    const int tasks_per_block = kWarpsPerBlock * kTasksPerWarp;
-    const int blocks_needed = (total_tasks + tasks_per_block - 1) / tasks_per_block;
-
     if (max_sm_count <= 0) {
         max_sm_count = getDeviceSMCount();
     }
-    const int launch_blocks = std::min(blocks_needed, max_sm_count);
 
-    // Set max dynamic shared memory
+    // Determine whether to use SM (int4 Zero-Copy) path
+    // AUTO now defaults to TMA (optimal for Hopper); SM is opt-in via mode=1
+    bool use_sm = false;
+    if (mode == 1) {
+        use_sm = true;
+    } else if (mode == 2) {
+        use_sm = false;
+    } else {
+        // AUTO: default to TMA on Hopper
+        use_sm = false;
+    }
+
+    if (use_sm && (block_size_bytes % 16 == 0)) {
+        // SM path: int4 Zero-Copy (no Shared Memory staging)
+        const int block_size_int4 = block_size_bytes / 16;
+        const int total_int4_tasks = total_tasks * block_size_int4;
+
+        static constexpr int kZCThreads = 256;
+        int blocks_needed = (total_int4_tasks + kZCThreads - 1) / kZCThreads;
+        int launch_blocks = std::min(blocks_needed, max_sm_count * 4);
+
+        printf("[TMA-Gather] backend=SM(int4), blocks=%d, threads=%d, "
+               "tasks=%d, block_size=%d, src=%p (align=%luB)\n",
+               launch_blocks, kZCThreads, total_tasks, block_size_bytes,
+               src_base, (unsigned long)((uintptr_t)src_base % 1024 == 0 ? 1024 :
+                          (uintptr_t)src_base % 64 == 0 ? 64 : (uintptr_t)src_base % 16));
+
+        zerocopy_gather_int4_kernel<<<launch_blocks, kZCThreads>>>(
+            reinterpret_cast<const int4*>(src_base),
+            indices,
+            reinterpret_cast<int4*>(dst_base),
+            block_size_int4,
+            total_int4_tasks
+        );
+        return;
+    }
+
+    // TMA path: multi-warp, multi-task concurrent pipeline
+    // Smem layout: [data: kTMATasksPerBlock * bs | barriers: kTMATasksPerBlock * 8]
+    int smem_size = kTMATasksPerBlock * (block_size_bytes + 8);
+
+    int blocks_needed = (total_tasks + kTMATasksPerBlock - 1) / kTMATasksPerBlock;
+    int launch_blocks = std::min(blocks_needed, max_sm_count);
+    if (launch_blocks <= 0) {
+        return;
+    }
+
+    printf("[TMA-Gather] backend=TMA(cp.async.bulk), CTAs=%d, threads=%d, "
+           "tasks=%d, block_size=%d, smem=%d, src=%p (align=%luB)\n",
+           launch_blocks, kTMAThreadsPerBlock, total_tasks, block_size_bytes,
+           smem_size, src_base,
+           (unsigned long)((uintptr_t)src_base % 1024 == 0 ? 1024 :
+                            (uintptr_t)src_base % 64 == 0 ? 64 : (uintptr_t)src_base % 16));
+
     cudaFuncSetAttribute(tma_gather_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    tma_gather_kernel<<<launch_blocks, kThreadsPerBlock, smem_size>>>(
+    tma_gather_kernel<<<launch_blocks, kTMAThreadsPerBlock, smem_size>>>(
         src_base, indices, dst_base, block_size_bytes, total_tasks
     );
 }
@@ -289,22 +397,67 @@ void launch_tma_scatter_kernel(
     char* dst_base,
     int block_size_bytes,
     int total_tasks,
-    int max_sm_count
+    int max_sm_count,
+    int mode   // 0=AUTO, 1=SM (int4 Zero-Copy), 2=TMA (cp.async.bulk)
 ) {
-    int smem_size = kWarpsPerBlock * kTasksPerWarp * (block_size_bytes + 8);
-
-    const int tasks_per_block = kWarpsPerBlock * kTasksPerWarp;
-    const int blocks_needed = (total_tasks + tasks_per_block - 1) / tasks_per_block;
-
     if (max_sm_count <= 0) {
         max_sm_count = getDeviceSMCount();
     }
-    const int launch_blocks = std::min(blocks_needed, max_sm_count);
+
+    // AUTO now defaults to TMA; SM is opt-in via mode=1
+    bool use_sm = false;
+    if (mode == 1) {
+        use_sm = true;
+    } else if (mode == 2) {
+        use_sm = false;
+    } else {
+        use_sm = false;
+    }
+
+    if (use_sm && (block_size_bytes % 16 == 0)) {
+        const int block_size_int4 = block_size_bytes / 16;
+        const int total_int4_tasks = total_tasks * block_size_int4;
+
+        static constexpr int kZCThreads = 256;
+        int blocks_needed = (total_int4_tasks + kZCThreads - 1) / kZCThreads;
+        int launch_blocks = std::min(blocks_needed, max_sm_count * 4);
+
+        printf("[TMA-Scatter] backend=SM(int4), blocks=%d, threads=%d, "
+               "tasks=%d, block_size=%d, dst=%p (align=%luB)\n",
+               launch_blocks, kZCThreads, total_tasks, block_size_bytes,
+               dst_base, (unsigned long)((uintptr_t)dst_base % 1024 == 0 ? 1024 :
+                          (uintptr_t)dst_base % 64 == 0 ? 64 : (uintptr_t)dst_base % 16));
+
+        zerocopy_scatter_int4_kernel<<<launch_blocks, kZCThreads>>>(
+            reinterpret_cast<const int4*>(src_base),
+            indices,
+            reinterpret_cast<int4*>(dst_base),
+            block_size_int4,
+            total_int4_tasks
+        );
+        return;
+    }
+
+    // TMA path: multi-warp, multi-task concurrent pipeline
+    int smem_size = kTMATasksPerBlock * (block_size_bytes + 8);
+
+    int blocks_needed = (total_tasks + kTMATasksPerBlock - 1) / kTMATasksPerBlock;
+    int launch_blocks = std::min(blocks_needed, max_sm_count);
+    if (launch_blocks <= 0) {
+        return;
+    }
+
+    printf("[TMA-Scatter] backend=TMA(cp.async.bulk), CTAs=%d, threads=%d, "
+           "tasks=%d, block_size=%d, smem=%d, dst=%p (align=%luB)\n",
+           launch_blocks, kTMAThreadsPerBlock, total_tasks, block_size_bytes,
+           smem_size, dst_base,
+           (unsigned long)((uintptr_t)dst_base % 1024 == 0 ? 1024 :
+                            (uintptr_t)dst_base % 64 == 0 ? 64 : (uintptr_t)dst_base % 16));
 
     cudaFuncSetAttribute(tma_scatter_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    tma_scatter_kernel<<<launch_blocks, kThreadsPerBlock, smem_size>>>(
+    tma_scatter_kernel<<<launch_blocks, kTMAThreadsPerBlock, smem_size>>>(
         src_base, indices, dst_base, block_size_bytes, total_tasks
     );
 }

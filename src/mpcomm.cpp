@@ -477,10 +477,10 @@ public:
     // TMA Transfer
     int tmaGather(uintptr_t dram_dev_ptr, const long *indices,
                   void *gpu_dst, int num_blocks, int block_size,
-                  int max_sm_count);
+                  int max_sm_count, int mode);
     int tmaScatter(void *gpu_src, const long *indices,
                    uintptr_t dram_dev_ptr, int num_blocks, int block_size,
-                   int max_sm_count);
+                   int max_sm_count, int mode);
 
 private:
     // Topology discovery
@@ -4893,30 +4893,21 @@ int MPComm::Impl::unmapDRAMfromGPU(void *host_addr) {
 #ifdef USE_CUDA
 extern void launch_tma_gather_kernel(
     const char *src_base, const long *indices, char *dst_base,
-    int block_size_bytes, int total_tasks, int max_sm_count);
+    int block_size_bytes, int total_tasks, int max_sm_count, int mode);
 
 extern void launch_tma_scatter_kernel(
     const char *src_base, const long *indices, char *dst_base,
-    int block_size_bytes, int total_tasks, int max_sm_count);
+    int block_size_bytes, int total_tasks, int max_sm_count, int mode);
 #endif
 
 int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
                              void *gpu_dst, int num_blocks, int block_size,
-                             int max_sm_count) {
+                             int max_sm_count, int mode) {
 #ifdef USE_CUDA
     if (!dram_dev_ptr || !indices || !gpu_dst || num_blocks <= 0 || block_size <= 0) {
         MPCOMM_LOG_ERROR("MPComm: tmaGather: invalid arguments\n");
         return MPCOMM_ERR_INVALID_ARG;
     }
-
-    // Verify alignment requirements for TMA
-    if (dram_dev_ptr % 16 != 0 || reinterpret_cast<uintptr_t>(gpu_dst) % 16 != 0) {
-        MPCOMM_LOG_WARN("MPComm: tmaGather: addresses not 16-byte aligned, "
-                        "performance may be suboptimal\n");
-    }
-
-    MPCOMM_LOG_INFO("MPComm: tmaGather: %d blocks x %d bytes, src=0x%lx -> dst=%p\n",
-                    num_blocks, block_size, (unsigned long)dram_dev_ptr, gpu_dst);
 
     launch_tma_gather_kernel(
         reinterpret_cast<const char *>(dram_dev_ptr),
@@ -4924,12 +4915,13 @@ int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
         reinterpret_cast<char *>(gpu_dst),
         block_size,
         num_blocks,
-        max_sm_count);
+        max_sm_count,
+        mode);
 
     return MPCOMM_SUCCESS;
 #else
     (void)dram_dev_ptr; (void)indices; (void)gpu_dst;
-    (void)num_blocks; (void)block_size; (void)max_sm_count;
+    (void)num_blocks; (void)block_size; (void)max_sm_count; (void)mode;
     MPCOMM_LOG_ERROR("MPComm: tmaGather: CUDA support not compiled (USE_CUDA=OFF)\n");
     return MPCOMM_ERR_DEVICE;
 #endif
@@ -4937,15 +4929,12 @@ int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
 
 int MPComm::Impl::tmaScatter(void *gpu_src, const long *indices,
                               uintptr_t dram_dev_ptr, int num_blocks,
-                              int block_size, int max_sm_count) {
+                              int block_size, int max_sm_count, int mode) {
 #ifdef USE_CUDA
     if (!gpu_src || !indices || !dram_dev_ptr || num_blocks <= 0 || block_size <= 0) {
         MPCOMM_LOG_ERROR("MPComm: tmaScatter: invalid arguments\n");
         return MPCOMM_ERR_INVALID_ARG;
     }
-
-    MPCOMM_LOG_INFO("MPComm: tmaScatter: %d blocks x %d bytes, src=%p -> dst=0x%lx\n",
-                    num_blocks, block_size, gpu_src, (unsigned long)dram_dev_ptr);
 
     launch_tma_scatter_kernel(
         reinterpret_cast<const char *>(gpu_src),
@@ -4953,7 +4942,8 @@ int MPComm::Impl::tmaScatter(void *gpu_src, const long *indices,
         reinterpret_cast<char *>(dram_dev_ptr),
         block_size,
         num_blocks,
-        max_sm_count);
+        max_sm_count,
+        mode);
 
     return MPCOMM_SUCCESS;
 #else
@@ -4978,16 +4968,16 @@ int MPComm::unmapDRAMfromGPU(void *host_addr) {
 
 int MPComm::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
                       void *gpu_dst, int num_blocks, int block_size,
-                      int max_sm_count) {
+                      int max_sm_count, H2DMode mode) {
     return impl_->tmaGather(dram_dev_ptr, indices, gpu_dst, num_blocks,
-                            block_size, max_sm_count);
+                            block_size, max_sm_count, static_cast<int>(mode));
 }
 
 int MPComm::tmaScatter(void *gpu_src, const long *indices,
                        uintptr_t dram_dev_ptr, int num_blocks,
-                       int block_size, int max_sm_count) {
+                       int block_size, int max_sm_count, H2DMode mode) {
     return impl_->tmaScatter(gpu_src, indices, dram_dev_ptr, num_blocks,
-                             block_size, max_sm_count);
+                             block_size, max_sm_count, static_cast<int>(mode));
 }
 
 }  // namespace mpcomm

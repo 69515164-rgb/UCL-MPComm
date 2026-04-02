@@ -19,6 +19,7 @@
 #include <cstring>
 #include <immintrin.h>  // _mm_pause
 #include <pthread.h>    // pthread_self
+#include <set>
 
 namespace mpcomm {
 
@@ -772,8 +773,25 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
         result.copy_done_flag = flag;
         result.success = true;
         result.t_result_pushed = std::chrono::steady_clock::now();
+
+        // Monitor result_queue usage before push
+        size_t rq_size = state->result_queue.sizeApprox();
+        if (rq_size > kPxnCopyQueueCapacity * 3 / 4) {
+            MPCOMM_LOG_WARN("MPComm PXN: result_queue near full: %zu/%zu\n",
+                            rq_size, kPxnCopyQueueCapacity);
+        }
+
+        bool push_stalled = false;
+        auto push_start = std::chrono::steady_clock::now();
         while (!state->result_queue.tryPush(result)) {
+            push_stalled = true;
             _mm_pause();
+        }
+        if (push_stalled) {
+            auto push_dur = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - push_start).count();
+            MPCOMM_LOG_WARN("MPComm PXN: result_queue push stalled for %ld us "
+                            "(queue was full)\n", push_dur);
         }
     }
 

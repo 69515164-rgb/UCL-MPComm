@@ -76,6 +76,13 @@ public:
                tail_.load(std::memory_order_acquire);
     }
 
+    // Approximate size (safe to call from any thread, but not linearizable)
+    size_t sizeApprox() const {
+        size_t h = head_.load(std::memory_order_acquire);
+        size_t t = tail_.load(std::memory_order_acquire);
+        return (t >= h) ? (t - h) : (Capacity + 1 - h + t);
+    }
+
 private:
     T buffer_[Capacity + 1];  // One extra slot for full/empty disambiguation
     alignas(64) std::atomic<size_t> head_;
@@ -91,6 +98,7 @@ inline constexpr const char* kPxnEnableEnvVar = "MPCOMM_PXN_ENABLE";
 inline constexpr const char* kPxnBufferSizeEnvVar = "MPCOMM_PXN_BUFFER_SIZE";
 inline constexpr const char* kPxnDirectRatioEnvVar = "MPCOMM_PXN_DIRECT_RATIO";
 inline constexpr const char* kPxnBenchSequentialEnvVar = "MPCOMM_PXN_BENCH_SEQUENTIAL";
+inline constexpr const char* kPxnProxyNvlinkAlphaEnvVar = "MPCOMM_PXN_NVLINK_ALPHA";
 
 // Default proxy buffer size per GPU: 256 MB
 static constexpr size_t kPxnDefaultBufferSize = 256ULL << 20;
@@ -172,13 +180,15 @@ struct PxnProxyBuffer {
     CUdeviceptr tryAlloc(size_t len) {
         size_t aligned_len = (len + 255) & ~255ULL;  // 256-byte alignment
         size_t cur = alloc_offset.load(std::memory_order_relaxed);
-        size_t free = free_offset.load(std::memory_order_acquire);
+        size_t free_val = free_offset.load(std::memory_order_acquire);
 
         // Simple linear allocation (no wrap-around for simplicity)
-        // Reset when both pointers reach the end
+        // Reset when both pointers reach the end.
+        // Note: free_val can exceed cur if error-path frees occurred
+        // (e.g., submitCopyRequest failure), so we use >= not ==.
         if (cur + aligned_len > size) {
-            if (free == cur) {
-                // Buffer is empty, reset both pointers
+            if (free_val >= cur) {
+                // Buffer is empty (all allocated space has been freed), reset
                 alloc_offset.store(0, std::memory_order_relaxed);
                 free_offset.store(0, std::memory_order_release);
                 cur = 0;

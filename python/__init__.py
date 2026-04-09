@@ -71,6 +71,15 @@ def get_cmake_dir() -> str:
     return _os.path.join(_PACKAGE_DIR, "lib", "cmake", "mpcomm")
 
 
+def get_tests_dir() -> str:
+    """Return the path to the MPComm bundled test / example files.
+
+    Contains scatter_test.cpp, CMakeLists.txt, check_install.sh,
+    cpp-target.sh, and cpp-initiator.sh.
+    """
+    return _os.path.join(_PACKAGE_DIR, "tests")
+
+
 __all__ = [
     "MPComm",
     "MPCommError",
@@ -79,4 +88,5 @@ __all__ = [
     "get_include_dir",
     "get_lib_dir",
     "get_cmake_dir",
+    "get_tests_dir",
 ]

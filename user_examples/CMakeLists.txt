@@ -9,6 +9,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #   cmake .. -DCMAKE_PREFIX_PATH=/opt/mpcomm
 find_package(mpcomm REQUIRED)
 
+# Explicitly resolve mpcomm include directory via Python to work around
+# potential _IMPORT_PREFIX mismatch in pip-installed wheels.
+execute_process(
+    COMMAND python3 -c "import mpcomm; print(mpcomm.get_include_dir())"
+    OUTPUT_VARIABLE MPCOMM_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _mpcomm_py_result
+)
+if(NOT _mpcomm_py_result EQUAL 0 OR NOT EXISTS "${MPCOMM_INCLUDE_DIR}")
+    # Fallback: try to infer from mpcomm_DIR
+    get_filename_component(_mpcomm_pkg_dir "${mpcomm_DIR}/../../.." ABSOLUTE)
+    set(MPCOMM_INCLUDE_DIR "${_mpcomm_pkg_dir}/include")
+endif()
+message(STATUS "MPComm include dir: ${MPCOMM_INCLUDE_DIR}")
+
 # Optional: CUDA support for HBM tests
 option(USE_CUDA "Enable CUDA/GPU memory support" OFF)
 
@@ -22,6 +37,10 @@ target_link_libraries(scatter_test PRIVATE
     mpcomm::mpcomm    # shared library (recommended)
     ${NUMA_LIBRARY}   # for numa_alloc_onnode in test code
 )
+
+# Ensure mpcomm headers are found (supplements INTERFACE_INCLUDE_DIRECTORIES
+# from mpcomm::mpcomm which may have incorrect prefix in pip-installed wheels)
+target_include_directories(scatter_test PRIVATE ${MPCOMM_INCLUDE_DIR})
 
 target_compile_options(scatter_test PRIVATE -Wall -Wextra -O2)
 

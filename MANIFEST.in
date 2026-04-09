@@ -16,8 +16,14 @@ recursive-include cmake *.cmake.in
 # Documentation (for readme)
 include docs/MPComm_Introduction.md
 
+# Test / example files bundled into the wheel
+include check_install.sh
+include user_examples/scatter_test.cpp
+include user_examples/CMakeLists.txt
+include user_examples/cpp-target.sh
+include user_examples/cpp-initiator.sh
+
 # Exclude build artifacts
 prune build
 prune mpcomm-install
-prune user_examples
 prune .codebuddy

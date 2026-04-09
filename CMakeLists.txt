@@ -273,6 +273,16 @@ if(DEFINED SKBUILD)
         DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
     )
 
+    # Test / example files  ->  mpcomm/tests/
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/check_install.sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/scatter_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/CMakeLists.txt
+        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/cpp-target.sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/cpp-initiator.sh
+        DESTINATION ${_PKG_PREFIX}/tests
+    )
+
 else()
     # -----------------------------------------------------------------
     # Standalone CMake build (the original behaviour)

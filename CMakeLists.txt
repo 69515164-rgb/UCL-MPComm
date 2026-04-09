@@ -65,6 +65,7 @@ endif()
 # MPComm static library
 add_library(mpcomm_static STATIC
     src/mpcomm.cpp
+    src/mpcomm_pxn.cpp
 )
 set_target_properties(mpcomm_static PROPERTIES
     OUTPUT_NAME mpcomm
@@ -76,6 +77,9 @@ target_include_directories(mpcomm_static PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     ${IBVERBS_INCLUDE_DIR}
 )
+target_include_directories(mpcomm_static PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 target_link_libraries(mpcomm_static PUBLIC
     ${IBVERBS_LIBRARY}
@@ -86,6 +90,7 @@ target_link_libraries(mpcomm_static PUBLIC
 # MPComm shared library
 add_library(mpcomm_shared SHARED
     src/mpcomm.cpp
+    src/mpcomm_pxn.cpp
 )
 set_target_properties(mpcomm_shared PROPERTIES
     OUTPUT_NAME mpcomm
@@ -98,6 +103,9 @@ target_include_directories(mpcomm_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     ${IBVERBS_INCLUDE_DIR}
+)
+target_include_directories(mpcomm_shared PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_link_libraries(mpcomm_shared PRIVATE

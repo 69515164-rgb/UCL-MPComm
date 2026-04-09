@@ -14,6 +14,7 @@
 
 #include "mpcomm.h"
 #include "mpcomm_log.h"
+#include "mpcomm_pxn.h"
 
 #include <arpa/inet.h>
 #include <emmintrin.h>  // For _mm_pause()
@@ -320,6 +321,47 @@ struct TransferContext {
     int numa_id;  // NUMA node that owns this transfer
     std::string timing_breakdown_str;  // Buffered timing breakdown (written by worker, printed by releaseTransfer)
 
+    // PXN (NVLink Proxy) fields
+    bool pxn_enabled;           // Whether this transfer uses PXN proxy forwarding
+    int pxn_source_gpu;         // Source GPU device_id (valid when pxn_enabled)
+    bool pxn_is_proxy_nic[kMaxNics]; // true if NIC requires NVLink proxy (precomputed)
+    size_t pxn_proxy_cutoff_chunk;  // Chunk index beyond which proxy NICs are disabled (tail cutoff)
+    // Track total bytes allocated per proxy GPU for batch freeing on completion
+    std::unordered_map<int, size_t> pxn_proxy_alloc_bytes;  // proxy_gpu_id -> total bytes
+
+    // PXN diagnostic counters (for debugging NIC selection)
+    size_t pxn_diag_direct_selected;     // Chunks assigned to direct NIC (phase 1)
+    size_t pxn_diag_proxy_selected;      // Chunks assigned to proxy NIC (phase 2 fallback)
+    size_t pxn_diag_direct_full_count;   // Times all direct NICs were full (triggered phase 2)
+    size_t pxn_diag_proxy_excluded;      // Times proxy NIC was excluded (buffer/queue full)
+    size_t pxn_diag_all_full_break;      // Times all NICs full, broke out to poll
+
+    // PXN per-chunk pipeline timing aggregates (accumulated from PxnPending timestamps)
+    size_t pxn_diag_proxy_chunks_timed;  // Number of proxy chunks with timing data
+    double pxn_diag_submit_to_result_us; // Sum of (t_result_recv - t_submit) across all proxy chunks
+    double pxn_diag_result_to_event_us;  // Sum of (t_event_done - t_result_recv) across all proxy chunks
+    double pxn_diag_event_to_rdma_us;    // Sum of (t_rdma_posted - t_event_done) across all proxy chunks
+    double pxn_diag_submit_to_rdma_us;   // Sum of (t_rdma_posted - t_submit) across all proxy chunks
+    double pxn_diag_max_submit_to_result_us;
+    double pxn_diag_max_result_to_event_us;
+    double pxn_diag_max_event_to_rdma_us;
+    double pxn_diag_max_submit_to_rdma_us;
+    // Fine-grained sub-breakdown of submit->result_recv
+    double pxn_diag_submit_to_dequeued_us;    // [a1] SPSC queue wait
+    double pxn_diag_dequeued_to_launched_us;   // [a2] cuMemcpyPeerAsync call
+    double pxn_diag_launched_to_pushed_us;     // [a3] cuEventRecord + event acquire
+    double pxn_diag_pushed_to_result_us;       // [a4] result push + worker poll delay
+    double pxn_diag_max_submit_to_dequeued_us;
+    double pxn_diag_max_dequeued_to_launched_us;
+    double pxn_diag_max_launched_to_pushed_us;
+    double pxn_diag_max_pushed_to_result_us;
+    // First/last proxy RDMA post timestamps (relative to all_posted_time)
+    std::chrono::steady_clock::time_point pxn_diag_first_rdma_post;
+    std::chrono::steady_clock::time_point pxn_diag_last_rdma_post;
+
+    // Per-NIC last completion timestamp (for diagnosing which NIC finishes last)
+    std::chrono::steady_clock::time_point per_nic_last_completion[kMaxNics];
+
     TransferContext()
         : handle(INVALID_TRANSFER_HANDLE)
         , total_chunks(0)
@@ -335,12 +377,42 @@ struct TransferContext {
         , num_qps_used(0)
         , rr_nic_index(0)
         , numa_id(0)
+        , pxn_enabled(false)
+        , pxn_source_gpu(-1)
+        , pxn_proxy_cutoff_chunk(SIZE_MAX)
+        , pxn_diag_direct_selected(0)
+        , pxn_diag_proxy_selected(0)
+        , pxn_diag_direct_full_count(0)
+        , pxn_diag_proxy_excluded(0)
+        , pxn_diag_all_full_break(0)
+        , pxn_diag_proxy_chunks_timed(0)
+        , pxn_diag_submit_to_result_us(0.0)
+        , pxn_diag_result_to_event_us(0.0)
+        , pxn_diag_event_to_rdma_us(0.0)
+        , pxn_diag_submit_to_rdma_us(0.0)
+        , pxn_diag_max_submit_to_result_us(0.0)
+        , pxn_diag_max_result_to_event_us(0.0)
+        , pxn_diag_max_event_to_rdma_us(0.0)
+        , pxn_diag_max_submit_to_rdma_us(0.0)
+        , pxn_diag_submit_to_dequeued_us(0.0)
+        , pxn_diag_dequeued_to_launched_us(0.0)
+        , pxn_diag_launched_to_pushed_us(0.0)
+        , pxn_diag_pushed_to_result_us(0.0)
+        , pxn_diag_max_submit_to_dequeued_us(0.0)
+        , pxn_diag_max_dequeued_to_launched_us(0.0)
+        , pxn_diag_max_launched_to_pushed_us(0.0)
+        , pxn_diag_max_pushed_to_result_us(0.0)
     {
+        memset(pxn_is_proxy_nic, 0, sizeof(pxn_is_proxy_nic));
         memset(per_nic_posted, 0, sizeof(per_nic_posted));
         memset(per_nic_completed, 0, sizeof(per_nic_completed));
         memset(per_nic_bytes, 0, sizeof(per_nic_bytes));
         memset(per_nic_qp_posted, 0, sizeof(per_nic_qp_posted));
         memset(per_nic_qp_completed, 0, sizeof(per_nic_qp_completed));
+        // Initialize per-NIC completion timestamps to epoch
+        for (size_t i = 0; i < kMaxNics; ++i) {
+            per_nic_last_completion[i] = std::chrono::steady_clock::time_point{};
+        }
     }
 
     TransferContext(const TransferContext&) = delete;
@@ -614,6 +686,9 @@ private:
 
     std::vector<NumaTopology> numa_topology_;
     std::vector<NicTopologyInfo> nic_topology_;
+
+    // PXN (NVLink Proxy) subsystem
+    PxnManager pxn_manager_;
 };
 
 // ============================================================================
@@ -992,6 +1067,42 @@ int MPComm::Impl::init(const std::string &local_host_id,
     MPCOMM_LOG_INFO("MPComm: Initialized with %zu NICs, TCP port %d\n",
            nic_contexts_.size(), tcp_port_);
 
+    // Initialize PXN (NVLink Proxy) subsystem if enabled
+#ifdef USE_CUDA
+    {
+        size_t nic_count = nic_contexts_.size();
+        auto get_gpu_pcie_nics = [this](int gpu_device_id) -> std::vector<size_t> {
+            return getGpuPcieAffinityNics(gpu_device_id);
+        };
+        if (pxn_manager_.init(nic_count, get_gpu_pcie_nics)) {
+            // Register proxy buffers with all NICs for RDMA access
+            auto reg_fn = [this](void* addr, size_t length) -> int {
+                return registerMemory(addr, length);
+            };
+            int ret = pxn_manager_.registerProxyBuffers(reg_fn);
+            if (ret != 0) {
+                MPCOMM_LOG_ERROR("MPComm: Failed to register PXN proxy buffers\n");
+                pxn_manager_.shutdown();
+            } else {
+                // Cache proxy buffer lkeys for each NIC
+                int gpu_count = 0;
+                cuDeviceGetCount(&gpu_count);
+                for (int dev_id = 0; dev_id < gpu_count; ++dev_id) {
+                    auto* pb = pxn_manager_.getProxyBuffer(dev_id);
+                    if (!pb || pb->buffer == 0) continue;
+                    for (size_t nic = 0; nic < nic_count; ++nic) {
+                        uint32_t lkey = getLkey(nic, reinterpret_cast<void*>(pb->buffer));
+                        if (lkey != 0) {
+                            pxn_manager_.setProxyLkey(dev_id, nic, lkey);
+                        }
+                    }
+                }
+                MPCOMM_LOG_INFO("MPComm: PXN proxy buffers registered and lkeys cached\n");
+            }
+        }
+    }
+#endif  // USE_CUDA
+
     // Generate MPComm version config file
     {
         namespace fs = std::filesystem;
@@ -1078,6 +1189,18 @@ void MPComm::Impl::shutdown() {
         close(listen_fd_);
         listen_fd_ = -1;
     }
+
+    // Shutdown PXN subsystem (must happen before NIC cleanup since proxy
+    // buffers are registered as memory regions on the NICs)
+#ifdef USE_CUDA
+    if (pxn_manager_.isEnabled()) {
+        auto unreg_fn = [this](void* addr) -> int {
+            return unregisterMemory(addr);
+        };
+        pxn_manager_.unregisterProxyBuffers(unreg_fn);
+        pxn_manager_.shutdown();
+    }
+#endif
 
     // Cleanup NIC contexts
     for (auto &ctx_ptr : nic_contexts_) {
@@ -3583,11 +3706,75 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     // This provides much finer granularity than NUMA-level selection,
     // especially when all NICs are on the same NUMA node.
     auto pcie_affine = getPcieAffinityNicsForAddr(reinterpret_cast<void*>(local_addr));
-    if (!pcie_affine.empty()) {
-        ctx->candidate_nic_indices = std::move(pcie_affine);
-    } else {
-        // CPU memory or PCIe affinity not available: fall back to NUMA-level selection
-        ctx->candidate_nic_indices = getLocalNicIndicesForNuma(memory_numa_node);
+
+    // PXN: When enabled and source is GPU memory in SCATTER/PUT direction,
+    // expand NIC candidates to all NICs reachable via NVLink proxy.
+    // This allows a single GPU to use all NICs for higher aggregate bandwidth.
+    bool use_pxn = false;
+    int gpu_device_id = -1;
+    // PXN: Select proxy NICs based on env MPCOMM_PXN_PROXY_NICS
+    // 0 or unset = all proxy NICs, N = limit to N proxy NICs
+    if (pxn_manager_.isEnabled() && !pcie_affine.empty() &&
+        direction == TransferDirection::SCATTER) {
+        // Detect which GPU owns this memory
+        gpu_device_id = detectGpuDevice(reinterpret_cast<void*>(local_addr));
+        if (gpu_device_id >= 0) {
+            auto reachable = pxn_manager_.getAllReachableNics(gpu_device_id);
+            if (reachable.size() > pcie_affine.size()) {
+                // Determine max proxy NICs from env (0 or unset = unlimited)
+                int max_proxy_nics = 0;
+                const char* env_val = std::getenv("MPCOMM_PXN_PROXY_NICS");
+                if (env_val && env_val[0] != '\0') {
+                    max_proxy_nics = std::atoi(env_val);
+                }
+                if (max_proxy_nics > 0) {
+                    // Limited mode: direct NICs + up to N proxy NICs
+                    std::vector<size_t> limited_nics = pcie_affine;
+                    int proxy_count = 0;
+                    for (size_t nic : reachable) {
+                        bool is_direct = false;
+                        for (size_t d : pcie_affine) {
+                            if (nic == d) { is_direct = true; break; }
+                        }
+                        if (!is_direct) {
+                            limited_nics.push_back(nic);
+                            if (++proxy_count >= max_proxy_nics) break;
+                        }
+                    }
+                    ctx->candidate_nic_indices = std::move(limited_nics);
+                } else {
+                    // Unlimited mode: use all reachable NICs (direct + all proxy)
+                    ctx->candidate_nic_indices = std::move(reachable);
+                }
+                ctx->pxn_enabled = true;
+                ctx->pxn_source_gpu = gpu_device_id;
+                // Tail cutoff: stop sending to proxy NICs for the last 20% of chunks
+                // to avoid proxy pipeline tail latency dominating completion time.
+                ctx->pxn_proxy_cutoff_chunk = total_chunks * 80 / 100;
+                // Precompute proxy NIC bitmap for fast lookup in NIC selection
+                for (size_t nic : ctx->candidate_nic_indices) {
+                    bool is_direct = false;
+                    for (size_t d : pcie_affine) {
+                        if (nic == d) { is_direct = true; break; }
+                    }
+                    ctx->pxn_is_proxy_nic[nic] = !is_direct;
+                }
+                use_pxn = true;
+                MPCOMM_LOG_DEBUG("MPComm PXN: Transfer using %zu NICs via NVLink proxy "
+                                 "(GPU %d, handle=%lu)\n",
+                                 ctx->candidate_nic_indices.size(),
+                                 gpu_device_id, ctx->handle);
+            }
+        }
+    }
+
+    if (!use_pxn) {
+        if (!pcie_affine.empty()) {
+            ctx->candidate_nic_indices = std::move(pcie_affine);
+        } else {
+            // CPU memory or PCIe affinity not available: fall back to NUMA-level selection
+            ctx->candidate_nic_indices = getLocalNicIndicesForNuma(memory_numa_node);
+        }
     }
     
     if (ctx->candidate_nic_indices.empty()) {
@@ -3726,6 +3913,7 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
                 // Completion belongs to current context
                 if (completed_nic < num_nics) {
                     ctx.per_nic_completed[completed_nic]++;
+                    ctx.per_nic_last_completion[completed_nic] = std::chrono::steady_clock::now();
                     if (completed_qp < qps_per_connection_) {
                         ctx.per_nic_qp_completed[completed_nic][completed_qp]++;
                     }
@@ -3740,6 +3928,7 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
                     TransferContext* other_ctx = it->second.get();
                     if (completed_nic < num_nics) {
                         other_ctx->per_nic_completed[completed_nic]++;
+                        other_ctx->per_nic_last_completion[completed_nic] = std::chrono::steady_clock::now();
                         if (completed_qp < qps_per_connection_) {
                             other_ctx->per_nic_qp_completed[completed_nic][completed_qp]++;
                         }
@@ -3877,17 +4066,23 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
                 // Print timing breakdown first (buffered from worker thread)
                 MPCOMM_LOG_DEBUG("%s", ctx.timing_breakdown_str.c_str());
                 MPCOMM_LOG_DEBUG("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
-                MPCOMM_LOG_DEBUG("%-20s %15s %12s %12s %12s\n", 
-                       "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)");
+                MPCOMM_LOG_DEBUG("%-20s %15s %12s %12s %12s %8s\n", 
+                       "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)",
+                       ctx.pxn_enabled ? "Type" : "");
                 MPCOMM_LOG_DEBUG("------------------------------------------------------------------------\n");
                 size_t num_nics = nic_contexts_.size();
                 for (size_t nic = 0; nic < num_nics; ++nic) {
                     double share_pct = (total_bytes > 0) ? 
                                        (100.0 * ctx.per_nic_bytes[nic] / total_bytes) : 0.0;
                     double nic_bandwidth_gbps = (ctx.per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
-                    MPCOMM_LOG_DEBUG("%-20s %15zu %12zu %11.1f%% %12.2f\n",
+                    const char* nic_type = "";
+                    if (ctx.pxn_enabled && ctx.per_nic_bytes[nic] > 0) {
+                        nic_type = ctx.pxn_is_proxy_nic[nic] ? "proxy" : "direct";
+                    }
+                    MPCOMM_LOG_DEBUG("%-20s %15zu %12zu %11.1f%% %12.2f %8s\n",
                            nic_contexts_[nic]->device_name.c_str(),
-                           ctx.per_nic_bytes[nic], ctx.per_nic_posted[nic], share_pct, nic_bandwidth_gbps);
+                           ctx.per_nic_bytes[nic], ctx.per_nic_posted[nic], share_pct, nic_bandwidth_gbps,
+                           nic_type);
                 }
                 MPCOMM_LOG_DEBUG("------------------------------------------------------------------------\n");
                 MPCOMM_LOG_DEBUG("%-20s %15zu %12zu %12s %12.2f\n",
@@ -3953,6 +4148,202 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     // Union of all candidate NIC indices across all active contexts (for CQ polling)
     std::vector<size_t> poll_nic_indices;
     std::vector<ActiveContextInfo> active_ctx_info;  // Reusable buffer for poll routing
+
+#ifdef USE_CUDA
+    // PXN pending queue: chunks waiting for NVLink copy to complete before RDMA post.
+    // Each entry holds the chunk info + CUDA event for tracking copy completion.
+    // Connection info is resolved eagerly (not via pointer) to avoid dangling
+    // references when active_contexts vector reallocates in Phase 1.
+    struct PxnPending {
+        TransferContext* ctx;
+        size_t chunk_idx;
+        size_t nic_index;
+        size_t qp_index;
+        CUdeviceptr proxy_addr;
+        int proxy_gpu_id;
+        uintptr_t remote_addr;
+        size_t length;
+        CUevent event;          // Set when copy thread result is received
+        uint64_t request_id;    // For copy thread correlation
+        bool event_received;    // True once copy thread result has been received
+        // Pre-resolved connection info (avoids cache pointer invalidation)
+        uint32_t lkey;
+        uint32_t rkey;
+        struct ibv_qp* qp;
+        // PXN per-chunk timing (for diagnosing proxy pipeline latency)
+        std::chrono::steady_clock::time_point t_submit;       // When copy request was submitted
+        std::chrono::steady_clock::time_point t_result_recv;  // When copy thread result was received
+        std::chrono::steady_clock::time_point t_event_done;   // When CUDA event completed (NVLink copy done)
+        std::chrono::steady_clock::time_point t_rdma_posted;  // When ibv_post_send completed
+        // Fine-grained timestamps from copy thread
+        std::chrono::steady_clock::time_point t_dequeued;       // When popped from SPSC queue
+        std::chrono::steady_clock::time_point t_copy_launched;  // After cuMemcpyPeerAsync returned
+        std::chrono::steady_clock::time_point t_result_pushed;  // After cuEventRecord, before result push
+    };
+    std::vector<PxnPending> pxn_pending;
+    uint64_t pxn_next_request_id = 1;  // Monotonic request ID counter
+    std::vector<PxnCopyResult> pxn_copy_results;  // Reusable buffer for poll results
+    size_t pxn_inline_poll_counter = 0;  // Counts proxy chunk submissions for inline poll
+    static constexpr size_t kPxnInlinePollInterval = 16;  // Process PXN pending every N proxy submissions
+
+    // Lambda to process PXN pending queue: poll copy results, check events,
+    // post RDMA for completed NVLink copies.  Called both inline during Phase 2a
+    // posting and in Phase 2c.  Returns number of RDMA posts made.
+    auto process_pxn_pending_fn = [&]() -> size_t {
+        size_t rdma_posted_count = 0;
+        if (pxn_pending.empty()) return 0;
+
+        // Poll copy thread results and match them to pending entries
+        pxn_copy_results.clear();
+        pxn_manager_.pollAllCopyResults(pxn_copy_results);
+        for (const auto& cr : pxn_copy_results) {
+            for (auto& pp : pxn_pending) {
+                if (pp.request_id == cr.request_id && !pp.event_received) {
+                    pp.event = cr.completion_event;
+                    pp.event_received = true;
+                    pp.t_result_recv = std::chrono::steady_clock::now();
+                    pp.t_dequeued = cr.t_dequeued;
+                    pp.t_copy_launched = cr.t_copy_launched;
+                    pp.t_result_pushed = cr.t_result_pushed;
+                    if (!cr.success) {
+                        pp.ctx->error_code.store(MPCOMM_ERR_TRANSFER);
+                        pp.ctx->end_time = std::chrono::steady_clock::now();
+                        pp.ctx->finished.store(true);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Check pending NVLink copies; post RDMA for completed ones
+        for (size_t pi = 0; pi < pxn_pending.size(); ) {
+            auto& pp = pxn_pending[pi];
+
+            if (!pp.event_received) {
+                ++pi;
+                continue;
+            }
+
+            if (pp.event == nullptr) {
+                pxn_pending[pi] = std::move(pxn_pending.back());
+                pxn_pending.pop_back();
+                continue;
+            }
+
+            if (!PxnManager::isEventDone(pp.event)) {
+                ++pi;
+                continue;
+            }
+
+            // NVLink copy completed — post RDMA from proxy buffer
+            TransferContext& pctx = *pp.ctx;
+            pp.t_event_done = std::chrono::steady_clock::now();
+
+            pxn_manager_.recycleEventToThread(pp.proxy_gpu_id, pp.event);
+            pp.event = nullptr;
+
+            uint32_t p_lkey = pp.lkey;
+            uint32_t p_rkey = pp.rkey;
+            struct ibv_qp* p_qp = pp.qp;
+
+            if (p_lkey == 0 || p_rkey == 0 || !p_qp) {
+                MPCOMM_LOG_ERROR("MPComm PXN: Invalid connection info for pending chunk "
+                                 "(nic=%zu, lkey=%u, rkey=%u)\n",
+                                 pp.nic_index, p_lkey, p_rkey);
+                pctx.error_code.store(MPCOMM_ERR_TRANSFER);
+                pctx.end_time = std::chrono::steady_clock::now();
+                pctx.finished.store(true);
+                pxn_pending[pi] = std::move(pxn_pending.back());
+                pxn_pending.pop_back();
+                continue;
+            }
+
+            struct ibv_sge p_sge;
+            memset(&p_sge, 0, sizeof(p_sge));
+            p_sge.addr = static_cast<uint64_t>(pp.proxy_addr);
+            p_sge.length = static_cast<uint32_t>(pp.length);
+            p_sge.lkey = p_lkey;
+
+            struct ibv_send_wr p_wr;
+            memset(&p_wr, 0, sizeof(p_wr));
+            p_wr.wr_id = WrIdEncoding::encode(pp.nic_index, pp.qp_index,
+                                                pctx.handle, pp.chunk_idx);
+            p_wr.opcode = IBV_WR_RDMA_WRITE;
+            p_wr.sg_list = &p_sge;
+            p_wr.num_sge = 1;
+            p_wr.send_flags = IBV_SEND_SIGNALED;
+            p_wr.wr.rdma.remote_addr = pp.remote_addr;
+            p_wr.wr.rdma.rkey = p_rkey;
+
+            struct ibv_send_wr* p_bad_wr = nullptr;
+            int ret = ibv_post_send(p_qp, &p_wr, &p_bad_wr);
+            if (ret != 0) {
+                MPCOMM_LOG_ERROR("MPComm PXN: ibv_post_send failed on NIC %zu: %d\n",
+                                 pp.nic_index, ret);
+                pctx.error_code.store(MPCOMM_ERR_TRANSFER);
+                pctx.end_time = std::chrono::steady_clock::now();
+                pctx.finished.store(true);
+                pxn_pending[pi] = std::move(pxn_pending.back());
+                pxn_pending.pop_back();
+                continue;
+            }
+
+            pctx.per_nic_posted[pp.nic_index]++;
+            pctx.per_nic_qp_posted[pp.nic_index][pp.qp_index]++;
+            pctx.per_nic_bytes[pp.nic_index] += pp.length;
+
+            // Accumulate PXN per-chunk pipeline timing
+            {
+                pp.t_rdma_posted = std::chrono::steady_clock::now();
+                auto to_us = [](const std::chrono::steady_clock::time_point& a,
+                                const std::chrono::steady_clock::time_point& b) -> double {
+                    return std::chrono::duration<double, std::micro>(b - a).count();
+                };
+                double s2r = to_us(pp.t_submit, pp.t_result_recv);
+                double r2e = to_us(pp.t_result_recv, pp.t_event_done);
+                double e2p = to_us(pp.t_event_done, pp.t_rdma_posted);
+                double s2p = to_us(pp.t_submit, pp.t_rdma_posted);
+                double s2d = to_us(pp.t_submit, pp.t_dequeued);
+                double d2l = to_us(pp.t_dequeued, pp.t_copy_launched);
+                double l2p = to_us(pp.t_copy_launched, pp.t_result_pushed);
+                double p2r = to_us(pp.t_result_pushed, pp.t_result_recv);
+                pctx.pxn_diag_proxy_chunks_timed++;
+                pctx.pxn_diag_submit_to_result_us += s2r;
+                pctx.pxn_diag_result_to_event_us += r2e;
+                pctx.pxn_diag_event_to_rdma_us += e2p;
+                pctx.pxn_diag_submit_to_rdma_us += s2p;
+                pctx.pxn_diag_submit_to_dequeued_us += s2d;
+                pctx.pxn_diag_dequeued_to_launched_us += d2l;
+                pctx.pxn_diag_launched_to_pushed_us += l2p;
+                pctx.pxn_diag_pushed_to_result_us += p2r;
+                if (s2r > pctx.pxn_diag_max_submit_to_result_us)
+                    pctx.pxn_diag_max_submit_to_result_us = s2r;
+                if (r2e > pctx.pxn_diag_max_result_to_event_us)
+                    pctx.pxn_diag_max_result_to_event_us = r2e;
+                if (e2p > pctx.pxn_diag_max_event_to_rdma_us)
+                    pctx.pxn_diag_max_event_to_rdma_us = e2p;
+                if (s2p > pctx.pxn_diag_max_submit_to_rdma_us)
+                    pctx.pxn_diag_max_submit_to_rdma_us = s2p;
+                if (s2d > pctx.pxn_diag_max_submit_to_dequeued_us)
+                    pctx.pxn_diag_max_submit_to_dequeued_us = s2d;
+                if (d2l > pctx.pxn_diag_max_dequeued_to_launched_us)
+                    pctx.pxn_diag_max_dequeued_to_launched_us = d2l;
+                if (l2p > pctx.pxn_diag_max_launched_to_pushed_us)
+                    pctx.pxn_diag_max_launched_to_pushed_us = l2p;
+                if (p2r > pctx.pxn_diag_max_pushed_to_result_us)
+                    pctx.pxn_diag_max_pushed_to_result_us = p2r;
+                if (pctx.pxn_diag_first_rdma_post.time_since_epoch().count() == 0)
+                    pctx.pxn_diag_first_rdma_post = pp.t_rdma_posted;
+                pctx.pxn_diag_last_rdma_post = pp.t_rdma_posted;
+            }
+
+            rdma_posted_count++;
+            pxn_pending[pi] = std::move(pxn_pending.back());
+            pxn_pending.pop_back();
+        }
+        return rdma_posted_count;
+    };
+#endif
     
     size_t idle_spins = 0;
     
@@ -4023,22 +4414,63 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 size_t chunk_idx = ctx.next_chunk_idx.load();
                 auto chunk = ctx.getChunk(chunk_idx);
                 
-                // Select best NIC using worker-level outstanding tracking
+                // Temporary exclusion set for proxy NICs whose resources are
+                // unavailable (buffer full or copy queue full) for this chunk.
+                // This prevents proxy NIC resource exhaustion from blocking
+                // direct NIC posting.
+                bool pxn_nic_excluded[kMaxNics] = {};
+
+            select_nic:
+                // Select best NIC using two-phase strategy:
+                // Phase 1: Prefer direct NICs (lower latency, no NVLink copy overhead)
+                // Phase 2: Fall back to proxy NICs only when all direct NICs are full
                 size_t best_nic = num_nics;  // Invalid initially
                 size_t min_outstanding = SIZE_MAX;
                 size_t num_candidate_nics = ctx.candidate_nic_indices.size();
                 
+                // Phase 1: Try direct NICs first
                 for (size_t idx = 0; idx < num_candidate_nics; ++idx) {
                     size_t nic = ctx.candidate_nic_indices[idx];
+                    if (pxn_nic_excluded[nic]) continue;
+                    if (ctx.pxn_enabled && ctx.pxn_is_proxy_nic[nic]) continue;  // Skip proxy NICs in phase 1
                     size_t outstanding = worker_nic_posted[nic] - worker_nic_completed[nic];
                     if (outstanding < max_outstanding_per_nic && outstanding < min_outstanding) {
                         min_outstanding = outstanding;
                         best_nic = nic;
                     }
                 }
+                
+                // Phase 2: If no direct NIC available, try proxy NICs
+                // Skip proxy NICs for tail chunks (beyond cutoff) to avoid
+                // proxy pipeline tail latency dominating completion time.
+                if (best_nic == num_nics && ctx.pxn_enabled &&
+                    chunk_idx < ctx.pxn_proxy_cutoff_chunk) {
+                    ctx.pxn_diag_direct_full_count++;
+                    min_outstanding = SIZE_MAX;
+                    for (size_t idx = 0; idx < num_candidate_nics; ++idx) {
+                        size_t nic = ctx.candidate_nic_indices[idx];
+                        if (pxn_nic_excluded[nic]) continue;
+                        if (!ctx.pxn_is_proxy_nic[nic]) continue;  // Skip direct NICs in phase 2
+                        size_t outstanding = worker_nic_posted[nic] - worker_nic_completed[nic];
+                        if (outstanding < max_outstanding_per_nic && outstanding < min_outstanding) {
+                            min_outstanding = outstanding;
+                            best_nic = nic;
+                        }
+                    }
+                }
+                
                 if (best_nic == num_nics) {
                     // All candidate NICs are full — break out and poll
+                    ctx.pxn_diag_all_full_break++;
                     break;
+                }
+                
+                // Track NIC selection decision
+                if (ctx.pxn_enabled) {
+                    if (ctx.pxn_is_proxy_nic[best_nic])
+                        ctx.pxn_diag_proxy_selected++;
+                    else
+                        ctx.pxn_diag_direct_selected++;
                 }
                 
                 // Select QP with lowest outstanding within this NIC (worker-level)
@@ -4115,9 +4547,110 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 // Prepare and post RDMA WR
                 struct ibv_sge sge;
                 memset(&sge, 0, sizeof(sge));
-                sge.addr = chunk.local_addr;
                 sge.length = static_cast<uint32_t>(chunk.length);
                 sge.lkey = lkey;
+
+#ifdef USE_CUDA
+                // PXN: Check if this NIC requires proxy forwarding via NVLink
+                bool pxn_proxy_needed = false;
+                int proxy_gpu_id = -1;
+                if (ctx.pxn_enabled) {
+                    proxy_gpu_id = pxn_manager_.getProxyGpuForNic(
+                        ctx.pxn_source_gpu, best_nic);
+                    pxn_proxy_needed = (proxy_gpu_id >= 0);
+                }
+
+                if (pxn_proxy_needed) {
+                    // This chunk goes through a proxy GPU:
+                    // 1. Allocate space in proxy buffer
+                    // 2. Submit async NVLink copy (via copy thread or direct)
+                    // 3. Add to pending queue (RDMA post deferred until copy completes)
+                    auto* pb = pxn_manager_.getProxyBuffer(proxy_gpu_id);
+                    if (!pb) {
+                        MPCOMM_LOG_ERROR("MPComm PXN: No proxy buffer for GPU %d\n",
+                                         proxy_gpu_id);
+                        ctx.error_code.store(MPCOMM_ERR_MEMORY);
+                        ctx.end_time = std::chrono::steady_clock::now();
+                        ctx.finished.store(true);
+                        break;
+                    }
+
+                    CUdeviceptr proxy_addr = pb->tryAlloc(chunk.length);
+                    if (proxy_addr == 0) {
+                        // Proxy buffer full — exclude this NIC and re-select
+                        // so that direct NICs can continue posting.
+                        ctx.pxn_diag_proxy_excluded++;
+                        pxn_nic_excluded[best_nic] = true;
+                        goto select_nic;
+                    }
+
+                    // Prepare pending entry
+                    PxnPending pending;
+                    pending.ctx = &ctx;
+                    pending.chunk_idx = chunk_idx;
+                    pending.nic_index = best_nic;
+                    pending.qp_index = qp_index;
+                    pending.proxy_addr = proxy_addr;
+                    pending.proxy_gpu_id = proxy_gpu_id;
+                    pending.remote_addr = chunk.remote_addr;
+                    pending.length = chunk.length;
+                    pending.lkey = pxn_manager_.getProxyLkey(proxy_gpu_id, best_nic);
+                    pending.rkey = rkey;
+                    pending.qp = qp;
+
+                    // Submit to dedicated copy thread (no CUDA context switch)
+                    PxnCopyRequest copy_req;
+                    copy_req.src_addr = static_cast<CUdeviceptr>(chunk.local_addr);
+                    copy_req.src_ctx = pxn_manager_.getProxyBuffer(ctx.pxn_source_gpu)->cuda_ctx;
+                    copy_req.dst_addr = proxy_addr;
+                    copy_req.dst_ctx = pb->cuda_ctx;
+                    copy_req.length = chunk.length;
+                    copy_req.request_id = pxn_next_request_id++;
+
+                    if (!pxn_manager_.submitCopyRequest(proxy_gpu_id, copy_req)) {
+                        // Queue full — free the proxy buffer allocation,
+                        // exclude this NIC and re-select so direct NICs
+                        // can continue posting.
+                        pb->free(chunk.length);
+                        ctx.pxn_diag_proxy_excluded++;
+                        pxn_nic_excluded[best_nic] = true;
+                        goto select_nic;
+                    }
+
+                    pending.event = nullptr;  // Will be filled from copy result
+                    pending.request_id = copy_req.request_id;
+                    pending.event_received = false;
+                    pending.t_submit = std::chrono::steady_clock::now();
+
+                    pxn_pending.push_back(std::move(pending));
+
+                    // Track proxy buffer allocation for batch freeing
+                    ctx.pxn_proxy_alloc_bytes[proxy_gpu_id] += chunk.length;
+
+                    // Pre-increment flow control counters so that NIC selection
+                    // in Phase 2a accounts for pending PXN chunks.  Without this,
+                    // many chunks can pile up for the same NIC/QP and overflow
+                    // the send queue when Phase 2b posts them all at once.
+                    worker_nic_posted[best_nic]++;
+                    worker_nic_qp_posted[best_nic][qp_index]++;
+
+                    // Advance chunk index (chunk is "claimed" even though RDMA not posted yet)
+                    ctx.next_chunk_idx.fetch_add(1);
+
+                    // Inline PXN pending processing: every kPxnInlinePollInterval
+                    // proxy submissions, drain completed NVLink copies and post
+                    // their RDMA.  This keeps the proxy pipeline flowing and
+                    // frees proxy buffer space without waiting for Phase 2c.
+                    if (++pxn_inline_poll_counter >= kPxnInlinePollInterval) {
+                        pxn_inline_poll_counter = 0;
+                        process_pxn_pending_fn();
+                    }
+
+                    continue;  // Don't post RDMA yet, go to next chunk
+                }
+#endif  // USE_CUDA
+
+                sge.addr = chunk.local_addr;
                 
                 struct ibv_send_wr wr;
                 memset(&wr, 0, sizeof(wr));
@@ -4163,9 +4696,11 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
             }
         }
         
-        // ---- Phase 3: Poll completions from all candidate NICs ----
-        // Completions are routed to correct TransferContext via wr_id handle decoding.
-        // Build active context info for lock-free fast-path routing.
+        // ---- Phase 2b: Poll completions from all candidate NICs ----
+        // Moved BEFORE PXN pending processing so that direct NIC outstanding
+        // slots are freed as quickly as possible.  Previously, PXN pending
+        // processing (Phase 2b old) sat between posting and polling, delaying
+        // completion harvesting and causing direct NIC stalls.
         {
             active_ctx_info.clear();
             for (const auto& ac : active_contexts) {
@@ -4190,6 +4725,12 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 continue;
             }
         }
+
+#ifdef USE_CUDA
+        // ---- Phase 2c: Process PXN pending queue (NVLink copy -> RDMA post) ----
+        // Uses the same lambda as the inline poll in Phase 2a.
+        process_pxn_pending_fn();
+#endif  // USE_CUDA
         
         // ---- Phase 4: Remove completed contexts ----
         {
@@ -4200,6 +4741,30 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 
                 if (ctx.finished.load()) {
                     // Already finished (error case) — finalize stats and remove
+#ifdef USE_CUDA
+                    // Clean up any PXN pending chunks for this context
+                    if (ctx.pxn_enabled) {
+                        for (size_t pi = 0; pi < pxn_pending.size(); ) {
+                            if (pxn_pending[pi].ctx == &ctx) {
+                                if (pxn_pending[pi].event) {
+                                    pxn_manager_.recycleEventToThread(
+                                        pxn_pending[pi].proxy_gpu_id,
+                                        pxn_pending[pi].event);
+                                }
+                                pxn_pending[pi] = std::move(pxn_pending.back());
+                                pxn_pending.pop_back();
+                            } else {
+                                ++pi;
+                            }
+                        }
+                        // Free PXN proxy buffer allocations for this transfer
+                        for (auto& [gpu_id, bytes] : ctx.pxn_proxy_alloc_bytes) {
+                            auto* pb = pxn_manager_.getProxyBuffer(gpu_id);
+                            if (pb) pb->free(bytes);
+                        }
+                        ctx.pxn_proxy_alloc_bytes.clear();
+                    }
+#endif
                     finalizeTransferStats(ctx);
                     active_contexts.erase(active_contexts.begin() + i);
                     any_removed = true;
@@ -4209,6 +4774,16 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
                 if (ctx.next_chunk_idx.load() >= total_chunks &&
                     ctx.total_completed.load() >= total_chunks) {
                     // All chunks posted and completed — mark finished
+#ifdef USE_CUDA
+                    // Free PXN proxy buffer allocations for this transfer
+                    if (ctx.pxn_enabled) {
+                        for (auto& [gpu_id, bytes] : ctx.pxn_proxy_alloc_bytes) {
+                            auto* pb = pxn_manager_.getProxyBuffer(gpu_id);
+                            if (pb) pb->free(bytes);
+                        }
+                        ctx.pxn_proxy_alloc_bytes.clear();
+                    }
+#endif
                     ctx.error_code.store(MPCOMM_SUCCESS);
                     ctx.end_time = std::chrono::steady_clock::now();
                     finalizeTransferStats(ctx);
@@ -4260,7 +4835,27 @@ void MPComm::Impl::initContextCache(TransferContext& ctx, NicConnCache& cache) {
                     info.remote_nic = map_it->second[0];
                 }
                 info.rkey = conn_it->second.getRkeyForAddr(ctx.remote_addrs[host_idx], info.remote_nic);
-                info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));
+
+                // PXN: For proxy NICs, use the proxy buffer's lkey instead of
+                // the source buffer's lkey, because RDMA will post from proxy buffer.
+                // For direct NICs (no proxy), use the source buffer's lkey as usual.
+#ifdef USE_CUDA
+                if (ctx.pxn_enabled) {
+                    int proxy_gpu = pxn_manager_.getProxyGpuForNic(
+                        ctx.pxn_source_gpu, local_nic);
+                    if (proxy_gpu >= 0) {
+                        // This NIC goes through a proxy GPU — use proxy buffer lkey
+                        info.lkey = pxn_manager_.getProxyLkey(proxy_gpu, local_nic);
+                    } else {
+                        // Direct NIC — use source buffer lkey
+                        info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));
+                    }
+                } else
+#endif
+                {
+                    info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));
+                }
+
                 info.num_qps = qps_per_connection_;
                 for (size_t qi = 0; qi < qps_per_connection_ && qi < NicConnInfo::kMaxQPsPerConn; ++qi) {
                     info.qps[qi] = getOrCreateQP(local_nic, host_id, info.remote_nic, qi);
@@ -4342,6 +4937,7 @@ int MPComm::Impl::pollAllNicsForWorker(
             // Route completion to the target context
             if (completed_nic < num_nics) {
                 target_ctx->per_nic_completed[completed_nic]++;
+                target_ctx->per_nic_last_completion[completed_nic] = std::chrono::steady_clock::now();
                 if (completed_qp < qps_per_connection_) {
                     target_ctx->per_nic_qp_completed[completed_nic][completed_qp]++;
                 }
@@ -4394,6 +4990,93 @@ void MPComm::Impl::finalizeTransferStats(TransferContext& ctx) {
     s += buf;
     snprintf(buf, sizeof(buf), "  Total chunks: %zu\n", total_chunks);
     s += buf;
+    if (ctx.pxn_enabled) {
+        snprintf(buf, sizeof(buf),
+                 "  PXN NIC selection: direct=%zu, proxy=%zu, "
+                 "direct_full=%zu, proxy_excluded=%zu, all_full_break=%zu, "
+                 "proxy_cutoff=%zu/%zu\n",
+                 ctx.pxn_diag_direct_selected,
+                 ctx.pxn_diag_proxy_selected,
+                 ctx.pxn_diag_direct_full_count,
+                 ctx.pxn_diag_proxy_excluded,
+                 ctx.pxn_diag_all_full_break,
+                 ctx.pxn_proxy_cutoff_chunk,
+                 total_chunks);
+        s += buf;
+
+        // Per-NIC completion timing relative to all_posted_time
+        double direct_last_us = 0.0, proxy_last_us = 0.0;
+        for (size_t nic = 0; nic < ctx.num_nics_used; ++nic) {
+            if (ctx.per_nic_completed[nic] == 0) continue;
+            double nic_us = to_us(ctx.all_posted_time, ctx.per_nic_last_completion[nic]);
+            if (ctx.pxn_is_proxy_nic[nic]) {
+                if (nic_us > proxy_last_us) proxy_last_us = nic_us;
+            } else {
+                if (nic_us > direct_last_us) direct_last_us = nic_us;
+            }
+        }
+        snprintf(buf, sizeof(buf),
+                 "  PXN completion: direct_last=%.1f us, proxy_last=%.1f us\n",
+                 direct_last_us, proxy_last_us);
+        s += buf;
+
+        // PXN proxy pipeline timing breakdown
+        if (ctx.pxn_diag_proxy_chunks_timed > 0) {
+            size_t n = ctx.pxn_diag_proxy_chunks_timed;
+            snprintf(buf, sizeof(buf),
+                     "  PXN proxy pipeline (%zu chunks, avg / max):\n", n);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "    [a] submit->result_recv:  %7.1f / %7.1f us  (copy thread queue + launch)\n",
+                     ctx.pxn_diag_submit_to_result_us / n,
+                     ctx.pxn_diag_max_submit_to_result_us);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "      [a1] submit->dequeued:  %7.1f / %7.1f us  (SPSC queue wait)\n",
+                     ctx.pxn_diag_submit_to_dequeued_us / n,
+                     ctx.pxn_diag_max_submit_to_dequeued_us);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "      [a2] dequeued->launched: %6.1f / %7.1f us  (cuMemcpyPeerAsync)\n",
+                     ctx.pxn_diag_dequeued_to_launched_us / n,
+                     ctx.pxn_diag_max_dequeued_to_launched_us);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "      [a3] launched->pushed:  %7.1f / %7.1f us  (event acquire+record)\n",
+                     ctx.pxn_diag_launched_to_pushed_us / n,
+                     ctx.pxn_diag_max_launched_to_pushed_us);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "      [a4] pushed->recv:      %6.1f / %7.1f us  (result push + poll delay)\n",
+                     ctx.pxn_diag_pushed_to_result_us / n,
+                     ctx.pxn_diag_max_pushed_to_result_us);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "    [b] result_recv->event:   %7.1f / %7.1f us  (NVLink copy execution)\n",
+                     ctx.pxn_diag_result_to_event_us / n,
+                     ctx.pxn_diag_max_result_to_event_us);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "    [c] event->rdma_post:     %7.1f / %7.1f us  (RDMA post from proxy buf)\n",
+                     ctx.pxn_diag_event_to_rdma_us / n,
+                     ctx.pxn_diag_max_event_to_rdma_us);
+            s += buf;
+            snprintf(buf, sizeof(buf),
+                     "    [total] submit->rdma_post:%7.1f / %7.1f us\n",
+                     ctx.pxn_diag_submit_to_rdma_us / n,
+                     ctx.pxn_diag_max_submit_to_rdma_us);
+            s += buf;
+            // Show proxy RDMA posting span relative to all_posted_time
+            if (ctx.pxn_diag_first_rdma_post.time_since_epoch().count() != 0) {
+                double first_post_rel = to_us(ctx.all_posted_time, ctx.pxn_diag_first_rdma_post);
+                double last_post_rel = to_us(ctx.all_posted_time, ctx.pxn_diag_last_rdma_post);
+                snprintf(buf, sizeof(buf),
+                         "    Proxy RDMA post span (rel to all_posted): first=%.1f us, last=%.1f us\n",
+                         first_post_rel, last_post_rel);
+                s += buf;
+            }
+        }
+    }
 }
 
 int MPComm::Impl::getNumaForAddr(uintptr_t addr) const {

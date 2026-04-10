@@ -71,13 +71,13 @@ def get_cmake_dir() -> str:
     return _os.path.join(_PACKAGE_DIR, "lib", "cmake", "mpcomm")
 
 
-def get_tests_dir() -> str:
-    """Return the path to the MPComm bundled test / example files.
+def get_check_install_script() -> str:
+    """Return the path to the check_install.sh verification script.
 
-    Contains scatter_test.cpp, CMakeLists.txt, check_install.sh,
-    cpp-target.sh, and cpp-initiator.sh.
+    Usage:
+        bash $(python3 -c "import mpcomm; print(mpcomm.get_check_install_script())")
     """
-    return _os.path.join(_PACKAGE_DIR, "tests")
+    return _os.path.join(_PACKAGE_DIR, "scripts", "check_install.sh")
 
 
 __all__ = [
@@ -88,5 +88,5 @@ __all__ = [
     "get_include_dir",
     "get_lib_dir",
     "get_cmake_dir",
-    "get_tests_dir",
+    "get_check_install_script",
 ]

@@ -234,6 +234,14 @@ if(DEFINED SKBUILD)
         )
     endif()
 
+    # Deploy scripts  ->  mpcomm/scripts/
+    install(FILES deploy/check_install.sh
+        DESTINATION ${_PKG_PREFIX}/scripts
+        PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                    GROUP_READ GROUP_EXECUTE
+                    WORLD_READ WORLD_EXECUTE
+    )
+
     # C++ header files  ->  mpcomm/include/
     install(FILES include/mpcomm.h include/mpcomm_log.h
         DESTINATION ${_PKG_PREFIX}/include
@@ -271,16 +279,6 @@ if(DEFINED SKBUILD)
         ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfig.cmake
         ${CMAKE_CURRENT_BINARY_DIR}/mpcommConfigVersion.cmake
         DESTINATION ${MPCOMM_CMAKE_INSTALL_DIR}
-    )
-
-    # Test / example files  ->  mpcomm/tests/
-    install(FILES
-        ${CMAKE_CURRENT_SOURCE_DIR}/check_install.sh
-        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/scatter_test.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/CMakeLists.txt
-        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/cpp-target.sh
-        ${CMAKE_CURRENT_SOURCE_DIR}/user_examples/cpp-initiator.sh
-        DESTINATION ${_PKG_PREFIX}/tests
     )
 
 else()

@@ -111,6 +111,7 @@ Options:
   --deploy-url URL      Custom deploy script URL (for auto-deploy)
   --deploy-tests-url URL Custom test deploy script URL
   --tests-dir DIR        Test files install directory (default: /opt/mpcomm_tests)
+  --version VER         mpcomm version to deploy (default: resolved from VERSION file on mirror)
   --skip-deploy         Skip auto-deployment, fail if mpcomm not installed
 --startup-wait SECS   Timeout for targets to become ready (default: 30)
   --parallel N          Max concurrent SSH operations (default: 20)
@@ -158,6 +159,8 @@ while [[ $# -gt 0 ]]; do
         --deploy-url)     DEPLOY_URL="$2"; shift 2 ;;
         --deploy-tests-url) DEPLOY_TESTS_URL="$2"; shift 2 ;;
         --tests-dir)      TESTS_INSTALL_DIR="$2"; shift 2 ;;
+        --version)        MPCOMM_VERSION="$2"; shift 2 ;;
+        --version=*)      MPCOMM_VERSION="${1#*=}"; shift ;;
         --skip-deploy)    SKIP_DEPLOY=true; shift ;;
         --startup-wait)   STARTUP_WAIT="$2"; shift 2 ;;
         --parallel)       PARALLEL_JOBS="$2"; shift 2 ;;
@@ -177,6 +180,11 @@ parse_hosts "$HOSTS_FILE"
 if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_JOBS" -lt 1 ]; then
     log_error "--parallel must be a positive integer (got: $PARALLEL_JOBS)"
     exit 1
+fi
+
+# Resolve the target version once so every node deploys the same version.
+if ! $DRY_RUN && ! $SKIP_DEPLOY; then
+    resolve_mpcomm_version || exit 1
 fi
 
 # ---- Cleanup Function ----
@@ -330,10 +338,10 @@ log_error "Run deploy_all.sh first, or remove --skip-deploy to auto-deploy."
         if [ "$ip" = "LOCAL" ]; then
             log_info "  Deploying mpcomm on local machine ($INITIATOR_IP) (this may take a few minutes)..."
             if $DRY_RUN; then
-                log_debug "  Would run: wget -qO- '${DEPLOY_URL}' | bash"
+                log_debug "  Would run: wget -qO- '${DEPLOY_URL}' | bash -s -- --version=${MPCOMM_VERSION:-<latest>}"
                 break
             fi
-            DEPLOY_OUTPUT=$(wget -qO- "${DEPLOY_URL}" | bash 2>&1) || {
+            DEPLOY_OUTPUT=$(wget -qO- "${DEPLOY_URL}" | bash -s -- --version="${MPCOMM_VERSION}" 2>&1) || {
                 log_error "  local ($INITIATOR_IP) - deployment FAILED"
                 log_error "  Output (last 20 lines):"
                 echo "$DEPLOY_OUTPUT" | tail -20
@@ -369,7 +377,7 @@ log_error "Run deploy_all.sh first, or remove --skip-deploy to auto-deploy."
             local idx="$1"
             local ip="$2"
             echo "=== Deploying mpcomm on $ip ==="
-            if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash" 2>&1; then
+            if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash -s -- --version=${MPCOMM_VERSION}" 2>&1; then
                 echo "DEPLOY SCRIPT FAILED on $ip"
                 return 1
             fi
@@ -389,7 +397,7 @@ log_error "Run deploy_all.sh first, or remove --skip-deploy to auto-deploy."
         fi
     elif $DRY_RUN; then
         for idx in "${REMOTE_DEPLOY_INDICES[@]}"; do
-            log_debug "  Would run: $(ssh_cmd "${TARGET_IPS[$idx]}") 'wget -qO- \"${DEPLOY_URL}\" | bash'"
+            log_debug "  Would run: $(ssh_cmd "${TARGET_IPS[$idx]}") 'wget -qO- \"${DEPLOY_URL}\" | bash -s -- --version=${MPCOMM_VERSION}'"
         done
     fi
 
@@ -472,7 +480,7 @@ else
             local ip="$2"
             local sentinel="/tmp/mt_bin_deploy_$$_${idx}"
             echo "=== Deploying tests on $ip ==="
-            if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${TESTS_INSTALL_DIR}" 2>&1; then
+            if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${TESTS_INSTALL_DIR} --version=${MPCOMM_VERSION}" 2>&1; then
                 echo "deploy_tests.sh FAILED on $ip"
                 return 1
             fi

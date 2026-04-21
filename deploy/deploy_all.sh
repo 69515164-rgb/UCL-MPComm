@@ -32,6 +32,7 @@ Deploy mpcomm and build scatter_test on all machines in the hosts file.
 
 Options:
   --hosts FILE          Host list file (default: hosts.txt)
+  --version VER         mpcomm version to deploy (default: resolved from VERSION file on mirror)
   --deploy-url URL      Custom deploy script URL
   --deploy-tests-url URL Custom test deploy script URL
   --tests-dir DIR        Test files install directory (default: /opt/mpcomm_tests)
@@ -56,6 +57,8 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --hosts)          HOSTS_FILE="$2"; shift 2 ;;
+        --version)        MPCOMM_VERSION="$2"; shift 2 ;;
+        --version=*)      MPCOMM_VERSION="${1#*=}"; shift ;;
         --deploy-url)     DEPLOY_URL="$2"; shift 2 ;;
         --deploy-tests-url) DEPLOY_TESTS_URL="$2"; shift 2 ;;
         --tests-dir)      TESTS_INSTALL_DIR="$2"; shift 2 ;;
@@ -82,6 +85,11 @@ if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_JOBS" -lt 1 ]; then
     exit 1
 fi
 
+# Resolve the target version once so every node deploys the same version.
+if ! $DRY_RUN; then
+    resolve_mpcomm_version || exit 1
+fi
+
 echo ""
 echo "============================================================"
 echo "  MPComm Multi-Node Deploy"
@@ -94,6 +102,7 @@ for i in $(seq 0 $((NUM_TARGETS - 1))); do
 done
 echo "  Skip deploy:   $SKIP_DEPLOY"
 echo "  Skip build:    $SKIP_BUILD"
+echo "  Version:       ${MPCOMM_VERSION:-<resolve at runtime>}"
 echo "  Parallel:      $PARALLEL_JOBS concurrent SSH jobs"
 echo "============================================================"
 echo ""
@@ -178,10 +187,10 @@ if ! $SKIP_DEPLOY; then
             if [ "$ip" = "LOCAL" ]; then
                 log_info "  Deploying mpcomm on local machine ($INITIATOR_IP) (this may take a few minutes)..."
                 if $DRY_RUN; then
-                    log_debug "  Would run: wget -qO- '${DEPLOY_URL}' | bash"
+            log_debug "  Would run: wget -qO- '${DEPLOY_URL}' | bash -s -- --version=${MPCOMM_VERSION:-<latest>}"
                     break
                 fi
-                DEPLOY_OUTPUT=$(wget -qO- "${DEPLOY_URL}" | bash 2>&1) || {
+                DEPLOY_OUTPUT=$(wget -qO- "${DEPLOY_URL}" | bash -s -- --version="${MPCOMM_VERSION}" 2>&1) || {
                     log_error "  local ($INITIATOR_IP) - deployment FAILED"
                     log_error "  Output (last 20 lines):"
                     echo "$DEPLOY_OUTPUT" | tail -20
@@ -218,7 +227,7 @@ if ! $SKIP_DEPLOY; then
                 local idx="$1"
                 local ip="$2"
                 echo "=== Deploying mpcomm on $ip ==="
-                if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash" 2>&1; then
+                if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash -s -- --version=${MPCOMM_VERSION}" 2>&1; then
                     echo "DEPLOY SCRIPT FAILED on $ip"
                     return 1
                 fi
@@ -238,7 +247,7 @@ if ! $SKIP_DEPLOY; then
             fi
         elif $DRY_RUN; then
             for idx in "${REMOTE_DEPLOY_INDICES[@]}"; do
-                log_debug "  Would run: $(ssh_cmd "${TARGET_IPS[$idx]}") 'wget -qO- \"${DEPLOY_URL}\" | bash'"
+                log_debug "  Would run: $(ssh_cmd "${TARGET_IPS[$idx]}") 'wget -qO- \"${DEPLOY_URL}\" | bash -s -- --version=${MPCOMM_VERSION}'"
             done
         fi
 
@@ -320,7 +329,7 @@ if ! $SKIP_BUILD; then
                 local idx="$1"
                 local ip="$2"
                 echo "=== Deploying tests on $ip ==="
-                if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${TESTS_INSTALL_DIR}" 2>&1; then
+                if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${TESTS_INSTALL_DIR} --version=${MPCOMM_VERSION}" 2>&1; then
                     echo "deploy_tests.sh FAILED on $ip"
                     return 1
                 fi

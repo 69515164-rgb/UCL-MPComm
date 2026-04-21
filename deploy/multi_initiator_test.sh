@@ -676,13 +676,25 @@ if ! $DRY_RUN; then
         local launcher="/tmp/mpcomm_launch_${port}.sh"
         local pid_sentinel="/tmp/mit_tgt_pid_$$_${slot}"
 
+        # Pick the first NUMA node from the spec (e.g. "0,1" -> "0") for
+        # numactl --cpunodebind/--membind. If numactl is unavailable on the
+        # remote host we fall back to an unbound launch with a warning so the
+        # test can still proceed.
+        local bind_node="${numas%%,*}"
+
         # Build the target launcher body locally; ship it via stdin.
         local launcher_body
         launcher_body="$(cat <<EOF
 #!/bin/bash
 ${ENV_EXPORTS}
 cd '${remote_dir}'
-stdbuf -oL ${remote_bin} --mode target --host-id ${ip}:${port} --tcp-port ${port} --buffer-size ${bufsz} --num-numas ${numas} > '${log_file}' 2>&1 &
+NUMACTL_PREFIX=""
+if [ -n '${bind_node}' ] && command -v numactl >/dev/null 2>&1; then
+    NUMACTL_PREFIX="numactl --cpunodebind=${bind_node} --membind=${bind_node}"
+elif [ -n '${bind_node}' ]; then
+    echo "[WARN] numactl not found on \$(hostname); target will run without NUMA binding" >&2
+fi
+stdbuf -oL \${NUMACTL_PREFIX} ${remote_bin} --mode target --host-id ${ip}:${port} --tcp-port ${port} --buffer-size ${bufsz} --num-numas ${numas} > '${log_file}' 2>&1 &
 echo \$! > '${pid_file}'
 EOF
 )"
@@ -872,7 +884,16 @@ build_initiator_cmd() {
     local name="$1"
     local remote_bin="$2"
     local specs="${JOB_TGT_SPECS[$name]}"
-    local cmd="${remote_bin}"
+    # Bind the initiator process to the first NUMA node from its numas spec
+    # (e.g. "0,1" -> "0"). The prefix is evaluated on the remote host at
+    # launch time so that missing numactl falls back gracefully.
+    local bind_node="${JOB_INI_NUMAS[$name]%%,*}"
+    local cmd
+    if [ -n "$bind_node" ]; then
+        cmd="\$(command -v numactl >/dev/null 2>&1 && echo \"numactl --cpunodebind=${bind_node} --membind=${bind_node}\" || { echo \"[WARN] numactl not found on \$(hostname); initiator will run without NUMA binding\" >&2; echo \"\"; }) ${remote_bin}"
+    else
+        cmd="${remote_bin}"
+    fi
     local i=0
     IFS='|' read -r -a arr <<< "$specs"
     for s in "${arr[@]}"; do

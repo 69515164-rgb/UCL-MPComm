@@ -7,13 +7,15 @@
     # from the pip package directory.
     #
     # Usage:
-    #   bash deploy_tests.sh                    # default (release)
-    #   bash deploy_tests.sh --debug            # debug build
+    #   bash deploy_tests.sh                    # current release (read VERSION)
+    #   bash deploy_tests.sh --debug            # current debug
+    #   bash deploy_tests.sh --version R01C02   # specific release
     #   bash deploy_tests.sh --install-dir /opt/mpcomm_tests
     #
     #   # via pipe:
     #   wget -qO- <URL>/deploy_tests.sh | bash
     #   wget -qO- <URL>/deploy_tests.sh | bash -s -- --debug
+    #   wget -qO- <URL>/deploy_tests.sh | bash -s -- --version=R01C02
     #
     # Exit code: 0 = success, 1 = failure
     # ============================================================================
@@ -24,17 +26,21 @@
     # ------------------------------------------------------------------
     DEBUG_BUILD=false
     INSTALL_DIR="/opt/mpcomm_tests"
+    MPCOMM_VERSION=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --debug)            DEBUG_BUILD=true; shift ;;
             --install-dir=*)    INSTALL_DIR="${1#*=}"; shift ;;
             --install-dir)      INSTALL_DIR="$2"; shift 2 ;;
+            --version=*)        MPCOMM_VERSION="${1#*=}"; shift ;;
+            --version)          MPCOMM_VERSION="$2"; shift 2 ;;
             *)                  shift ;;
         esac
     done
 
-    # Base URL for test files on Tencent mirror
-    TESTS_BASE_URL="https://mirrors.tencent.com/repository/generic/mpcomm/tests"
+    # Mirror base URLs (TESTS_BASE_URL resolved later after version is known)
+    MIRROR_BASE="https://mirrors.tencent.com/repository/generic/mpcomm"
+    VERSION_URL="${MIRROR_BASE}/VERSION"
 
     # Files to download
     TEST_FILES=(
@@ -113,6 +119,26 @@
         exit 1
     fi
     info "Download tool: $DL_CMD ✅"
+
+    # ------------------------------------------------------------------
+    # Resolve version (from --version, else from VERSION file on mirror)
+    # ------------------------------------------------------------------
+    if [[ -z "$MPCOMM_VERSION" ]]; then
+        info "Resolving mpcomm version from ${VERSION_URL} ..."
+        RAW_VERSION=""
+        if [[ "$DL_CMD" == "wget" ]]; then
+            RAW_VERSION=$(wget -qO- "${VERSION_URL}" 2>/dev/null || true)
+        else
+            RAW_VERSION=$(curl -fsSL "${VERSION_URL}" 2>/dev/null || true)
+        fi
+        MPCOMM_VERSION=$(echo "$RAW_VERSION" | awk -F= '/^MPCOMM_VERSION=/{gsub(/[[:space:]]/,"",$2); print $2; exit}')
+        if [[ -z "$MPCOMM_VERSION" ]]; then
+            error "Failed to resolve mpcomm version from ${VERSION_URL}"
+            exit 1
+        fi
+    fi
+    info "mpcomm version: $MPCOMM_VERSION"
+    TESTS_BASE_URL="${MIRROR_BASE}/tests/${MPCOMM_VERSION}"
 
     # ------------------------------------------------------------------
     # 2. Download test files

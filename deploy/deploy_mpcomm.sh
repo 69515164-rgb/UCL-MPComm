@@ -6,12 +6,16 @@
 # Performs environment checks before installation.
 #
 # Usage:
-#   bash deploy.sh              # install release build
-#   bash deploy.sh --debug       # install debug build
+#   bash deploy.sh                     # install current release build (read VERSION)
+#   bash deploy.sh --debug              # install current debug build
+#   bash deploy.sh --version R01C02     # install specific release version
+#   bash deploy.sh --debug --version R01C02  # install specific debug version
+#   bash deploy.sh --version R01C02 --semver 1.3.0  # override wheel semver
 #
 #   # via pipe:
 #   wget -qO- <URL>/deploy_mpcomm.sh | bash
 #   wget -qO- <URL>/deploy_mpcomm.sh | bash -s -- --debug
+#   wget -qO- <URL>/deploy_mpcomm.sh | bash -s -- --version=R01C02
 #
 # Exit code: 0 = success, 1 = failure
 # ============================================================================
@@ -21,11 +25,22 @@ set -euo pipefail
 # Parse arguments
 # ------------------------------------------------------------------
 DEBUG_BUILD=false
-for arg in "$@"; do
-    case "$arg" in
-        --debug) DEBUG_BUILD=true ;;
+MPCOMM_VERSION=""
+MPCOMM_SEMVER=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --debug)          DEBUG_BUILD=true; shift ;;
+        --version=*)      MPCOMM_VERSION="${1#*=}"; shift ;;
+        --version)        MPCOMM_VERSION="$2"; shift 2 ;;
+        --semver=*)       MPCOMM_SEMVER="${1#*=}"; shift ;;
+        --semver)         MPCOMM_SEMVER="$2"; shift 2 ;;
+        *)                shift ;;
     esac
 done
+
+# Mirror base URLs
+MIRROR_BASE="https://mirrors.tencent.com/repository/generic/mpcomm"
+VERSION_URL="${MIRROR_BASE}/VERSION"
 
 # Supported Python versions (add new versions here)
 SUPPORTED_PYTHON_VERSIONS=("3.12" "3.13")
@@ -118,13 +133,46 @@ if ! $VERSION_SUPPORTED; then
 fi
 info "Python version: $PYTHON_VERSION ($PY_TAG) ✅"
 
-# Build wheel URL and filename based on detected Python version
-MPCOMM_VER="1.2.0"
-WHL_NAME="mpcomm-${MPCOMM_VER}-${PY_TAG}-${PY_TAG}-linux_x86_64.whl"
+# ------------------------------------------------------------------
+# Resolve versions from VERSION file on mirror (if not fully overridden)
+#   MPCOMM_VERSION  -> release tag, used in mirror path (e.g. R01C03)
+#   MPCOMM_SEMVER   -> PEP 440 version used in wheel filename (e.g. 1.3.0)
+# ------------------------------------------------------------------
+if [[ -z "$MPCOMM_VERSION" || -z "$MPCOMM_SEMVER" ]]; then
+    info "Resolving mpcomm version from ${VERSION_URL} ..."
+    RAW_VERSION=""
+    if command -v wget &>/dev/null; then
+        RAW_VERSION=$(wget -qO- "${VERSION_URL}" 2>/dev/null || true)
+    elif command -v curl &>/dev/null; then
+        RAW_VERSION=$(curl -fsSL "${VERSION_URL}" 2>/dev/null || true)
+    else
+        error "Neither wget nor curl found. Please install one of them."
+        exit 1
+    fi
+    if [[ -z "$MPCOMM_VERSION" ]]; then
+        MPCOMM_VERSION=$(echo "$RAW_VERSION" | awk -F= '/^MPCOMM_VERSION=/{gsub(/[[:space:]]/,"",$2); print $2; exit}')
+    fi
+    if [[ -z "$MPCOMM_SEMVER" ]]; then
+        MPCOMM_SEMVER=$(echo "$RAW_VERSION" | awk -F= '/^MPCOMM_SEMVER=/{gsub(/[[:space:]]/,"",$2); print $2; exit}')
+    fi
+fi
+if [[ -z "$MPCOMM_VERSION" ]]; then
+    error "Failed to resolve MPCOMM_VERSION from ${VERSION_URL}"
+    exit 1
+fi
+if [[ -z "$MPCOMM_SEMVER" ]]; then
+    error "Failed to resolve MPCOMM_SEMVER from ${VERSION_URL} (required for wheel filename)"
+    exit 1
+fi
+info "mpcomm version: $MPCOMM_VERSION (wheel semver: $MPCOMM_SEMVER)"
+
+# Build wheel URL and filename based on detected Python version and resolved semver
+WHL_NAME="mpcomm-${MPCOMM_SEMVER}-${PY_TAG}-${PY_TAG}-linux_x86_64.whl"
+
 if $DEBUG_BUILD; then
-    WHL_URL="https://mirrors.tencent.com/repository/generic/mpcomm/build/debug/${WHL_NAME}"
+    WHL_URL="${MIRROR_BASE}/build/debug/${MPCOMM_VERSION}/${WHL_NAME}"
 else
-    WHL_URL="https://mirrors.tencent.com/repository/generic/mpcomm/build/${WHL_NAME}"
+    WHL_URL="${MIRROR_BASE}/build/${MPCOMM_VERSION}/${WHL_NAME}"
 fi
 info "Wheel: $WHL_NAME"
 

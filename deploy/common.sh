@@ -12,6 +12,12 @@ HOSTS_FILE="${HOSTS_FILE:-${SCRIPT_DIR:-.}/hosts.txt}"
 BINARY_PATH="${BINARY_PATH:-./build/scatter_test}"
 DEPLOY_URL="${DEPLOY_URL:-https://mirrors.tencent.com/repository/generic/mpcomm/utils/deploy_mpcomm.sh}"
 DEPLOY_TESTS_URL="${DEPLOY_TESTS_URL:-https://mirrors.tencent.com/repository/generic/mpcomm/utils/deploy_tests.sh}"
+# Shared VERSION file on the mirror that records the most recent published
+# version (applies to both the wheel and the test sources). Same format as the
+# in-repo VERSION file: contains a line `MPCOMM_VERSION=<ver>`.
+VERSION_URL="${VERSION_URL:-https://mirrors.tencent.com/repository/generic/mpcomm/VERSION}"
+# Explicit version to deploy; empty means "resolve from VERSION_URL".
+MPCOMM_VERSION="${MPCOMM_VERSION:-}"
 TESTS_INSTALL_DIR="${TESTS_INSTALL_DIR:-/opt/mpcomm_tests}"
 SSH_USER="${SSH_USER:-root}"
 SSH_PORT="${SSH_PORT:-36001}"
@@ -45,6 +51,41 @@ ssh_cmd() {
         cmd+=" ${host}"
     fi
     echo "$cmd"
+}
+
+# ---- Resolve mpcomm version to deploy ----
+# If $MPCOMM_VERSION is already set (e.g. via --version), use it as-is.
+# Otherwise fetch $VERSION_URL and parse the `MPCOMM_VERSION=` line from it.
+# On success, $MPCOMM_VERSION is exported so subprocesses (ssh) inherit it.
+resolve_mpcomm_version() {
+    if [ -n "${MPCOMM_VERSION:-}" ]; then
+        log_debug "Using explicit mpcomm version: $MPCOMM_VERSION"
+        export MPCOMM_VERSION
+        return 0
+    fi
+
+    local raw=""
+    if command -v wget &>/dev/null; then
+        raw=$(wget -qO- "${VERSION_URL}" 2>/dev/null || true)
+    elif command -v curl &>/dev/null; then
+        raw=$(curl -fsSL "${VERSION_URL}" 2>/dev/null || true)
+    else
+        log_error "Neither wget nor curl available to resolve mpcomm version."
+        return 1
+    fi
+
+    local fetched
+    fetched=$(echo "$raw" | awk -F= '/^MPCOMM_VERSION=/{gsub(/[[:space:]]/,"",$2); print $2; exit}')
+
+    if [ -z "$fetched" ]; then
+        log_error "Failed to resolve mpcomm version from $VERSION_URL"
+        return 1
+    fi
+
+    MPCOMM_VERSION="$fetched"
+    export MPCOMM_VERSION
+    log_info "Resolved mpcomm version: $MPCOMM_VERSION"
+    return 0
 }
 
 # ---- Read Hosts File ----
@@ -144,8 +185,10 @@ remote_deploy_tests() {
     local install_dir="$TESTS_INSTALL_DIR"
 
     log_info "  $label - deploying tests via deploy_tests.sh..."
+    local version_arg=""
+    [ -n "${MPCOMM_VERSION:-}" ] && version_arg="--version=${MPCOMM_VERSION}"
     local deploy_output deploy_ok=false
-    deploy_output=$($(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${install_dir}" 2>&1) && deploy_ok=true
+    deploy_output=$($(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${install_dir} ${version_arg}" 2>&1) && deploy_ok=true
 
     if $deploy_ok && $(ssh_cmd "$ip") "test -x '${install_dir}/build/scatter_test'" &>/dev/null; then
         BUILT_BINARY_PATH="${install_dir}/build/scatter_test"
@@ -169,8 +212,10 @@ local_deploy_tests() {
     local install_dir="$TESTS_INSTALL_DIR"
 
     log_info "Deploying tests locally via deploy_tests.sh..."
+    local version_arg=()
+    [ -n "${MPCOMM_VERSION:-}" ] && version_arg=(--version="${MPCOMM_VERSION}")
     local deploy_output deploy_ok=false
-    deploy_output=$(wget -qO- "${DEPLOY_TESTS_URL}" | bash -s -- --install-dir="${install_dir}" 2>&1) && deploy_ok=true
+    deploy_output=$(wget -qO- "${DEPLOY_TESTS_URL}" | bash -s -- --install-dir="${install_dir}" "${version_arg[@]}" 2>&1) && deploy_ok=true
 
     if $deploy_ok && [ -x "${install_dir}/build/scatter_test" ]; then
         BUILT_BINARY_PATH="${install_dir}/build/scatter_test"

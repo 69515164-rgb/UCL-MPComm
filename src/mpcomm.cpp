@@ -31,6 +31,7 @@
 
 #ifdef USE_CUDA
 #include <cuda.h>
+#include <cuda_runtime.h>
 #endif
 
 #include <infiniband/verbs.h>
@@ -604,6 +605,18 @@ public:
     std::vector<size_t> getLocalNicIndicesForNuma(int numa_node) const;
     int getGpuNumaNode(int gpu_device_id) const;
 
+    // HBM-DRAM Mapping
+    uintptr_t mapDRAMtoGPU(void *host_addr, size_t length);
+    int unmapDRAMfromGPU(void *host_addr);
+
+    // TMA Transfer
+    int tmaGather(uintptr_t dram_dev_ptr, const long *indices,
+                  void *gpu_dst, int num_blocks, int block_size,
+                  int max_sm_count, int mode);
+    int tmaScatter(void *gpu_src, const long *indices,
+                   uintptr_t dram_dev_ptr, int num_blocks, int block_size,
+                   int max_sm_count, int mode);
+
 private:
     // Topology discovery
     int getNumaNodeCount();
@@ -751,6 +764,17 @@ private:
 
     // PXN (NVLink Proxy) subsystem
     PxnManager pxn_manager_;
+
+#ifdef MPCOMM_ENABLE_CUDA_KERNELS
+    // DRAM-GPU mapping tracking (used by H2D/D2H TMA kernels)
+    struct DRAMGPUMapping {
+        void *host_addr;
+        size_t length;
+        uintptr_t device_ptr;
+    };
+    std::unordered_map<uintptr_t, DRAMGPUMapping> dram_gpu_mappings_;  // key: host_addr as uintptr_t
+    std::mutex dram_gpu_mappings_mutex_;
+#endif
 };
 
 // ============================================================================
@@ -964,6 +988,23 @@ MPComm::Impl::Impl()
 MPComm::Impl::~Impl() {
     shutdown();
 }
+
+/*
+init()
+  │
+  ├─ 1. 防重复 + openDevices() → 打开 RDMA NIC
+  │
+  ├─ 2. socket/bind/listen → TCP 控制面监听
+  │
+  ├─ 3. discoverTopology() → 探测 NUMA 拓扑 + 读取 CPU 列表
+  │
+  ├─ 4. 创建 worker_queues_ + worker_threads_ → RDMA 异步引擎启动
+  │
+  ├─ 5. 日志
+  │
+  └─ 6. 写版本文件（可选）
+*/
+
 
 int MPComm::Impl::init(const std::string &local_host_id,
                  const std::string &device_names,
@@ -1228,6 +1269,12 @@ int MPComm::Impl::init(const std::string &local_host_id,
 
     return MPCOMM_SUCCESS;
 }
+/*
+shutdown():
+  停 Accept 线程 → 原子标记 worker 停止 → join 所有 worker
+  → 清理队列/线程 → 关 TCP socket → 销毁 NIC RDMA 资源
+  → 清空连接 → 标记未初始化
+*/
 
 void MPComm::Impl::shutdown() {
     stopAcceptThread();
@@ -1273,7 +1320,12 @@ void MPComm::Impl::shutdown() {
     connections_.clear();
     initialized_ = false;
 }
-
+/*
+openDevices():
+  枚举 RDMA 设备 → 构建设备白名单(参数 < 环境变量优先级)
+  → 逐设备: 过滤 → NUMA本地内存分配 NicContext
+  → setupNicContext 初始化 RDMA 资源 → 收集到 nic_contexts_
+*/
 int MPComm::Impl::openDevices(const std::string &device_names) {
     int num_devices = 0;
     struct ibv_device **devices = ibv_get_device_list(&num_devices);
@@ -1429,6 +1481,17 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
         if (ibv_query_gid(ctx.context, ctx.port, ctx.gid_index, &ctx.gid) != 0) {
             MPCOMM_LOG_ERROR("MPComm: Failed to query GID on %s\n",
                     device_name.c_str());
+            ibv_close_device(ctx.context);
+            ctx.context = nullptr;
+            return MPCOMM_ERR_CONTEXT;
+        }
+        // Check if the queried GID is all-zeros (no routable IPv4-mapped address).
+        // This happens on NICs that only have link-local (fe80::) GIDs but no
+        // IPv4 configuration. Such NICs cannot establish RoCEv2 connections and
+        // would cause modifyQPToRTR to fail with EINVAL.
+        if (isNullGid(&ctx.gid)) {
+            MPCOMM_LOG_WARN("MPComm: GID index %d on %s is all-zeros (no routable address), skipping device\n",
+                    ctx.gid_index, device_name.c_str());
             ibv_close_device(ctx.context);
             ctx.context = nullptr;
             return MPCOMM_ERR_CONTEXT;
@@ -2683,6 +2746,11 @@ int MPComm::Impl::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
 
     if (ibv_modify_qp(qp, &attr, flags) != 0) {
         MPCOMM_PLOG_ERROR("MPComm: Failed to modify QP to RTR");
+        MPCOMM_LOG_ERROR("MPComm:   Local NIC: %s, port=%u, gid_index=%d, gid=%s\n",
+                ctx.device_name.c_str(), ctx.port, ctx.gid_index,
+                gidToString(ctx.gid).c_str());
+        MPCOMM_LOG_ERROR("MPComm:   Remote: gid=%s, lid=%u, qp_num=%u\n",
+                remote.gid, remote.lid, remote.qp_num);
         return MPCOMM_ERR_CONNECTION;
     }
 
@@ -2960,6 +3028,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     // - If all remote NICs are on the same NUMA node: simple suffix-based matching
     
     size_t total_connections = 0;
+    size_t skipped_connections = 0;
     
     // Suffix-based matching strategy with cross-NUMA support:
     // Local NIC with suffix N connects to:
@@ -3017,6 +3086,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         
         // Create connections to each target remote NIC
         for (size_t remote_nic : target_remote_nics) {
+            bool connection_failed = false;
             std::string key = remote_host_id + ":" + std::to_string(local_nic) + 
                               ":" + std::to_string(remote_nic);
             std::vector<struct ibv_qp *> qp_list;
@@ -3091,22 +3161,50 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                 // Complete QP setup
                 ret = modifyQPToRTR(ctx, qp, remote_info);
                 if (ret != 0) {
+                    // Send failure status to passive side so it can skip too
+                    uint8_t status = 1;  // 1 = failure
+                    send(sock_fd, &status, sizeof(status), 0);
+                    MPCOMM_LOG_WARN("MPComm: Skipping NIC %s->%s (modifyQPToRTR failed), continuing with other NICs\n",
+                           nic_contexts_[local_nic]->device_name.c_str(),
+                           remote_nic_names[remote_nic].c_str());
                     destroyQP(qp);
                     for (auto *created_qp : qp_list) {
                         destroyQP(created_qp);
                     }
-                    close(sock_fd);
-                    return ret;
+                    qp_list.clear();
+                    connection_failed = true;
+                    break;
                 }
 
                 ret = modifyQPToRTS(qp);
                 if (ret != 0) {
+                    // Send failure status to passive side so it can skip too
+                    uint8_t status = 1;  // 1 = failure
+                    send(sock_fd, &status, sizeof(status), 0);
+                    MPCOMM_LOG_WARN("MPComm: Skipping NIC %s->%s (modifyQPToRTS failed), continuing with other NICs\n",
+                           nic_contexts_[local_nic]->device_name.c_str(),
+                           remote_nic_names[remote_nic].c_str());
                     destroyQP(qp);
                     for (auto *created_qp : qp_list) {
                         destroyQP(created_qp);
                     }
-                    close(sock_fd);
-                    return ret;
+                    qp_list.clear();
+                    connection_failed = true;
+                    break;
+                }
+
+                // Send success status to passive side
+                {
+                    uint8_t status = 0;  // 0 = success
+                    if (send(sock_fd, &status, sizeof(status), 0) != sizeof(status)) {
+                        MPCOMM_PLOG_ERROR("MPComm: Failed to send QP status");
+                        destroyQP(qp);
+                        for (auto *created_qp : qp_list) {
+                            destroyQP(created_qp);
+                        }
+                        close(sock_fd);
+                        return MPCOMM_ERR_CONNECTION;
+                    }
                 }
 
                 qp_list.push_back(qp);
@@ -3115,6 +3213,20 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                 if (qp_idx == 0) {
                     conn_info.nic_endpoints[remote_nic] = remote_info;
                 }
+            }
+
+            if (connection_failed) {
+                // Remove this remote NIC from the mapping since connection failed
+                auto map_it = conn_info.local_to_remote_nic_map.find(local_nic);
+                if (map_it != conn_info.local_to_remote_nic_map.end()) {
+                    auto &targets = map_it->second;
+                    targets.erase(std::remove(targets.begin(), targets.end(), remote_nic), targets.end());
+                    if (targets.empty()) {
+                        conn_info.local_to_remote_nic_map.erase(map_it);
+                    }
+                }
+                skipped_connections++;
+                continue;  // Skip to next remote NIC
             }
 
             // Store QP list with new key format: "host:local_nic:remote_nic"
@@ -3128,14 +3240,25 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
 
     close(sock_fd);
 
+    if (total_connections == 0) {
+        MPCOMM_LOG_ERROR("MPComm: No NIC connections established to %s (all %zu skipped)\n",
+               remote_host_id.c_str(), skipped_connections);
+        return MPCOMM_ERR_CONNECTION;
+    }
+
     // Store connection info
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
         connections_[remote_host_id] = conn_info;
     }
 
-    MPCOMM_LOG_INFO("MPComm: Connected to %s with %zu NIC connections (NUMA-aware), %zu QPs each\n",
-           remote_host_id.c_str(), total_connections, actual_qps);
+    if (skipped_connections > 0) {
+        MPCOMM_LOG_WARN("MPComm: Connected to %s with %zu NIC connections (%zu skipped due to unreachable NICs), %zu QPs each\n",
+               remote_host_id.c_str(), total_connections, skipped_connections, actual_qps);
+    } else {
+        MPCOMM_LOG_INFO("MPComm: Connected to %s with %zu NIC connections (NUMA-aware), %zu QPs each\n",
+               remote_host_id.c_str(), total_connections, actual_qps);
+    }
     
     return MPCOMM_SUCCESS;
 }
@@ -3459,6 +3582,7 @@ void MPComm::Impl::acceptLoop() {
                               ":" + std::to_string(remote_nic);
             std::vector<struct ibv_qp *> qp_list;
             qp_list.reserve(actual_qps);
+            bool connection_skipped = false;
 
             // Process first QP (already received remote_info)
             for (size_t qp_idx = 0; qp_idx < actual_qps && success; ++qp_idx) {
@@ -3502,6 +3626,30 @@ void MPComm::Impl::acceptLoop() {
                     break;
                 }
 
+                // Receive status from active side (whether modifyQPToRTR/RTS succeeded)
+                uint8_t active_status = 0;
+                if (recv(client_fd, &active_status, sizeof(active_status), MSG_WAITALL) !=
+                    sizeof(active_status)) {
+                    MPCOMM_PLOG_ERROR("MPComm: Failed to receive QP status from active side");
+                    destroyQP(qp);
+                    success = false;
+                    break;
+                }
+
+                if (active_status != 0) {
+                    // Active side failed to establish this connection, skip it
+                    MPCOMM_LOG_WARN("MPComm: Passive side: Active side reported failure for NIC %s<-%s, skipping\n",
+                           nic_contexts_[local_nic]->device_name.c_str(),
+                           remote_nic_names[remote_nic].c_str());
+                    destroyQP(qp);
+                    for (auto *created_qp : qp_list) {
+                        destroyQP(created_qp);
+                    }
+                    qp_list.clear();
+                    connection_skipped = true;
+                    break;
+                }
+
                 // Complete QP setup
                 if (modifyQPToRTR(ctx, qp, remote_info) != 0 ||
                     modifyQPToRTS(qp) != 0) {
@@ -3525,7 +3673,11 @@ void MPComm::Impl::acceptLoop() {
                        qp_idx, local_info.qp_num, remote_info.qp_num);
             }
 
-            if (success) {
+            if (connection_skipped) {
+                // Active side reported failure, skip this connection but continue
+                total_connections++;  // Still counts toward expected_connections
+                continue;
+            } else if (success) {
                 // Store QP list with new key format
                 std::lock_guard<std::mutex> lock(ctx.qp_mutex);
                 ctx.qp_map[key] = std::move(qp_list);
@@ -4359,6 +4511,18 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
 // ============================================================================
 // Worker Thread Implementation for Fully Async Transfer
 // ============================================================================
+
+/**
+┌─────────────────────────────────────────┐
+│          while (worker_running_)        │
+│                                         │
+│  Phase 1: 取任务 ──→ 加入活跃集合          │
+│  Phase 2: 发 RDMA WR（流控 + 负载均衡）    │
+│  Phase 3: 轮询 CQ，收割完成事件            │
+│  Phase 4: 清理已完成的上下文               │
+│                                         │
+└─────────────────────────────────────────┘
+ */
 
 void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
     // Bind this thread to a specific CPU if requested
@@ -5873,6 +6037,195 @@ std::vector<size_t> MPComm::getLocalNicIndicesForNuma(int numa_node) const {
 
 int MPComm::getGpuNumaNode(int gpu_device_id) const {
     return impl_->getGpuNumaNode(gpu_device_id);
+}
+
+// =====================================================================
+// HBM-DRAM Mapping Implementation
+// =====================================================================
+
+uintptr_t MPComm::Impl::mapDRAMtoGPU(void *host_addr, size_t length) {
+#ifdef MPCOMM_ENABLE_CUDA_KERNELS
+    if (!host_addr || length == 0) {
+        MPCOMM_LOG_ERROR("MPComm: mapDRAMtoGPU: invalid arguments (addr=%p, length=%zu)\n",
+                         host_addr, length);
+        return 0;
+    }
+
+    // Query NUMA node for logging
+    int numa_node = -1;
+    int status = -1;
+    if (move_pages(0, 1, &host_addr, nullptr, &status, 0) == 0 && status >= 0) {
+        numa_node = status;
+    }
+    MPCOMM_LOG_INFO("MPComm: mapDRAMtoGPU: registering DRAM buffer %p (%zu bytes) on NUMA node %d\n",
+                    host_addr, length, numa_node);
+
+    // Register as pinned + mapped memory
+    cudaError_t err = cudaHostRegister(host_addr, length, cudaHostRegisterMapped);
+    if (err != cudaSuccess && err != cudaErrorHostMemoryAlreadyRegistered) {
+        MPCOMM_LOG_ERROR("MPComm: mapDRAMtoGPU: cudaHostRegister failed: %s\n",
+                         cudaGetErrorString(err));
+        return 0;
+    }
+
+    // Get GPU-accessible device pointer
+    void *device_ptr = nullptr;
+    err = cudaHostGetDevicePointer(&device_ptr, host_addr, 0);
+    if (err != cudaSuccess || !device_ptr) {
+        MPCOMM_LOG_ERROR("MPComm: mapDRAMtoGPU: cudaHostGetDevicePointer failed: %s\n",
+                         cudaGetErrorString(err));
+        cudaHostUnregister(host_addr);
+        return 0;
+    }
+
+    // Track the mapping
+    {
+        std::lock_guard<std::mutex> lock(dram_gpu_mappings_mutex_);
+        DRAMGPUMapping mapping;
+        mapping.host_addr = host_addr;
+        mapping.length = length;
+        mapping.device_ptr = reinterpret_cast<uintptr_t>(device_ptr);
+        dram_gpu_mappings_[reinterpret_cast<uintptr_t>(host_addr)] = mapping;
+    }
+
+    MPCOMM_LOG_INFO("MPComm: mapDRAMtoGPU: DRAM %p mapped to GPU device pointer %p\n",
+                    host_addr, device_ptr);
+    return reinterpret_cast<uintptr_t>(device_ptr);
+#else
+    (void)host_addr;
+    (void)length;
+    MPCOMM_LOG_ERROR("MPComm: mapDRAMtoGPU: CUDA kernels not compiled (USE_CUDA_KERNELS=OFF)\n");
+    return 0;
+#endif
+}
+
+int MPComm::Impl::unmapDRAMfromGPU(void *host_addr) {
+#ifdef MPCOMM_ENABLE_CUDA_KERNELS
+    if (!host_addr) {
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+
+    // Remove from tracking
+    {
+        std::lock_guard<std::mutex> lock(dram_gpu_mappings_mutex_);
+        auto it = dram_gpu_mappings_.find(reinterpret_cast<uintptr_t>(host_addr));
+        if (it == dram_gpu_mappings_.end()) {
+            MPCOMM_LOG_WARN("MPComm: unmapDRAMfromGPU: address %p not found in mapping table\n",
+                            host_addr);
+            return MPCOMM_ERR_INVALID_ARG;
+        }
+        dram_gpu_mappings_.erase(it);
+    }
+
+    cudaError_t err = cudaHostUnregister(host_addr);
+    if (err != cudaSuccess) {
+        MPCOMM_LOG_ERROR("MPComm: unmapDRAMfromGPU: cudaHostUnregister failed: %s\n",
+                         cudaGetErrorString(err));
+        return MPCOMM_ERR_MEMORY;
+    }
+
+    MPCOMM_LOG_INFO("MPComm: unmapDRAMfromGPU: unregistered DRAM buffer %p\n", host_addr);
+    return MPCOMM_SUCCESS;
+#else
+    (void)host_addr;
+    MPCOMM_LOG_ERROR("MPComm: unmapDRAMfromGPU: CUDA kernels not compiled (USE_CUDA_KERNELS=OFF)\n");
+    return MPCOMM_ERR_DEVICE;
+#endif
+}
+
+// =====================================================================
+// TMA Transfer Implementation
+// =====================================================================
+
+// External TMA kernel declarations (defined in mpcomm_tma_kernels.cu)
+#ifdef MPCOMM_ENABLE_CUDA_KERNELS
+extern void launch_tma_gather_kernel(
+    const char *src_base, const long *indices, char *dst_base,
+    int block_size_bytes, int total_tasks, int max_sm_count, int mode);
+
+extern void launch_tma_scatter_kernel(
+    const char *src_base, const long *indices, char *dst_base,
+    int block_size_bytes, int total_tasks, int max_sm_count, int mode);
+#endif
+
+int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
+                             void *gpu_dst, int num_blocks, int block_size,
+                             int max_sm_count, int mode) {
+#ifdef MPCOMM_ENABLE_CUDA_KERNELS
+    if (!dram_dev_ptr || !indices || !gpu_dst || num_blocks <= 0 || block_size <= 0) {
+        MPCOMM_LOG_ERROR("MPComm: tmaGather: invalid arguments\n");
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+
+    launch_tma_gather_kernel(
+        reinterpret_cast<const char *>(dram_dev_ptr),
+        indices,
+        reinterpret_cast<char *>(gpu_dst),
+        block_size,
+        num_blocks,
+        max_sm_count,
+        mode);
+
+    return MPCOMM_SUCCESS;
+#else
+    (void)dram_dev_ptr; (void)indices; (void)gpu_dst;
+    (void)num_blocks; (void)block_size; (void)max_sm_count; (void)mode;
+    MPCOMM_LOG_ERROR("MPComm: tmaGather: CUDA kernels not compiled (USE_CUDA_KERNELS=OFF)\n");
+    return MPCOMM_ERR_DEVICE;
+#endif
+}
+
+int MPComm::Impl::tmaScatter(void *gpu_src, const long *indices,
+                              uintptr_t dram_dev_ptr, int num_blocks,
+                              int block_size, int max_sm_count, int mode) {
+#ifdef MPCOMM_ENABLE_CUDA_KERNELS
+    if (!gpu_src || !indices || !dram_dev_ptr || num_blocks <= 0 || block_size <= 0) {
+        MPCOMM_LOG_ERROR("MPComm: tmaScatter: invalid arguments\n");
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+
+    launch_tma_scatter_kernel(
+        reinterpret_cast<const char *>(gpu_src),
+        indices,
+        reinterpret_cast<char *>(dram_dev_ptr),
+        block_size,
+        num_blocks,
+        max_sm_count,
+        mode);
+
+    return MPCOMM_SUCCESS;
+#else
+    (void)gpu_src; (void)indices; (void)dram_dev_ptr;
+    (void)num_blocks; (void)block_size; (void)max_sm_count; (void)mode;
+    MPCOMM_LOG_ERROR("MPComm: tmaScatter: CUDA kernels not compiled (USE_CUDA_KERNELS=OFF)\n");
+    return MPCOMM_ERR_DEVICE;
+#endif
+}
+
+// =====================================================================
+// Public API Forwarding: HBM-DRAM Mapping & TMA
+// =====================================================================
+
+uintptr_t MPComm::mapDRAMtoGPU(void *host_addr, size_t length) {
+    return impl_->mapDRAMtoGPU(host_addr, length);
+}
+
+int MPComm::unmapDRAMfromGPU(void *host_addr) {
+    return impl_->unmapDRAMfromGPU(host_addr);
+}
+
+int MPComm::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
+                      void *gpu_dst, int num_blocks, int block_size,
+                      int max_sm_count, H2DMode mode) {
+    return impl_->tmaGather(dram_dev_ptr, indices, gpu_dst, num_blocks,
+                            block_size, max_sm_count, static_cast<int>(mode));
+}
+
+int MPComm::tmaScatter(void *gpu_src, const long *indices,
+                       uintptr_t dram_dev_ptr, int num_blocks,
+                       int block_size, int max_sm_count, H2DMode mode) {
+    return impl_->tmaScatter(gpu_src, indices, dram_dev_ptr, num_blocks,
+                             block_size, max_sm_count, static_cast<int>(mode));
 }
 
 }  // namespace mpcomm

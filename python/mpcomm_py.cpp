@@ -488,6 +488,70 @@ public:
         return result;
     }
 
+    // ==================== HBM-DRAM Mapping API ====================
+
+    /**
+     * Map a DRAM buffer to GPU address space via Zero-Copy
+     * @param host_addr  CPU DRAM buffer address as uintptr_t
+     * @param length     Buffer length in bytes
+     * @return GPU device pointer as uintptr_t, or 0 on failure
+     */
+    uintptr_t mapDRAMtoGPU(uintptr_t host_addr, size_t length) {
+        return comm_.mapDRAMtoGPU(reinterpret_cast<void *>(host_addr), length);
+    }
+
+    /**
+     * Unmap a previously mapped DRAM buffer from GPU address space
+     * @param host_addr  The original CPU DRAM address as uintptr_t
+     * @return 0 on success, negative error code on failure
+     */
+    int unmapDRAMfromGPU(uintptr_t host_addr) {
+        return comm_.unmapDRAMfromGPU(reinterpret_cast<void *>(host_addr));
+    }
+
+    // ==================== TMA Transfer API ====================
+
+    /**
+     * Gather: Load scattered blocks from DRAM to GPU HBM
+     * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
+     * @param indices_ptr    Pointer to block indices array (on GPU)
+     * @param gpu_dst_ptr    GPU HBM destination address
+     * @param num_blocks     Number of blocks to gather
+     * @param block_size     Size of each block in bytes
+     * @param max_sm_count   Maximum SMs to use (0 = auto)
+     * @param mode           Transfer mode: 0=AUTO, 1=SM, 2=TMA
+     * @return 0 on success, negative error code on failure
+     */
+    int tmaGather(uintptr_t dram_dev_ptr, uintptr_t indices_ptr,
+                  uintptr_t gpu_dst_ptr, int num_blocks, int block_size,
+                  int max_sm_count = 0, int mode = 0) {
+        return comm_.tmaGather(dram_dev_ptr,
+                               reinterpret_cast<const long *>(indices_ptr),
+                               reinterpret_cast<void *>(gpu_dst_ptr),
+                               num_blocks, block_size, max_sm_count,
+                               static_cast<H2DMode>(mode));
+    }
+
+    /**
+     * Scatter: Store data blocks from GPU HBM to DRAM
+     * @param gpu_src_ptr    GPU HBM source address
+     * @param indices_ptr    Pointer to block indices array (on GPU)
+     * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
+     * @param num_blocks     Number of blocks to scatter
+     * @param block_size     Size of each block in bytes
+     * @param max_sm_count   Maximum SMs to use (0 = auto)
+     * @param mode           Transfer mode: 0=AUTO, 1=SM, 2=TMA
+     * @return 0 on success, negative error code on failure
+     */
+    int tmaScatter(uintptr_t gpu_src_ptr, uintptr_t indices_ptr,
+                   uintptr_t dram_dev_ptr, int num_blocks, int block_size,
+                   int max_sm_count = 0, int mode = 0) {
+        return comm_.tmaScatter(reinterpret_cast<void *>(gpu_src_ptr),
+                                reinterpret_cast<const long *>(indices_ptr),
+                                dram_dev_ptr, num_blocks, block_size,
+                                max_sm_count, static_cast<H2DMode>(mode));
+    }
+
 private:
     MPComm comm_;
 };
@@ -659,7 +723,41 @@ m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
              py::arg("remote_tcp_port"),
              "Query remote host's first published buffer (backward compatible)")
         .def("get_published_buffer_info", &MPCommPy::getPublishedBufferInfo,
-             "Get local published buffer info");
+             "Get local published buffer info")
+        // HBM-DRAM Mapping API
+        .def("map_dram_to_gpu", &MPCommPy::mapDRAMtoGPU,
+             py::arg("host_addr"),
+             py::arg("length"),
+             "Map DRAM buffer to GPU address space via Zero-Copy. Returns GPU device pointer.")
+        .def("unmap_dram_from_gpu", &MPCommPy::unmapDRAMfromGPU,
+             py::arg("host_addr"),
+             "Unmap a previously mapped DRAM buffer from GPU address space")
+        // H2D Transfer API (supports SM and TMA modes)
+        .def("tma_gather", &MPCommPy::tmaGather,
+             py::arg("dram_dev_ptr"),
+             py::arg("indices_ptr"),
+             py::arg("gpu_dst_ptr"),
+             py::arg("num_blocks"),
+             py::arg("block_size"),
+             py::arg("max_sm_count") = 0,
+             py::arg("mode") = 0,
+             "Gather: Load scattered blocks from DRAM to GPU HBM.\n"
+             "mode: 0=AUTO (default), 1=SM (int4 Zero-Copy), 2=TMA (cp.async.bulk)")
+        .def("tma_scatter", &MPCommPy::tmaScatter,
+             py::arg("gpu_src_ptr"),
+             py::arg("indices_ptr"),
+             py::arg("dram_dev_ptr"),
+             py::arg("num_blocks"),
+             py::arg("block_size"),
+             py::arg("max_sm_count") = 0,
+             py::arg("mode") = 0,
+             "Scatter: Store blocks from GPU HBM to DRAM.\n"
+             "mode: 0=AUTO (default), 1=SM (int4 Zero-Copy), 2=TMA (cp.async.bulk)");
+
+    // Expose H2DMode constants
+    m.attr("H2D_MODE_AUTO") = static_cast<int>(H2D_MODE_AUTO);
+    m.attr("H2D_MODE_SM")   = static_cast<int>(H2D_MODE_SM);
+    m.attr("H2D_MODE_TMA")  = static_cast<int>(H2D_MODE_TMA);
 }
 
 }  // namespace mpcomm

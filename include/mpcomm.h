@@ -48,6 +48,26 @@ enum MPCommError {
 using TransferHandle = uint64_t;
 static constexpr TransferHandle INVALID_TRANSFER_HANDLE = 0;
 
+/**
+ * H2D (Host-to-Device) transfer mode for gather/scatter operations.
+ *
+ *   AUTO - Automatically select the best kernel based on hardware.
+ *          On Hopper (sm_90+), defaults to TMA for optimal PCIe bandwidth
+ *          with minimal SM occupancy.
+ *   SM   - int4 vectorized Zero-Copy.  GPU SM threads directly read/write DRAM
+ *          via PCIe using 128-bit LDG/STG instructions.  Optional optimization
+ *          that trades SM compute resources for simplicity (no Smem staging).
+ *          Requires block_size to be 16-byte aligned.
+ *   TMA  - Hopper TMA engine (cp.async.bulk).  Data goes through Shared Memory
+ *          staging with mbarrier synchronization.  Minimal SM occupancy; best
+ *          for large contiguous transfers.  Requires sm_90+ (H100/H800/H20).
+ */
+enum H2DMode {
+    H2D_MODE_AUTO = 0,   // Auto-select best kernel (default)
+    H2D_MODE_SM   = 1,   // int4 vectorized Zero-Copy (SM-driven)
+    H2D_MODE_TMA  = 2,   // Hopper TMA engine (cp.async.bulk via Smem)
+};
+
 // Maximum size for a single RDMA transfer (default: 1 GB)
 // Can be configured via environment variable MPCOMM_MAX_RDMA_TRANSFER_SIZE
 static constexpr size_t MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE = 1ULL << 30;
@@ -392,6 +412,83 @@ public:
 
     /** Get the NUMA node for a specific GPU device */
     int getGpuNumaNode(int gpu_device_id) const;
+
+    // ==================== HBM-DRAM Mapping API ====================
+
+    /**
+     * Map a DRAM buffer to GPU address space via Zero-Copy (cudaHostRegister + Mapped)
+     *
+     * This registers a CPU DRAM buffer as pinned memory and obtains a GPU-accessible
+     * device pointer. The GPU can then access DRAM data directly through PCIe BAR
+     * without explicit cudaMemcpy.
+     *
+     * @param host_addr  CPU DRAM buffer address (should be page-aligned for best performance)
+     * @param length     Buffer length in bytes
+     * @return GPU-accessible device pointer (as uintptr_t), or 0 on failure
+     */
+    uintptr_t mapDRAMtoGPU(void *host_addr, size_t length);
+
+    /**
+     * Unmap a previously mapped DRAM buffer from GPU address space
+     *
+     * @param host_addr  The original CPU DRAM address passed to mapDRAMtoGPU
+     * @return 0 on success, negative error code on failure
+     */
+    int unmapDRAMfromGPU(void *host_addr);
+
+    // ==================== H2D Transfer API ====================
+
+    /**
+     * Gather: Load scattered data blocks from DRAM (via mapped pointer) to GPU HBM
+     *
+     * Supports two kernel backends selectable via `mode`:
+     *   H2D_MODE_AUTO (default) - auto-select based on block_size and hardware
+     *   H2D_MODE_SM   - int4 vectorized Zero-Copy (LDG.E.128, SM-driven)
+     *   H2D_MODE_TMA  - Hopper TMA engine (cp.async.bulk, requires sm_90+)
+     *
+     * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
+     * @param indices        Array of block indices to gather (on GPU)
+     * @param gpu_dst        Destination GPU HBM buffer
+     * @param num_blocks     Number of blocks to gather
+     * @param block_size     Size of each block in bytes (must be aligned to 16 bytes)
+     * @param max_sm_count   Maximum number of SMs to use (0 = auto)
+     * @param mode           Transfer mode: H2D_MODE_AUTO, H2D_MODE_SM, or H2D_MODE_TMA
+     * @return 0 on success, negative error code on failure
+     */
+    int tmaGather(uintptr_t dram_dev_ptr,
+                  const long *indices,
+                  void *gpu_dst,
+                  int num_blocks,
+                  int block_size,
+                  int max_sm_count = 0,
+                  H2DMode mode = H2D_MODE_AUTO);
+
+    /**
+     * Scatter: Store data blocks from GPU HBM to DRAM (via mapped pointer)
+     *
+     * Supports two kernel backends selectable via `mode`:
+     *   H2D_MODE_AUTO (default) - auto-select based on block_size and hardware
+     *   H2D_MODE_SM   - int4 vectorized Zero-Copy (STG.E.128, SM-driven)
+     *   H2D_MODE_TMA  - Hopper TMA engine (cp.async.bulk, requires sm_90+)
+     *
+     * @param gpu_src        Source GPU HBM buffer
+     * @param indices        Array of block indices to scatter (on GPU)
+     * @param dram_dev_ptr   GPU-mapped DRAM device pointer (from mapDRAMtoGPU)
+     * @param num_blocks     Number of blocks to scatter
+     * @param block_size     Size of each block in bytes (must be aligned to 16 bytes)
+     * @param max_sm_count   Maximum number of SMs to use (0 = auto)
+     * @param mode           Transfer mode: H2D_MODE_AUTO, H2D_MODE_SM, or H2D_MODE_TMA
+     * @return 0 on success, negative error code on failure
+     */
+    int tmaScatter(void *gpu_src,
+                   const long *indices,
+                   uintptr_t dram_dev_ptr,
+                   int num_blocks,
+                   int block_size,
+                   int max_sm_count = 0,
+                   H2DMode mode = H2D_MODE_AUTO);
+
+    // ==================== End HBM-DRAM Mapping & TMA API ====================
 
 private:
     class Impl;

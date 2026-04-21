@@ -7,6 +7,7 @@
 #   USE_MLNX=ON ./build_wheel.sh       # enable Mellanox support
 #   USE_CUDA=ON ./build_wheel.sh       # enable CUDA support
 #   USE_MLNX=ON USE_CUDA=ON ./build_wheel.sh  # both
+#   USE_CUDA=ON USE_CUDA_KERNELS=ON ./build_wheel.sh  # build TMA H2D/D2H kernels (requires nvcc + Hopper)
 #
 # The resulting .whl file will be placed in the dist/ directory.
 # ============================================================================
@@ -19,13 +20,17 @@ cd "$SCRIPT_DIR"
 USE_MLNX="${USE_MLNX:-ON}"
 USE_BNXT="${USE_BNXT:-OFF}"
 USE_CUDA="${USE_CUDA:-ON}"
+# H2D/D2H TMA kernels are Hopper-only and require nvcc; enabled by default.
+# Set USE_CUDA_KERNELS=OFF on build hosts without nvcc.
+USE_CUDA_KERNELS="${USE_CUDA_KERNELS:-ON}"
 
 echo "============================================"
 echo " MPComm wheel builder"
 echo "============================================"
-echo " USE_MLNX = $USE_MLNX"
-echo " USE_BNXT = $USE_BNXT"
-echo " USE_CUDA = $USE_CUDA"
+echo " USE_MLNX         = $USE_MLNX"
+echo " USE_BNXT         = $USE_BNXT"
+echo " USE_CUDA         = $USE_CUDA"
+echo " USE_CUDA_KERNELS = $USE_CUDA_KERNELS"
 echo "============================================"
 
 # ---------- detect package manager ------------------------------------------
@@ -136,6 +141,7 @@ CMAKE_ARGS=""
 CMAKE_ARGS="$CMAKE_ARGS --config-setting=cmake.define.USE_MLNX=$USE_MLNX"
 CMAKE_ARGS="$CMAKE_ARGS --config-setting=cmake.define.USE_BNXT=$USE_BNXT"
 CMAKE_ARGS="$CMAKE_ARGS --config-setting=cmake.define.USE_CUDA=$USE_CUDA"
+CMAKE_ARGS="$CMAKE_ARGS --config-setting=cmake.define.USE_CUDA_KERNELS=$USE_CUDA_KERNELS"
 
 python3 -m build --wheel $CMAKE_ARGS
 

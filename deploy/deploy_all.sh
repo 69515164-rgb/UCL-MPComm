@@ -39,6 +39,7 @@ Options:
   --skip-build          Skip scatter_test build (only install mpcomm)
   --ssh-user USER       SSH username (default: root)
   --ssh-port PORT       SSH port (default: 36001)
+  --parallel N          Max concurrent SSH operations (default: 20)
   --verbose             Enable verbose output
   --dry-run             Print commands without executing
   -h, --help            Show this help
@@ -46,6 +47,7 @@ Options:
 Examples:
   $(basename "$0") --hosts hosts.txt
   $(basename "$0") --hosts hosts.txt --skip-build
+  $(basename "$0") --hosts hosts_100.txt --parallel 30
 EOF
     exit 0
 }
@@ -61,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build)     SKIP_BUILD=true; shift ;;
         --ssh-user)       SSH_USER="$2"; shift 2 ;;
         --ssh-port)       SSH_PORT="$2"; shift 2 ;;
+        --parallel)       PARALLEL_JOBS="$2"; shift 2 ;;
         --verbose)        VERBOSE=true; shift ;;
         --dry-run)        DRY_RUN=true; shift ;;
         -h|--help)        usage ;;
@@ -74,6 +77,11 @@ done
 # ---- Main ----
 parse_hosts "$HOSTS_FILE"
 
+if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_JOBS" -lt 1 ]; then
+    log_error "--parallel must be a positive integer (got: $PARALLEL_JOBS)"
+    exit 1
+fi
+
 echo ""
 echo "============================================================"
 echo "  MPComm Multi-Node Deploy"
@@ -86,6 +94,7 @@ for i in $(seq 0 $((NUM_TARGETS - 1))); do
 done
 echo "  Skip deploy:   $SKIP_DEPLOY"
 echo "  Skip build:    $SKIP_BUILD"
+echo "  Parallel:      $PARALLEL_JOBS concurrent SSH jobs"
 echo "============================================================"
 echo ""
 
@@ -118,38 +127,66 @@ if ! $SKIP_DEPLOY; then
         log_debug "  Would check mpcomm on local machine"
     fi
 
-    # Check remote (target) machines
-    for i in $(seq 0 $((NUM_TARGETS - 1))); do
-        ip="${TARGET_IPS[$i]}"
-        if $DRY_RUN; then
-            log_debug "  Would check mpcomm on $ip"
-            continue
-        fi
-        if $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null" &>/dev/null; then
-            REMOTE_VER=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
-            log_info "  [$i] $ip - mpcomm installed (version: $REMOTE_VER)"
-        else
-            log_warn "  [$i] $ip - mpcomm NOT installed"
-            DEPLOY_NEEDED_IPS+=("$ip")
-        fi
-    done
+    # Check remote (target) machines in parallel
+    if ! $DRY_RUN; then
+        _check_mpcomm_remote() {
+            local idx="$1"
+            local ip="$2"
+            local ok_marker="/tmp/mpcomm_check_ok_$$_${idx}"
+            if $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null" &>/dev/null; then
+                local ver
+                ver=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
+                echo "INSTALLED version=$ver"
+                # Mark success via a sentinel file the parent can read.
+                echo "$ver" > "$ok_marker"
+                return 0
+            else
+                echo "NOT_INSTALLED"
+                return 1
+            fi
+        }
+
+        check_failed=()
+        parallel_foreach_host _check_mpcomm_remote "check_mpcomm" check_failed
+
+        # All non-failed indices are installed; failed indices need deploy.
+        # Reconstruct by checking sentinel files.
+        for i in $(seq 0 $((NUM_TARGETS - 1))); do
+            ip="${TARGET_IPS[$i]}"
+            sentinel="/tmp/mpcomm_check_ok_$$_${i}"
+            if [ -f "$sentinel" ]; then
+                ver=$(cat "$sentinel")
+                log_info "  [$i] $ip - mpcomm installed (version: $ver)"
+                rm -f "$sentinel"
+            else
+                log_warn "  [$i] $ip - mpcomm NOT installed"
+                DEPLOY_NEEDED_IPS+=("$ip")
+            fi
+        done
+    else
+        for i in $(seq 0 $((NUM_TARGETS - 1))); do
+            log_debug "  Would check mpcomm on ${TARGET_IPS[$i]}"
+        done
+    fi
 
     if [ ${#DEPLOY_NEEDED_IPS[@]} -gt 0 ]; then
-        log_step "Auto-deploying mpcomm on ${#DEPLOY_NEEDED_IPS[@]} machine(s)..."
+        log_step "Auto-deploying mpcomm on ${#DEPLOY_NEEDED_IPS[@]} machine(s) in parallel..."
         DEPLOY_FAIL=false
+
+        # ---- Deploy on local machine (if needed) synchronously first ----
         for ip in "${DEPLOY_NEEDED_IPS[@]}"; do
             if [ "$ip" = "LOCAL" ]; then
                 log_info "  Deploying mpcomm on local machine ($INITIATOR_IP) (this may take a few minutes)..."
                 if $DRY_RUN; then
                     log_debug "  Would run: wget -qO- '${DEPLOY_URL}' | bash"
-                    continue
+                    break
                 fi
                 DEPLOY_OUTPUT=$(wget -qO- "${DEPLOY_URL}" | bash 2>&1) || {
                     log_error "  local ($INITIATOR_IP) - deployment FAILED"
                     log_error "  Output (last 20 lines):"
                     echo "$DEPLOY_OUTPUT" | tail -20
                     DEPLOY_FAIL=true
-                    continue
+                    break
                 }
                 if python3 -c 'import mpcomm' 2>/dev/null; then
                     LOCAL_VER=$(python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null || echo "unknown")
@@ -158,28 +195,52 @@ if ! $SKIP_DEPLOY; then
                     log_error "  local ($INITIATOR_IP) - deployment completed but mpcomm import still fails"
                     DEPLOY_FAIL=true
                 fi
-            else
-                log_info "  Deploying mpcomm on $ip (this may take a few minutes)..."
-                if $DRY_RUN; then
-                    log_debug "  Would run: $(ssh_cmd "$ip") 'wget -qO- \"${DEPLOY_URL}\" | bash'"
-                    continue
-                fi
-                DEPLOY_OUTPUT=$($(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash" 2>&1) || {
-                    log_error "  $ip - deployment FAILED"
-                    log_error "  Output (last 20 lines):"
-                    echo "$DEPLOY_OUTPUT" | tail -20
-                    DEPLOY_FAIL=true
-                    continue
-                }
-                if $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null" &>/dev/null; then
-                    REMOTE_VER=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
-                    log_info "  $ip - mpcomm deployed successfully (version: $REMOTE_VER)"
-                else
-                    log_error "  $ip - deployment completed but mpcomm import still fails"
-                    DEPLOY_FAIL=true
-                fi
+                break
             fi
         done
+
+        # ---- Deploy on remote machines in parallel ----
+        REMOTE_DEPLOY_INDICES=()
+        for ip in "${DEPLOY_NEEDED_IPS[@]}"; do
+            [ "$ip" = "LOCAL" ] && continue
+            # Find the index of this ip in TARGET_IPS
+            for i in $(seq 0 $((NUM_TARGETS - 1))); do
+                if [ "${TARGET_IPS[$i]}" = "$ip" ]; then
+                    REMOTE_DEPLOY_INDICES+=("$i")
+                    break
+                fi
+            done
+        done
+
+        if [ ${#REMOTE_DEPLOY_INDICES[@]} -gt 0 ] && ! $DRY_RUN; then
+            log_info "  Deploying mpcomm on ${#REMOTE_DEPLOY_INDICES[@]} remote machine(s) (parallel: $PARALLEL_JOBS, may take a few minutes)..."
+            _deploy_mpcomm_remote() {
+                local idx="$1"
+                local ip="$2"
+                echo "=== Deploying mpcomm on $ip ==="
+                if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash" 2>&1; then
+                    echo "DEPLOY SCRIPT FAILED on $ip"
+                    return 1
+                fi
+                if ! $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null"; then
+                    echo "POST-DEPLOY IMPORT CHECK FAILED on $ip"
+                    return 1
+                fi
+                local ver
+                ver=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
+                echo "Deployed successfully on $ip (version: $ver)"
+                return 0
+            }
+            remote_deploy_failed=()
+            parallel_foreach_host _deploy_mpcomm_remote "deploy_mpcomm" remote_deploy_failed "${REMOTE_DEPLOY_INDICES[@]}"
+            if [ ${#remote_deploy_failed[@]} -gt 0 ]; then
+                DEPLOY_FAIL=true
+            fi
+        elif $DRY_RUN; then
+            for idx in "${REMOTE_DEPLOY_INDICES[@]}"; do
+                log_debug "  Would run: $(ssh_cmd "${TARGET_IPS[$idx]}") 'wget -qO- \"${DEPLOY_URL}\" | bash'"
+            done
+        fi
 
         if $DEPLOY_FAIL; then
             log_error "Deployment failed on some machines. Aborting."
@@ -218,23 +279,69 @@ if ! $SKIP_BUILD; then
         log_debug "  Would check/deploy binary on local machine"
     fi
 
-    # --- Check/deploy on remote (target) machines ---
-    for i in $(seq 0 $((NUM_TARGETS - 1))); do
-        ip="${TARGET_IPS[$i]}"
-        if $DRY_RUN; then
-            log_debug "  Would check/deploy binary on $ip"
-            continue
-        fi
+    # --- Check/deploy on remote (target) machines in parallel ---
+    if ! $DRY_RUN; then
+        # Phase 1: check which targets are missing the binary (parallel).
+        # A sentinel file is created by successful checkers.
+        _check_binary_remote() {
+            local idx="$1"
+            local ip="$2"
+            local sentinel="/tmp/mpcomm_bin_ok_$$_${idx}"
+            if $(ssh_cmd "$ip") "test -x '${TESTS_INSTALL_DIR}/build/scatter_test'" &>/dev/null; then
+                echo "FOUND on $ip"
+                : > "$sentinel"
+                return 0
+            fi
+            echo "NOT FOUND on $ip"
+            # Return 0 so parallel framework doesn't mark it as failure;
+            # we treat "missing" as a known state, not an error.
+            return 0
+        }
+        check_failed=()
+        parallel_foreach_host _check_binary_remote "check_binary" check_failed
 
-        if $(ssh_cmd "$ip") "test -x '${TESTS_INSTALL_DIR}/build/scatter_test'" &>/dev/null; then
-            log_info "  [$i] $ip - binary found: ${TESTS_INSTALL_DIR}/build/scatter_test"
-        else
-            log_warn "  [$i] $ip - binary not found, deploying tests..."
-            if ! remote_deploy_tests "$ip" "[$i] $ip"; then
+        BUILD_NEEDED_INDICES=()
+        for i in $(seq 0 $((NUM_TARGETS - 1))); do
+            ip="${TARGET_IPS[$i]}"
+            sentinel="/tmp/mpcomm_bin_ok_$$_${i}"
+            if [ -f "$sentinel" ]; then
+                log_info "  [$i] $ip - binary found: ${TESTS_INSTALL_DIR}/build/scatter_test"
+                rm -f "$sentinel"
+            else
+                log_warn "  [$i] $ip - binary not found, will deploy tests"
+                BUILD_NEEDED_INDICES+=("$i")
+            fi
+        done
+
+        # Phase 2: deploy tests on all machines that need it (parallel).
+        if [ ${#BUILD_NEEDED_INDICES[@]} -gt 0 ]; then
+            log_info "  Deploying tests on ${#BUILD_NEEDED_INDICES[@]} machine(s) (parallel: $PARALLEL_JOBS)..."
+            _deploy_tests_remote() {
+                local idx="$1"
+                local ip="$2"
+                echo "=== Deploying tests on $ip ==="
+                if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${TESTS_INSTALL_DIR}" 2>&1; then
+                    echo "deploy_tests.sh FAILED on $ip"
+                    return 1
+                fi
+                if ! $(ssh_cmd "$ip") "test -x '${TESTS_INSTALL_DIR}/build/scatter_test'" &>/dev/null; then
+                    echo "Binary missing after deploy on $ip"
+                    return 1
+                fi
+                echo "Binary deployed: ${TESTS_INSTALL_DIR}/build/scatter_test on $ip"
+                return 0
+            }
+            build_failed=()
+            parallel_foreach_host _deploy_tests_remote "deploy_tests" build_failed "${BUILD_NEEDED_INDICES[@]}"
+            if [ ${#build_failed[@]} -gt 0 ]; then
                 ALL_BINARY_OK=false
             fi
         fi
-    done
+    else
+        for i in $(seq 0 $((NUM_TARGETS - 1))); do
+            log_debug "  Would check/deploy binary on ${TARGET_IPS[$i]}"
+        done
+    fi
 
     if ! $ALL_BINARY_OK && ! $DRY_RUN; then
         log_error "Binary missing/build failed on some machines. Aborting."
@@ -251,3 +358,8 @@ echo "============================================================"
 log_info "Deployment complete! All machines are ready."
 log_info "Run multi_node_test.sh to start testing."
 echo "============================================================"
+
+# Clean up parallel log dir (unless --verbose was given)
+if [ -d "${PARALLEL_LOG_DIR:-}" ] && ! $VERBOSE; then
+    rm -rf "$PARALLEL_LOG_DIR" 2>/dev/null || true
+fi

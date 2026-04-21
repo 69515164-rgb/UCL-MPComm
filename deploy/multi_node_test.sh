@@ -113,6 +113,7 @@ Options:
   --tests-dir DIR        Test files install directory (default: /opt/mpcomm_tests)
   --skip-deploy         Skip auto-deployment, fail if mpcomm not installed
 --startup-wait SECS   Timeout for targets to become ready (default: 30)
+  --parallel N          Max concurrent SSH operations (default: 20)
   --verbose             Enable verbose output
   --dry-run             Print commands without executing
   -h, --help            Show this help
@@ -159,6 +160,7 @@ while [[ $# -gt 0 ]]; do
         --tests-dir)      TESTS_INSTALL_DIR="$2"; shift 2 ;;
         --skip-deploy)    SKIP_DEPLOY=true; shift ;;
         --startup-wait)   STARTUP_WAIT="$2"; shift 2 ;;
+        --parallel)       PARALLEL_JOBS="$2"; shift 2 ;;
         --verbose)        VERBOSE=true; shift ;;
         --dry-run)        DRY_RUN=true; shift ;;
         -h|--help)        usage ;;
@@ -171,6 +173,11 @@ done
 
 # ---- Main ----
 parse_hosts "$HOSTS_FILE"
+
+if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_JOBS" -lt 1 ]; then
+    log_error "--parallel must be a positive integer (got: $PARALLEL_JOBS)"
+    exit 1
+fi
 
 # ---- Cleanup Function ----
 REMOTE_PIDS=()
@@ -186,19 +193,33 @@ cleanup() {
     echo ""
     log_step "Cleaning up remote target processes..."
 
+    # Kill tracked PIDs in parallel
     if [ ${#REMOTE_PIDS[@]} -gt 0 ]; then
+        local pids=()
         for entry in "${REMOTE_PIDS[@]}"; do
-            local ip="${entry%%:*}"
-            local pid="${entry#*:}"
-            log_info "  Killing PID $pid on $ip"
-            $(ssh_cmd "$ip") "kill $pid 2>/dev/null; kill -9 $pid 2>/dev/null" 2>/dev/null || true
+            [ -z "$entry" ] && continue
+            local cip="${entry%%:*}"
+            local cpid="${entry#*:}"
+            log_info "  Killing PID $cpid on $cip"
+            ( $(ssh_cmd "$cip") "kill $cpid 2>/dev/null; kill -9 $cpid 2>/dev/null" 2>/dev/null || true ) &
+            pids+=($!)
         done
+        for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
     fi
 
+    # Broad pkill in parallel
     if $SSH_VERIFIED; then
-        for ip in "${TARGET_IPS[@]}"; do
-            $(ssh_cmd "$ip") "pkill -f 'scatter_test --mode target' 2>/dev/null" 2>/dev/null || true
+        local pids=()
+        for cip in "${TARGET_IPS[@]}"; do
+            ( $(ssh_cmd "$cip") "pkill -f 'scatter_test --mode target' 2>/dev/null" 2>/dev/null || true ) &
+            pids+=($!)
         done
+        for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+    fi
+
+    # Clean up parallel log dir if we created one and the user didn't ask for verbose
+    if [ -d "${PARALLEL_LOG_DIR:-}" ] && ! $VERBOSE; then
+        rm -rf "$PARALLEL_LOG_DIR" 2>/dev/null || true
     fi
 
     log_info "Cleanup done."
@@ -226,6 +247,7 @@ echo "  Buffer size:   ${BUFFER_SIZE} (target)"
 [ -n "$GPU_DEVICE" ] && echo "  GPU device:    ${GPU_DEVICE}"
 [ -n "$RUN_BOTH" ]   && echo "  DRAM + HBM:    yes"
 echo "  PXN:           ${MPCOMM_PXN_ENABLE}"
+echo "  Parallel:      $PARALLEL_JOBS concurrent SSH jobs"
 echo "============================================================"
 echo ""
 
@@ -256,21 +278,42 @@ else
     log_debug "  Would check mpcomm on local machine"
 fi
 
-# Check remote (target) machines
-for i in $(seq 0 $((NUM_TARGETS - 1))); do
-    ip="${TARGET_IPS[$i]}"
-    if $DRY_RUN; then
-        log_debug "  Would check mpcomm on $ip"
-        continue
-    fi
-    if $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null" &>/dev/null; then
-        REMOTE_VER=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
-        log_info "  [$i] $ip - mpcomm installed (version: $REMOTE_VER)"
-    else
-        log_warn "  [$i] $ip - mpcomm NOT installed"
-        DEPLOY_NEEDED_IPS+=("$ip")
-    fi
-done
+# Check remote (target) machines in parallel
+if ! $DRY_RUN; then
+    _mt_check_mpcomm() {
+        local idx="$1"
+        local ip="$2"
+        local sentinel="/tmp/mt_mpcomm_ok_$$_${idx}"
+        if $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null" &>/dev/null; then
+            local ver
+            ver=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
+            echo "$ver" > "$sentinel"
+            echo "INSTALLED version=$ver on $ip"
+            return 0
+        fi
+        echo "NOT_INSTALLED on $ip"
+        return 0
+    }
+    CHECK_FAILED=()
+    parallel_foreach_host _mt_check_mpcomm "check_mpcomm" CHECK_FAILED
+
+    for i in $(seq 0 $((NUM_TARGETS - 1))); do
+        ip="${TARGET_IPS[$i]}"
+        sentinel="/tmp/mt_mpcomm_ok_$$_${i}"
+        if [ -f "$sentinel" ]; then
+            REMOTE_VER=$(cat "$sentinel")
+            log_info "  [$i] $ip - mpcomm installed (version: $REMOTE_VER)"
+            rm -f "$sentinel"
+        else
+            log_warn "  [$i] $ip - mpcomm NOT installed"
+            DEPLOY_NEEDED_IPS+=("$ip")
+        fi
+    done
+else
+    for i in $(seq 0 $((NUM_TARGETS - 1))); do
+        log_debug "  Would check mpcomm on ${TARGET_IPS[$i]}"
+    done
+fi
 
 if [ ${#DEPLOY_NEEDED_IPS[@]} -gt 0 ]; then
     if $SKIP_DEPLOY; then
@@ -279,21 +322,23 @@ log_error "Run deploy_all.sh first, or remove --skip-deploy to auto-deploy."
         exit 1
     fi
 
-    log_step "Auto-deploying mpcomm on ${#DEPLOY_NEEDED_IPS[@]} machine(s)..."
+    log_step "Auto-deploying mpcomm on ${#DEPLOY_NEEDED_IPS[@]} machine(s) in parallel..."
     DEPLOY_FAIL=false
+
+    # Deploy on local machine synchronously (if needed)
     for ip in "${DEPLOY_NEEDED_IPS[@]}"; do
         if [ "$ip" = "LOCAL" ]; then
             log_info "  Deploying mpcomm on local machine ($INITIATOR_IP) (this may take a few minutes)..."
             if $DRY_RUN; then
                 log_debug "  Would run: wget -qO- '${DEPLOY_URL}' | bash"
-                continue
+                break
             fi
             DEPLOY_OUTPUT=$(wget -qO- "${DEPLOY_URL}" | bash 2>&1) || {
                 log_error "  local ($INITIATOR_IP) - deployment FAILED"
                 log_error "  Output (last 20 lines):"
                 echo "$DEPLOY_OUTPUT" | tail -20
                 DEPLOY_FAIL=true
-                continue
+                break
             }
             if python3 -c 'import mpcomm' 2>/dev/null; then
                 LOCAL_VER=$(python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null || echo "unknown")
@@ -302,28 +347,51 @@ log_error "Run deploy_all.sh first, or remove --skip-deploy to auto-deploy."
                 log_error "  local ($INITIATOR_IP) - deployment completed but mpcomm import still fails"
                 DEPLOY_FAIL=true
             fi
-        else
-            log_info "  Deploying mpcomm on $ip (this may take a few minutes)..."
-            if $DRY_RUN; then
-                log_debug "  Would run: $(ssh_cmd "$ip") 'wget -qO- \"${DEPLOY_URL}\" | bash'"
-                continue
-            fi
-            DEPLOY_OUTPUT=$($(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash" 2>&1) || {
-                log_error "  $ip - deployment FAILED"
-                log_error "  Output (last 20 lines):"
-                echo "$DEPLOY_OUTPUT" | tail -20
-                DEPLOY_FAIL=true
-                continue
-            }
-            if $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null" &>/dev/null; then
-                REMOTE_VER=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
-                log_info "  $ip - mpcomm deployed successfully (version: $REMOTE_VER)"
-            else
-                log_error "  $ip - deployment completed but mpcomm import still fails"
-                DEPLOY_FAIL=true
-            fi
+            break
         fi
     done
+
+    # Deploy on remote targets in parallel
+    REMOTE_DEPLOY_INDICES=()
+    for ip in "${DEPLOY_NEEDED_IPS[@]}"; do
+        [ "$ip" = "LOCAL" ] && continue
+        for i in $(seq 0 $((NUM_TARGETS - 1))); do
+            if [ "${TARGET_IPS[$i]}" = "$ip" ]; then
+                REMOTE_DEPLOY_INDICES+=("$i")
+                break
+            fi
+        done
+    done
+
+    if [ ${#REMOTE_DEPLOY_INDICES[@]} -gt 0 ] && ! $DRY_RUN; then
+        log_info "  Deploying mpcomm on ${#REMOTE_DEPLOY_INDICES[@]} remote machine(s) (parallel: $PARALLEL_JOBS)..."
+        _mt_deploy_mpcomm() {
+            local idx="$1"
+            local ip="$2"
+            echo "=== Deploying mpcomm on $ip ==="
+            if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_URL}' | bash" 2>&1; then
+                echo "DEPLOY SCRIPT FAILED on $ip"
+                return 1
+            fi
+            if ! $(ssh_cmd "$ip") "python3 -c 'import mpcomm' 2>/dev/null"; then
+                echo "POST-DEPLOY IMPORT CHECK FAILED on $ip"
+                return 1
+            fi
+            local ver
+            ver=$($(ssh_cmd "$ip") "python3 -c 'import mpcomm; print(mpcomm.__version__)' 2>/dev/null" || echo "unknown")
+            echo "Deployed successfully on $ip (version: $ver)"
+            return 0
+        }
+        REMOTE_DEPLOY_FAILED=()
+        parallel_foreach_host _mt_deploy_mpcomm "deploy_mpcomm" REMOTE_DEPLOY_FAILED "${REMOTE_DEPLOY_INDICES[@]}"
+        if [ ${#REMOTE_DEPLOY_FAILED[@]} -gt 0 ]; then
+            DEPLOY_FAIL=true
+        fi
+    elif $DRY_RUN; then
+        for idx in "${REMOTE_DEPLOY_INDICES[@]}"; do
+            log_debug "  Would run: $(ssh_cmd "${TARGET_IPS[$idx]}") 'wget -qO- \"${DEPLOY_URL}\" | bash'"
+        done
+    fi
 
     if $DEPLOY_FAIL; then
         log_error "Deployment failed on some machines. Aborting."
@@ -336,40 +404,102 @@ fi
 echo ""
 
 # ---- Step 3: Locate scatter_test binary on all targets ----
-log_step "Step 3: Locating scatter_test binary on all targets..."
+log_step "Step 3: Locating scatter_test binary on all targets (parallel: $PARALLEL_JOBS)..."
 
 declare -a REMOTE_BINARY_PATHS=()
 declare -a REMOTE_WORK_DIRS=()
 
 ALL_BINARY_OK=true
-for i in $(seq 0 $((NUM_TARGETS - 1))); do
-    ip="${TARGET_IPS[$i]}"
-    if $DRY_RUN; then
-        log_debug "  Would resolve binary path on $ip"
-        REMOTE_BINARY_PATHS+=("${TESTS_INSTALL_DIR}/build/scatter_test")
-        REMOTE_WORK_DIRS+=("${TESTS_INSTALL_DIR}")
-        continue
-    fi
 
-    if $(ssh_cmd "$ip") "test -x '${TESTS_INSTALL_DIR}/build/scatter_test'" &>/dev/null; then
+if $DRY_RUN; then
+    for i in $(seq 0 $((NUM_TARGETS - 1))); do
+        log_debug "  Would resolve binary path on ${TARGET_IPS[$i]}"
         REMOTE_BINARY_PATHS+=("${TESTS_INSTALL_DIR}/build/scatter_test")
         REMOTE_WORK_DIRS+=("${TESTS_INSTALL_DIR}")
-        log_info "  [$i] $ip - binary found: ${TESTS_INSTALL_DIR}/build/scatter_test"
-    elif [ -n "${REMOTE_WORK_DIR:-}" ] && $(ssh_cmd "$ip") "test -x '${REMOTE_WORK_DIR}/${BINARY_PATH}'" &>/dev/null; then
-        REMOTE_BINARY_PATHS+=("${REMOTE_WORK_DIR}/${BINARY_PATH}")
-        REMOTE_WORK_DIRS+=("$REMOTE_WORK_DIR")
-        log_info "  [$i] $ip - binary found (fallback): ${REMOTE_WORK_DIR}/${BINARY_PATH}"
-    else
-        # Binary not found — attempt remote deploy
-        log_warn "  [$i] $ip - binary not found, deploying tests..."
-        if remote_deploy_tests "$ip" "[$i] $ip"; then
-            REMOTE_BINARY_PATHS+=("$BUILT_BINARY_PATH")
-            REMOTE_WORK_DIRS+=("$BUILT_TESTS_DIR")
-        else
-            ALL_BINARY_OK=false
+    done
+else
+    # Phase 1: locate binary on each target in parallel.
+    # Each worker writes "<binary_path>|<work_dir>" into a sentinel file on
+    # success (binary present), or creates a "missing" marker otherwise.
+    _mt_locate_binary() {
+        local idx="$1"
+        local ip="$2"
+        local sentinel="/tmp/mt_bin_loc_$$_${idx}"
+
+        if $(ssh_cmd "$ip") "test -x '${TESTS_INSTALL_DIR}/build/scatter_test'" &>/dev/null; then
+            echo "${TESTS_INSTALL_DIR}/build/scatter_test|${TESTS_INSTALL_DIR}" > "$sentinel"
+            echo "FOUND on $ip: ${TESTS_INSTALL_DIR}/build/scatter_test"
+            return 0
         fi
+        if [ -n "${REMOTE_WORK_DIR:-}" ] && \
+           $(ssh_cmd "$ip") "test -x '${REMOTE_WORK_DIR}/${BINARY_PATH}'" &>/dev/null; then
+            echo "${REMOTE_WORK_DIR}/${BINARY_PATH}|${REMOTE_WORK_DIR}" > "$sentinel"
+            echo "FOUND (fallback) on $ip: ${REMOTE_WORK_DIR}/${BINARY_PATH}"
+            return 0
+        fi
+        echo "NOT FOUND on $ip"
+        # Not a failure; we will deploy in phase 2.
+        return 0
+    }
+    LOCATE_FAILED=()
+    parallel_foreach_host _mt_locate_binary "locate_binary" LOCATE_FAILED
+
+    # Collect phase-1 results; figure out which indices need deploy
+    BIN_DEPLOY_INDICES=()
+    for i in $(seq 0 $((NUM_TARGETS - 1))); do
+        ip="${TARGET_IPS[$i]}"
+        sentinel="/tmp/mt_bin_loc_$$_${i}"
+        if [ -f "$sentinel" ]; then
+            IFS='|' read -r _bin _wd < "$sentinel"
+            REMOTE_BINARY_PATHS+=("$_bin")
+            REMOTE_WORK_DIRS+=("$_wd")
+            log_info "  [$i] $ip - binary found: $_bin"
+            rm -f "$sentinel"
+        else
+            log_warn "  [$i] $ip - binary not found, will deploy tests"
+            # Placeholder; will fill in after phase-2 deploy
+            REMOTE_BINARY_PATHS+=("")
+            REMOTE_WORK_DIRS+=("")
+            BIN_DEPLOY_INDICES+=("$i")
+        fi
+    done
+
+    # Phase 2: deploy tests on targets that need it, in parallel.
+    if [ ${#BIN_DEPLOY_INDICES[@]} -gt 0 ]; then
+        log_info "  Deploying tests on ${#BIN_DEPLOY_INDICES[@]} machine(s) (parallel: $PARALLEL_JOBS)..."
+        _mt_deploy_tests() {
+            local idx="$1"
+            local ip="$2"
+            local sentinel="/tmp/mt_bin_deploy_$$_${idx}"
+            echo "=== Deploying tests on $ip ==="
+            if ! $(ssh_cmd "$ip") "wget -qO- '${DEPLOY_TESTS_URL}' | bash -s -- --install-dir=${TESTS_INSTALL_DIR}" 2>&1; then
+                echo "deploy_tests.sh FAILED on $ip"
+                return 1
+            fi
+            if ! $(ssh_cmd "$ip") "test -x '${TESTS_INSTALL_DIR}/build/scatter_test'" &>/dev/null; then
+                echo "Binary missing after deploy on $ip"
+                return 1
+            fi
+            echo "${TESTS_INSTALL_DIR}/build/scatter_test|${TESTS_INSTALL_DIR}" > "$sentinel"
+            echo "Deployed successfully on $ip"
+            return 0
+        }
+        BIN_DEPLOY_FAILED=()
+        parallel_foreach_host _mt_deploy_tests "deploy_tests" BIN_DEPLOY_FAILED "${BIN_DEPLOY_INDICES[@]}"
+
+        for idx in "${BIN_DEPLOY_INDICES[@]}"; do
+            sentinel="/tmp/mt_bin_deploy_$$_${idx}"
+            if [ -f "$sentinel" ]; then
+                IFS='|' read -r _bin _wd < "$sentinel"
+                REMOTE_BINARY_PATHS[$idx]="$_bin"
+                REMOTE_WORK_DIRS[$idx]="$_wd"
+                rm -f "$sentinel"
+            else
+                ALL_BINARY_OK=false
+            fi
+        done
     fi
-done
+fi
 
 if ! $ALL_BINARY_OK && ! $DRY_RUN; then
     log_error "Binary missing/build failed on some targets. Aborting."
@@ -379,92 +509,121 @@ log_info "Binary verified on all targets."
 echo ""
 
 # ---- Step 4: Kill Any Existing Target Processes ----
-log_step "Step 4: Cleaning up any existing target processes..."
+log_step "Step 4: Cleaning up any existing target processes (parallel: $PARALLEL_JOBS)..."
 
-for ip in "${TARGET_IPS[@]}"; do
-    if $DRY_RUN; then
+if $DRY_RUN; then
+    for ip in "${TARGET_IPS[@]}"; do
         log_debug "  Would kill existing scatter_test on $ip"
-        continue
-    fi
-    $(ssh_cmd "$ip") "pkill -f 'scatter_test --mode target' 2>/dev/null" || true
-done
+    done
+else
+    _mt_pkill_existing() {
+        local idx="$1"
+        local ip="$2"
+        $(ssh_cmd "$ip") "pkill -f 'scatter_test --mode target' 2>/dev/null" || true
+        return 0
+    }
+    PKILL_FAILED=()
+    parallel_foreach_host _mt_pkill_existing "pkill_existing" PKILL_FAILED
+fi
 sleep 1
 log_info "Existing processes cleaned."
 echo ""
 
 # ---- Step 5: Start Target Processes on All Remote Machines ----
-log_step "Step 5: Starting target processes on ${NUM_TARGETS} remote machines..."
+log_step "Step 5: Starting target processes on ${NUM_TARGETS} remote machines (parallel: $PARALLEL_JOBS)..."
 
 ENV_EXPORTS=$(build_env_exports)
 
+# Pre-compute per-target arguments and print the launch plan.
+declare -a TARGET_NUMAS_EFFECTIVE=()
 for i in $(seq 0 $((NUM_TARGETS - 1))); do
     ip="${TARGET_IPS[$i]}"
     port="${TARGET_PORTS[$i]}"
     numas="${TARGET_NUMA_LIST[$i]}"
-
     if [ -n "$TARGET_NUMAS" ]; then
         numas="$TARGET_NUMAS"
     fi
+    TARGET_NUMAS_EFFECTIVE+=("$numas")
+    log_info "  [$i] Will start target on $ip:$port (NUMA: $numas)"
+done
 
-    REMOTE_BIN="${REMOTE_BINARY_PATHS[$i]:-${BINARY_PATH}}"
-    REMOTE_DIR="${REMOTE_WORK_DIRS[$i]:-${REMOTE_WORK_DIR:-$SCRIPT_DIR}}"
+# Initialize REMOTE_PIDS to the correct length so parallel workers can write
+# back via sentinel files without races on array growth.
+REMOTE_PIDS=()
+for i in $(seq 0 $((NUM_TARGETS - 1))); do
+    REMOTE_PIDS+=("")
+done
 
-    # Build the target command line
-    TARGET_CMD="${ENV_EXPORTS} cd '${REMOTE_DIR}' && "
-    TARGET_CMD+="${REMOTE_BIN} "
-    TARGET_CMD+="--mode target "
-    TARGET_CMD+="--host-id ${ip}:${port} "
-    TARGET_CMD+="--tcp-port ${port} "
-    TARGET_CMD+="--buffer-size ${BUFFER_SIZE} "
-    TARGET_CMD+="--num-numas ${numas}"
+if ! $DRY_RUN; then
+    _mt_start_target() {
+        local idx="$1"
+        local ip="$2"
+        local port="${TARGET_PORTS[$idx]}"
+        local numas="${TARGET_NUMAS_EFFECTIVE[$idx]}"
+        local remote_bin="${REMOTE_BINARY_PATHS[$idx]:-${BINARY_PATH}}"
+        local remote_dir="${REMOTE_WORK_DIRS[$idx]:-${REMOTE_WORK_DIR:-$SCRIPT_DIR}}"
+        local pid_file="/tmp/mpcomm_target_${port}.pid"
+        local log_file="/tmp/mpcomm_target_${port}.log"
+        local launcher="/tmp/mpcomm_launch_${port}.sh"
+        local pid_sentinel="/tmp/mt_start_pid_$$_${idx}"
 
-    log_info "  [$i] Starting target on $ip:$port (NUMA: $numas)"
-    log_debug "  CMD: $TARGET_CMD"
-
-    if $DRY_RUN; then
-        continue
-    fi
-
-    # Start the target process fully detached from the SSH session.
-    # We write a launcher script to the remote machine first (avoids shell quoting issues),
-    # then execute it with setsid so it's fully detached from the SSH session.
-    PID_FILE="/tmp/mpcomm_target_${port}.pid"
-    LOG_FILE="/tmp/mpcomm_target_${port}.log"
-    LAUNCHER="/tmp/mpcomm_launch_${port}.sh"
-
-    # Step A: Write the launcher script on the remote machine
-    $(ssh_cmd "$ip") bash -s <<LAUNCH_HEREDOC
-cat > ${LAUNCHER} << 'INNER_EOF'
+        # Step A: Write the launcher script on the remote machine
+        $(ssh_cmd "$ip") bash -s <<LAUNCH_HEREDOC
+cat > ${launcher} << 'INNER_EOF'
 #!/bin/bash
 ${ENV_EXPORTS}
-cd '${REMOTE_DIR}'
-stdbuf -oL ${REMOTE_BIN} --mode target --host-id ${ip}:${port} --tcp-port ${port} --buffer-size ${BUFFER_SIZE} --num-numas ${numas} > ${LOG_FILE} 2>&1 &
-echo \$! > ${PID_FILE}
+cd '${remote_dir}'
+stdbuf -oL ${remote_bin} --mode target --host-id ${ip}:${port} --tcp-port ${port} --buffer-size ${BUFFER_SIZE} --num-numas ${numas} > ${log_file} 2>&1 &
+echo \$! > ${pid_file}
 INNER_EOF
-chmod +x ${LAUNCHER}
+chmod +x ${launcher}
 LAUNCH_HEREDOC
 
-    # Step B: Execute the launcher script in a fully detached session
-    $(ssh_cmd "$ip") "setsid ${LAUNCHER} </dev/null >/dev/null 2>&1 &"
-    sleep 1
+        # Step B: Execute the launcher script in a fully detached session
+        $(ssh_cmd "$ip") "setsid ${launcher} </dev/null >/dev/null 2>&1 &"
+        sleep 1
 
-    # Step C: Read back the PID
-    REMOTE_PID=$($(ssh_cmd "$ip") "cat ${PID_FILE} 2>/dev/null" || echo "")
-    REMOTE_PID=$(echo "$REMOTE_PID" | tail -1 | tr -d '[:space:]')
+        # Step C: Read back the PID
+        local remote_pid
+        remote_pid=$($(ssh_cmd "$ip") "cat ${pid_file} 2>/dev/null" || echo "")
+        remote_pid=$(echo "$remote_pid" | tail -1 | tr -d '[:space:]')
 
-    if [ -n "$REMOTE_PID" ] && [ "$REMOTE_PID" -gt 0 ] 2>/dev/null; then
-        REMOTE_PIDS+=("${ip}:${REMOTE_PID}")
-        log_info "  [$i] $ip - started (PID: $REMOTE_PID)"
-    else
-        log_error "  [$i] $ip - failed to start target"
+        if [ -n "$remote_pid" ] && [ "$remote_pid" -gt 0 ] 2>/dev/null; then
+            echo "$remote_pid" > "$pid_sentinel"
+            echo "[$idx] $ip - started (PID: $remote_pid)"
+            return 0
+        fi
+        echo "[$idx] $ip - failed to start target"
+        return 1
+    }
+    START_FAILED=()
+    parallel_foreach_host _mt_start_target "start_target" START_FAILED
+
+    # Collect PIDs
+    START_FAIL=false
+    for i in $(seq 0 $((NUM_TARGETS - 1))); do
+        ip="${TARGET_IPS[$i]}"
+        port="${TARGET_PORTS[$i]}"
+        sentinel="/tmp/mt_start_pid_$$_${i}"
+        if [ -f "$sentinel" ]; then
+            pid=$(cat "$sentinel")
+            REMOTE_PIDS[$i]="${ip}:${pid}"
+            rm -f "$sentinel"
+            log_info "  [$i] $ip:$port - started (PID: $pid)"
+        else
+            log_error "  [$i] $ip:$port - failed to start target"
+            START_FAIL=true
+        fi
+    done
+    if $START_FAIL; then
         exit 1
     fi
-done
+fi
 
 echo ""
 
 # ---- Step 6: Wait for All Targets to Be Ready ----
-log_step "Step 6: Waiting for all targets to be ready..."
+log_step "Step 6: Waiting for all targets to be ready (hybrid: parallel check + sequential tail)..."
 
 READY_MARKER="Waiting for connections..."
 READY_TIMEOUT=${STARTUP_WAIT:-30}
@@ -474,51 +633,137 @@ if [ "$READY_TIMEOUT" -lt 10 ]; then
 fi
 
 ALL_READY=true
-for i in $(seq 0 $((NUM_TARGETS - 1))); do
-    ip="${TARGET_IPS[$i]}"
-    port="${TARGET_PORTS[$i]}"
-    entry="${REMOTE_PIDS[$i]}"
-    pid="${entry#*:}"
-    LOG_FILE="/tmp/mpcomm_target_${port}.log"
 
-    if $DRY_RUN; then
-        continue
-    fi
-
-    log_info "  [$i] Waiting for $ip:$port to be ready (timeout: ${READY_TIMEOUT}s)..."
-
-    ELAPSED=0
-    TARGET_READY=false
-    while [ "$ELAPSED" -lt "$READY_TIMEOUT" ]; do
-        # First check if the process is still alive
-        if ! $(ssh_cmd "$ip") "kill -0 $pid 2>/dev/null"; then
-            log_error "  [$i] $ip (PID $pid) - process died during startup!"
-            log_error "  Log tail:"
-            $(ssh_cmd "$ip") "tail -20 ${LOG_FILE} 2>/dev/null" || true
-            ALL_READY=false
-            break
-        fi
-
-        # Check if the ready marker appears in the log
-        if $(ssh_cmd "$ip") "grep -q '${READY_MARKER}' ${LOG_FILE} 2>/dev/null"; then
-            TARGET_READY=true
-            break
-        fi
-
-        sleep 1
-        ELAPSED=$((ELAPSED + 1))
+if ! $DRY_RUN; then
+    # ---- Phase A: quick parallel checks ----
+    # Run up to PHASE_A_ROUNDS fast parallel sweeps (1 second between rounds).
+    # Most targets become ready within 1-3 seconds, so this avoids the quadratic
+    # blow-up of opening a fresh SSH connection every second per host.
+    PHASE_A_ROUNDS=3
+    declare -A PHASE_A_READY=()
+    declare -A PHASE_A_DEAD=()
+    PHASE_A_PENDING=()
+    for i in $(seq 0 $((NUM_TARGETS - 1))); do
+        PHASE_A_PENDING+=("$i")
     done
 
-    if $TARGET_READY; then
-        log_info "  [$i] $ip:$port - ready (took ${ELAPSED}s)"
-    elif $ALL_READY; then
-        # Only print timeout error if we haven't already printed a "process died" error
-        log_error "  [$i] $ip:$port - NOT ready after ${READY_TIMEOUT}s!"
-        log_error "  Log tail:"
-        $(ssh_cmd "$ip") "tail -20 ${LOG_FILE} 2>/dev/null" || true
-        ALL_READY=false
+    _mt_check_ready() {
+        local idx="$1"
+        local ip="$2"
+        local port="${TARGET_PORTS[$idx]}"
+        local entry="${REMOTE_PIDS[$idx]}"
+        local pid="${entry#*:}"
+        local log_file="/tmp/mpcomm_target_${port}.log"
+        local ready_sentinel="/tmp/mt_ready_$$_${idx}"
+        local dead_sentinel="/tmp/mt_dead_$$_${idx}"
+
+        # Check process liveness + ready marker in a single ssh round trip.
+        local status
+        status=$($(ssh_cmd "$ip") "
+            if ! kill -0 $pid 2>/dev/null; then
+                echo DEAD
+                tail -20 ${log_file} 2>/dev/null
+                exit 0
+            fi
+            if grep -q '${READY_MARKER}' ${log_file} 2>/dev/null; then
+                echo READY
+                exit 0
+            fi
+            echo PENDING
+        " 2>&1)
+
+        local first_line
+        first_line=$(echo "$status" | head -1)
+        case "$first_line" in
+            READY)
+                : > "$ready_sentinel"
+                echo "[$idx] $ip:$port - ready"
+                return 0
+                ;;
+            DEAD)
+                echo "$status" > "$dead_sentinel"
+                echo "[$idx] $ip:$port - PROCESS DIED"
+                return 0  # handled by caller
+                ;;
+            *)
+                echo "[$idx] $ip:$port - still pending"
+                return 0
+                ;;
+        esac
+    }
+
+    for round in $(seq 1 "$PHASE_A_ROUNDS"); do
+        [ ${#PHASE_A_PENDING[@]} -eq 0 ] && break
+        log_info "  Phase A round $round: checking ${#PHASE_A_PENDING[@]} target(s) in parallel..."
+        local_failed=()
+        parallel_foreach_host _mt_check_ready "ready_check_r${round}" local_failed "${PHASE_A_PENDING[@]}"
+
+        # Collect results
+        NEW_PENDING=()
+        for idx in "${PHASE_A_PENDING[@]}"; do
+            ready_sentinel="/tmp/mt_ready_$$_${idx}"
+            dead_sentinel="/tmp/mt_dead_$$_${idx}"
+            if [ -f "$ready_sentinel" ]; then
+                PHASE_A_READY[$idx]=1
+                rm -f "$ready_sentinel"
+                log_info "    [$idx] ${TARGET_IPS[$idx]}:${TARGET_PORTS[$idx]} - ready"
+            elif [ -f "$dead_sentinel" ]; then
+                PHASE_A_DEAD[$idx]=1
+                log_error "    [$idx] ${TARGET_IPS[$idx]} - process died!"
+                log_error "    Log tail:"
+                sed 's/^/      /' "$dead_sentinel" >&2
+                rm -f "$dead_sentinel"
+                ALL_READY=false
+            else
+                NEW_PENDING+=("$idx")
+            fi
+        done
+        PHASE_A_PENDING=("${NEW_PENDING[@]}")
+        [ ${#PHASE_A_PENDING[@]} -gt 0 ] && sleep 1
+    done
+
+    # ---- Phase B: sequential tail for the few stragglers ----
+    if [ ${#PHASE_A_PENDING[@]} -gt 0 ] && $ALL_READY; then
+        log_info "  Phase B: ${#PHASE_A_PENDING[@]} slow target(s) still pending, polling individually..."
+        for idx in "${PHASE_A_PENDING[@]}"; do
+            ip="${TARGET_IPS[$idx]}"
+            port="${TARGET_PORTS[$idx]}"
+            entry="${REMOTE_PIDS[$idx]}"
+            pid="${entry#*:}"
+            LOG_FILE="/tmp/mpcomm_target_${port}.log"
+
+            log_info "  [$idx] Waiting for $ip:$port to be ready (remaining timeout: $((READY_TIMEOUT - PHASE_A_ROUNDS))s)..."
+            ELAPSED=0
+            MAX_ELAPSED=$((READY_TIMEOUT - PHASE_A_ROUNDS))
+            [ "$MAX_ELAPSED" -lt 5 ] && MAX_ELAPSED=5
+            TARGET_READY=false
+            while [ "$ELAPSED" -lt "$MAX_ELAPSED" ]; do
+                if ! $(ssh_cmd "$ip") "kill -0 $pid 2>/dev/null"; then
+                    log_error "  [$idx] $ip (PID $pid) - process died during startup!"
+                    log_error "  Log tail:"
+                    $(ssh_cmd "$ip") "tail -20 ${LOG_FILE} 2>/dev/null" || true
+                    ALL_READY=false
+                    break
+                fi
+                if $(ssh_cmd "$ip") "grep -q '${READY_MARKER}' ${LOG_FILE} 2>/dev/null"; then
+                    TARGET_READY=true
+                    break
+                fi
+                sleep 1
+                ELAPSED=$((ELAPSED + 1))
+            done
+
+            if $TARGET_READY; then
+                log_info "  [$idx] $ip:$port - ready (took $((PHASE_A_ROUNDS + ELAPSED))s total)"
+            elif $ALL_READY; then
+                log_error "  [$idx] $ip:$port - NOT ready after ${READY_TIMEOUT}s!"
+                log_error "  Log tail:"
+                $(ssh_cmd "$ip") "tail -20 ${LOG_FILE} 2>/dev/null" || true
+                ALL_READY=false
+            fi
+        done
     fi
-done
+fi
 
 if ! $ALL_READY && ! $DRY_RUN; then
     log_error "Some targets failed to become ready. Check logs above."

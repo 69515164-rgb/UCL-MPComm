@@ -256,7 +256,7 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
         } else if (arg == "--tcp-port" && i + 1 < argc) {
             cfg.tcp_port = std::stoi(argv[++i]);
         } else if (arg == "--size" && i + 1 < argc) {
-            cfg.buffer_size = std::stoull(argv[++i]);
+            cfg.buffer_size = parseSize(argv[++i]);
         } else if (arg == "--buffer-size" && i + 1 < argc) {
             cfg.target_buffer_size = parseSize(argv[++i]);
         } else if (arg == "--num-numas" && i + 1 < argc) {

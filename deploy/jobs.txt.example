@@ -1,0 +1,60 @@
+# =============================================================================
+# MPComm Multi-Initiator Test Configuration (for multi_initiator_test.sh)
+#
+# Format: INI-style sections, one section per test job.
+#
+# Sections:
+#   [global]      - Optional. Default test parameters inherited by every job.
+#   [jobs order]  - Optional. Comma/space separated list fixing job execution order.
+#                   If omitted, jobs run in the order they appear below.
+#   [<job_name>]  - One section per job. Each job defines one initiator and
+#                   one or more targets, plus optional per-job parameters.
+#
+# Per-job fields:
+#   initiator = <IP> <PORT> <NUMAS>      (required, exactly one)
+#   target    = <IP> <PORT> <NUMAS>      (required, one or more lines)
+#   size        = ...    (optional)     override global --size
+#   iterations  = ...    (optional)
+#   warmup      = ...    (optional)
+#   batch-size  = ...    (optional)
+#   gpu         = ...    (optional)
+#   both        = true|false (optional)
+#   test-type   = ...    (optional, comma-separated: scatter,gather,broadcast)
+#   buffer-size = ...    (optional)     target-side buffer size
+#
+# Notes:
+#   - A single physical machine may appear as initiator in one job AND as
+#     target in other jobs, but each (ip, port) pair must be UNIQUE across
+#     the whole file. Users are responsible for picking non-conflicting ports.
+#   - Lines starting with '#' are comments. Blank lines are ignored.
+#
+# Example: 4-machine cross-traffic scenario
+#   Job A: machine-1 (initiator) -> machine-3, machine-4
+#   Job B: machine-3 (initiator) -> machine-1, machine-2, machine-4
+#   Job C: machine-4 (initiator) -> machine-1, machine-3
+# =============================================================================
+
+[global]
+size        = 1G
+iterations  = 20
+warmup      = 5
+test-type   = scatter
+buffer-size = 2G
+
+[jobA]
+initiator = 29.160.51.1 12345 0
+target    = 29.160.51.3 22345 0
+target    = 29.160.51.4 22345 0
+
+[jobB]
+initiator = 29.160.51.3 12346 1
+target    = 29.160.51.1 22346 1
+target    = 29.160.51.2 22346 0
+target    = 29.160.51.4 22346 1
+size      = 512M
+test-type = gather
+
+[jobC]
+initiator = 29.160.51.4 12347 0
+target    = 29.160.51.1 22347 0
+target    = 29.160.51.3 22347 0

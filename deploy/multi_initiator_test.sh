@@ -75,9 +75,12 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") --jobs FILE [options]
 
-Runs multiple concurrent test jobs, each with its own initiator and targets.
-Every initiator is launched via SSH on its assigned machine; all initiators
-start running only after ALL targets (across all jobs) are ready.
+Runs multiple concurrent test jobs across a pool of machines. Every host
+involved in the jobs file runs exactly ONE 'scatter_test --mode both' process
+that simultaneously acts as target (publishing one buffer per job whose
+target list references it) and as initiator (running one benchmark round per
+job whose initiator line names it). A host therefore opens a single TCP port
+for all of its roles.
 
 Options:
   --jobs FILE           Jobs configuration file (default: jobs.txt)
@@ -88,11 +91,12 @@ Options:
   --tests-dir DIR       Test files install directory (default: /opt/mpcomm_tests)
   --skip-deploy         Skip mpcomm/test deployment check
   --startup-wait SECS   Timeout for targets to become ready (default: 30)
-  --job-timeout SECS    Max seconds to wait for each initiator (0 = no limit)
+  --job-timeout SECS    Max seconds to wait for every job to finish
+                        (0 = no limit; applies to the whole run)
   --parallel N          Max concurrent SSH operations (default: 20)
-  --show-logs           Print each initiator's full log in the results
+  --show-logs           Print each job's per-job log slice in the results
                         section (default: only show the bandwidth summary;
-                        full logs are still saved to /tmp/mpcomm_job_*.log)
+                        per-job slices are still saved to /tmp/mpcomm_job_*.log)
   --verbose             Enable verbose output
   --dry-run             Print planned actions without executing
   -h, --help            Show this help
@@ -112,6 +116,10 @@ Jobs file format (INI-style, see jobs.txt.example):
   target    = 29.1.1.1 22346 1
   size      = 512M
   test-type = gather
+
+Constraint: every appearance of a given host (whether as initiator or target,
+in any job) must use the SAME TCP port, because all of its roles are served
+by one MPComm instance.
 EOF
     exit 0
 }
@@ -422,8 +430,8 @@ fi
 # =============================================================================
 # Cleanup trap: kill every launched target on exit
 # =============================================================================
-LAUNCHED_TARGETS=()       # "ip:port" pairs that were successfully launched
-LAUNCHED_INITIATORS=()    # "ip:port" pairs for initiators we started via SSH
+LAUNCHED_TARGETS=()       # "ip:port" pairs for each host's launched
+                          # scatter_test --mode both process.
 CLEANUP_DONE=false
 
 cleanup() {
@@ -433,33 +441,18 @@ cleanup() {
     CLEANUP_DONE=true
 
     echo ""
-    log_step "Cleaning up all launched target/initiator processes..."
+    log_step "Cleaning up all launched 'both' processes..."
 
-    # Kill initiators (should normally have exited already). We tag each
-    # initiator launcher with the string "mpcomm_ini_<job>_<port>" (its file
-    # name), and the scatter_test child inherits that tag in its process
-    # tree, so we pkill the launcher script by name. We also do a broad sweep
-    # by tagged launcher path.
+    # Precise kill for each host's 'both' launcher + scatter_test child.
     local pids=()
-    for entry in "${LAUNCHED_INITIATORS[@]}"; do
-        [ -z "$entry" ] && continue
-        local ip="${entry%%:*}"
-        local port="${entry#*:}"
-        (
-            $(ssh_cmd "$ip") "pkill -f 'mpcomm_ini_.*_${port}\.sh' 2>/dev/null; true" 2>/dev/null || true
-        ) &
-        pids+=($!)
-    done
-    for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
-
-    # Kill targets
-    pids=()
     for entry in "${LAUNCHED_TARGETS[@]}"; do
         [ -z "$entry" ] && continue
         local ip="${entry%%:*}"
         local port="${entry#*:}"
         (
-            $(ssh_cmd "$ip") "pkill -f 'scatter_test --mode target --host-id ${ip}:${port}' 2>/dev/null" 2>/dev/null || true
+            $(ssh_cmd "$ip") "pkill -f 'mpcomm_both_${port}\.sh' 2>/dev/null; \
+                              pkill -f 'scatter_test --mode both --host-id ${ip}:${port}' 2>/dev/null; \
+                              true" 2>/dev/null || true
         ) &
         pids+=($!)
     done
@@ -471,7 +464,7 @@ cleanup() {
     for ip in "${ALL_HOSTS[@]}"; do
         (
             $(ssh_cmd "$ip") "pkill -f 'scatter_test' 2>/dev/null; \
-                              pkill -f 'mpcomm_ini_.*\.sh' 2>/dev/null; \
+                              pkill -f 'mpcomm_both_.*\.sh' 2>/dev/null; \
                               pkill -f 'mpcomm_launch_' 2>/dev/null; true" 2>/dev/null || true
         ) &
         pids+=($!)
@@ -596,7 +589,7 @@ log_step "Step 4: Cleaning up stale scatter_test processes..."
 if ! $DRY_RUN; then
     _mit_pkill() {
         local slot="$1" ip="$2"
-        $(ssh_cmd "$ip") "pkill -f 'scatter_test' 2>/dev/null; pkill -f 'mpcomm_ini_' 2>/dev/null" || true
+        $(ssh_cmd "$ip") "pkill -f 'scatter_test' 2>/dev/null; pkill -f 'mpcomm_both_' 2>/dev/null; pkill -f 'mpcomm_ini_' 2>/dev/null" || true
         return 0
     }
     pkill_failed=()
@@ -607,160 +600,373 @@ log_info "Stale processes cleaned."
 echo ""
 
 # =============================================================================
-# Step 5: Start every target process in parallel
+# Build per-host plan for --mode both
 #
-# ALL_TGT_KEYS[] entries are "ip:port:numas". For each entry we launch a
-# scatter_test --mode target process. Buffer size is resolved per-JOB (the job
-# whose target list contains this spec), falling back to 2G if unset.
+# One process per host. We aggregate all jobs:
+#   * For every (initiator_host -> target_host) pair in job X:
+#       - target_host gains a --serve entry (channel_id=X, numa=target's numa)
+#       - initiator_host gains a --target entry pointing at target_host with
+#         the same channel_id and peer_numa=target's numa, tagged with the
+#         job name so the binary can run each job's benchmark independently.
+#   * Each host runs scatter_test exactly once with --mode both.
+#
+# Invariants (enforced below):
+#   1. Every host has exactly one TCP port (a host cannot open MPComm on two
+#      different ports from the same process). If a host appears as
+#      initiator in one job with port P1 and as target in another job with
+#      port P2, we require P1==P2.
+#   2. channel_id is 1000 + job_index (1-based). It is unique within and
+#      across hosts; only initiator+target endpoints of the same job share it.
 # =============================================================================
-log_step "Step 5: Starting ${#ALL_TGT_KEYS[@]} target process(es) in parallel..."
+
+declare -A HOST_PORT=()           # ip -> tcp port
+declare -A HOST_NUMAS=()          # ip -> "0" or "0,1" (union of all roles)
+declare -A HOST_SERVES=()         # ip -> "cid:size:numa|cid:size:numa|..."
+declare -A HOST_TARGETS=()        # ip -> "cid:peer_job:peer_ip:peer_port:peer_numa|..."
+declare -A HOST_JOBS=()           # ip -> "jobA|jobB|..." logical jobs whose
+                                   #       initiator lives on this host
+declare -a HOST_LIST=()           # de-duplicated list of hosts actually used
+declare -A _seen_host_in_list=()
+
+_require_port() {
+    # ip / port / role-description (for error messages)
+    local ip="$1" port="$2" role="$3"
+    if [ -n "${HOST_PORT[$ip]:-}" ]; then
+        if [ "${HOST_PORT[$ip]}" != "$port" ]; then
+            log_error "Host $ip cannot use multiple ports in 'both' mode: "
+            log_error "  already bound to port ${HOST_PORT[$ip]}, but $role wants port $port."
+            log_error "  Fix jobs.txt so every appearance of $ip uses the same port."
+            exit 1
+        fi
+    else
+        HOST_PORT[$ip]="$port"
+    fi
+    if [ -z "${_seen_host_in_list[$ip]:-}" ]; then
+        HOST_LIST+=("$ip")
+        _seen_host_in_list[$ip]=1
+    fi
+}
+
+_merge_numas() {
+    # Merge comma-separated numa spec into HOST_NUMAS[ip], deduplicating.
+    local ip="$1" spec="$2"
+    local existing="${HOST_NUMAS[$ip]:-}"
+    local combined="$existing"
+    if [ -z "$existing" ]; then
+        combined="$spec"
+    else
+        combined="${existing},${spec}"
+    fi
+    # Dedup while preserving order of first appearance.
+    local IFS=','
+    local -A seen=()
+    local out=""
+    local tok
+    for tok in $combined; do
+        [ -z "$tok" ] && continue
+        if [ -z "${seen[$tok]:-}" ]; then
+            seen[$tok]=1
+            if [ -z "$out" ]; then out="$tok"; else out="${out},${tok}"; fi
+        fi
+    done
+    HOST_NUMAS[$ip]="$out"
+}
+
+_first_numa() {
+    # Return the first numa node from a spec like "0,1".
+    local spec="$1"
+    echo "${spec%%,*}"
+}
+
+_append_pipe() {
+    # $1 = variable name (assoc entry), $2 = key, $3 = value to append.
+    # Usage: _append_pipe HOST_SERVES "$ip" "$new_entry"
+    local -n _map="$1"
+    local key="$2" val="$3"
+    if [ -z "${_map[$key]:-}" ]; then
+        _map[$key]="$val"
+    else
+        _map[$key]="${_map[$key]}|${val}"
+    fi
+}
+
+# Walk jobs in declaration order and assign channel_id = 1000 + index (1-based).
+job_idx=0
+for name in "${JOB_NAMES[@]}"; do
+    job_idx=$((job_idx + 1))
+    cid=$((1000 + job_idx))
+
+    ini_ip="${JOB_INI_IP[$name]}"
+    ini_port="${JOB_INI_PORT[$name]}"
+    ini_numas="${JOB_INI_NUMAS[$name]}"
+    specs="${JOB_TGT_SPECS[$name]}"
+    bufsz="$(get_param "$name" buffer-size)"
+    bufsz="${bufsz:-2G}"
+
+    _require_port "$ini_ip" "$ini_port" "job [$name] initiator"
+    _merge_numas "$ini_ip" "$ini_numas"
+    _append_pipe HOST_JOBS "$ini_ip" "$name"
+
+    # Iterate targets of this job. Each target produces:
+    #   - a --serve entry on the target host
+    #   - a --target entry on the initiator host
+    IFS='|' read -r -a _specs_arr <<< "$specs"
+    for spec in "${_specs_arr[@]}"; do
+        [ -z "$spec" ] && continue
+        tip="${spec%%:*}"
+        rest="${spec#*:}"
+        tport="${rest%%:*}"
+        tnumas="${rest#*:}"
+        tfirst="$(_first_numa "$tnumas")"
+
+        _require_port "$tip" "$tport" "job [$name] target"
+        _merge_numas "$tip" "$tnumas"
+
+        # Serve on the target host (one buffer per job-target pair).
+        _append_pipe HOST_SERVES "$tip" "${cid}:${bufsz}:${tfirst}"
+
+        # Target on the initiator host (benchmark direction: ini -> tgt).
+        _append_pipe HOST_TARGETS "$ini_ip" \
+            "${cid}:${name}:${tip}:${tport}:${tfirst}"
+    done
+done
+unset job_idx
+
+echo ""
+log_step "Per-host 'both' process plan:"
+for ip in "${HOST_LIST[@]}"; do
+    port="${HOST_PORT[$ip]}"
+    numas="${HOST_NUMAS[$ip]:-0}"
+    serves="${HOST_SERVES[$ip]:-}"
+    tgts="${HOST_TARGETS[$ip]:-}"
+    jobs_on="${HOST_JOBS[$ip]:-}"
+    serve_count=0
+    tgt_count=0
+    [ -n "$serves" ] && serve_count=$(awk -F'|' '{print NF}' <<< "$serves")
+    [ -n "$tgts" ]   && tgt_count=$(awk -F'|' '{print NF}' <<< "$tgts")
+    echo "  $ip : port=$port  numas=$numas  serves=$serve_count  targets=$tgt_count  jobs=[${jobs_on//|/,}]"
+    if [ -n "$serves" ]; then
+        IFS='|' read -r -a _a <<< "$serves"; for e in "${_a[@]}"; do echo "      --serve $e"; done
+    fi
+    if [ -n "$tgts" ]; then
+        IFS='|' read -r -a _a <<< "$tgts"; for e in "${_a[@]}"; do echo "      --target $e"; done
+    fi
+done
+echo ""
+
+# =============================================================================
+# Step 5: Start one scatter_test --mode both process per host
+# =============================================================================
+log_step "Step 5: Starting ${#HOST_LIST[@]} 'both' process(es) in parallel..."
 
 ENV_EXPORTS="$(build_env_exports)"
 
-# Resolve buffer size per target key by finding which job declares it.
-# Returns the first job's buffer-size (defaulting to 2G). This is fine because
-# a (ip,port) pair is unique across the whole file.
-resolve_target_buffer_size() {
-    local want_key="$1"   # ip:port:numas
-    local want_ipport="${want_key%:*}"
-    local name specs s s_ipport
-    for name in "${JOB_NAMES[@]}"; do
-        specs="${JOB_TGT_SPECS[$name]}"
-        IFS='|' read -r -a _arr <<< "$specs"
-        for s in "${_arr[@]}"; do
-            s_ipport="${s%:*}"
-            if [ "$s_ipport" = "$want_ipport" ]; then
-                local bs
-                bs="$(get_param "$name" buffer-size)"
-                echo "${bs:-2G}"
-                return 0
+# Build the command line for a given host.
+#   cmd = numactl prefix + scatter_test --mode both --host-id ip:port
+#           --tcp-port port --num-numas <spec>
+#           [--serve cid:size:numa ...]
+#           [--job NAME --target host_id:ip:port:cid:peer_numa ...]
+#         followed by the per-job --size/--iterations/... overrides taken
+#         from whichever job that --job block belongs to.
+#
+# Host IDs assigned to each target entry use the peer's IP only (since it is
+# unique per host, thanks to _require_port). The remote process ID used as
+# --host-id is "ip:port".
+build_host_both_cmd() {
+    local ip="$1"
+    local remote_bin="$2"
+    local port="${HOST_PORT[$ip]}"
+    local numas="${HOST_NUMAS[$ip]:-0}"
+    local bind_node="${numas%%,*}"
+    local serves="${HOST_SERVES[$ip]:-}"
+    local tgts="${HOST_TARGETS[$ip]:-}"
+
+    local prefix=""
+    if [ -n "$bind_node" ]; then
+        prefix="\$(command -v numactl >/dev/null 2>&1 && echo \"numactl --cpunodebind=${bind_node} --membind=${bind_node}\" || { echo \"[WARN] numactl not found on \$(hostname); scatter_test will run without NUMA binding\" >&2; echo \"\"; })"
+    fi
+
+    local cmd="${prefix} ${remote_bin} --mode both"
+    cmd+=" --host-id ${ip}:${port}"
+    cmd+=" --tcp-port ${port}"
+    cmd+=" --num-numas ${numas}"
+
+    # All --serve entries (order does not matter).
+    if [ -n "$serves" ]; then
+        local s cid sz nn
+        IFS='|' read -r -a _sv_arr <<< "$serves"
+        for s in "${_sv_arr[@]}"; do
+            [ -z "$s" ] && continue
+            cmd+=" --serve ${s}"
+        done
+    fi
+
+    # --target entries, grouped by --job. We print one --job header per job so
+    # scatter_test splits the benchmark rounds correctly.
+    if [ -n "$tgts" ]; then
+        # Collect jobs in order of first appearance.
+        local -a job_order=()
+        declare -A _job_seen=()
+        local t cid jname peer_ip peer_port peer_numa peer_hostid
+        IFS='|' read -r -a _tg_arr <<< "$tgts"
+        for t in "${_tg_arr[@]}"; do
+            [ -z "$t" ] && continue
+            jname="${t#*:}"; jname="${jname%%:*}"
+            if [ -z "${_job_seen[$jname]:-}" ]; then
+                job_order+=("$jname")
+                _job_seen[$jname]=1
             fi
         done
-    done
-    echo "2G"
+
+        local j
+        for j in "${job_order[@]}"; do
+            cmd+=" --job ${j}"
+            # Per-job overrides come next so they apply to the upcoming
+            # --target entries. scatter_test does not re-parse --size inside
+            # a --job block, so we repeat them at the top of each job block
+            # too (last-wins semantics).
+            local v
+            v="$(get_param "$j" size)";        [ -n "$v" ] && cmd+=" --size $v"
+            v="$(get_param "$j" iterations)";  [ -n "$v" ] && cmd+=" --iterations $v"
+            v="$(get_param "$j" warmup)";      [ -n "$v" ] && cmd+=" --warmup $v"
+            v="$(get_param "$j" batch-size)";  [ -n "$v" ] && cmd+=" --batch-size $v"
+            v="$(get_param "$j" gpu)";         [ -n "$v" ] && cmd+=" --gpu $v"
+            v="$(get_param "$j" both)";        [ "$v" = "true" ] && cmd+=" --both"
+            v="$(get_param "$j" test-type)";   [ -n "$v" ] && cmd+=" --test-type $v"
+
+            for t in "${_tg_arr[@]}"; do
+                [ -z "$t" ] && continue
+                cid="${t%%:*}"
+                rest="${t#*:}"
+                jname="${rest%%:*}"
+                [ "$jname" = "$j" ] || continue
+                rest="${rest#*:}"
+                peer_ip="${rest%%:*}"
+                rest="${rest#*:}"
+                peer_port="${rest%%:*}"
+                peer_numa="${rest#*:}"
+                # host_id used by MPComm on the peer = "ip:port".
+                peer_hostid="${peer_ip}:${peer_port}"
+                cmd+=" --target ${peer_hostid}:${peer_ip}:${peer_port}:${cid}:${peer_numa}"
+            done
+        done
+    fi
+
+    echo "$cmd"
 }
 
-declare -a TGT_BUFSIZES=()
-for key in "${ALL_TGT_KEYS[@]}"; do
-    TGT_BUFSIZES+=("$(resolve_target_buffer_size "$key")")
+declare -a HOST_CMD=()
+declare -a HOST_REMOTE_PID=()
+for ip in "${HOST_LIST[@]}"; do
+    bin="${HOST_BINARY[$ip]}"
+    HOST_CMD+=("$(build_host_both_cmd "$ip" "$bin")")
+    HOST_REMOTE_PID+=("")
 done
 
-# Prepare arrays indexed by slot (= index into ALL_TGT_KEYS)
-declare -a TGT_IP=()
-declare -a TGT_PORT=()
-declare -a TGT_NUMAS=()
-for key in "${ALL_TGT_KEYS[@]}"; do
-    ip="${key%%:*}"
-    rest="${key#*:}"
-    port="${rest%%:*}"
-    numas="${rest#*:}"
-    TGT_IP+=("$ip")
-    TGT_PORT+=("$port")
-    TGT_NUMAS+=("$numas")
+# Print the full plan before launching
+for i in $(seq 0 $((${#HOST_LIST[@]} - 1))); do
+    log_info "  ${HOST_LIST[$i]} :: ${HOST_CMD[$i]}"
 done
 
-# Sentinel arrays for parallel launch
-declare -a TGT_PID=()
-for _ in "${ALL_TGT_KEYS[@]}"; do TGT_PID+=(""); done
-
-if ! $DRY_RUN; then
-    _mit_start_target() {
-        local slot="$1" ip="$2"
-        local port="${TGT_PORT[$slot]}"
-        local numas="${TGT_NUMAS[$slot]}"
-        local bufsz="${TGT_BUFSIZES[$slot]}"
-        local remote_bin="${HOST_BINARY[$ip]}"
-        local remote_dir="${HOST_WORKDIR[$ip]}"
-        local pid_file="/tmp/mpcomm_target_${port}.pid"
-        local log_file="/tmp/mpcomm_target_${port}.log"
-        local launcher="/tmp/mpcomm_launch_${port}.sh"
-        local pid_sentinel="/tmp/mit_tgt_pid_$$_${slot}"
-
-        # Pick the first NUMA node from the spec (e.g. "0,1" -> "0") for
-        # numactl --cpunodebind/--membind. If numactl is unavailable on the
-        # remote host we fall back to an unbound launch with a warning so the
-        # test can still proceed.
-        local bind_node="${numas%%,*}"
-
-        # Build the target launcher body locally; ship it via stdin.
-        local launcher_body
-        launcher_body="$(cat <<EOF
-#!/bin/bash
-${ENV_EXPORTS}
-cd '${remote_dir}'
-NUMACTL_PREFIX=""
-if [ -n '${bind_node}' ] && command -v numactl >/dev/null 2>&1; then
-    NUMACTL_PREFIX="numactl --cpunodebind=${bind_node} --membind=${bind_node}"
-elif [ -n '${bind_node}' ]; then
-    echo "[WARN] numactl not found on \$(hostname); target will run without NUMA binding" >&2
+if $DRY_RUN; then
+    log_warn "DRY RUN - skipping actual execution"
+    exit 0
 fi
-stdbuf -oL \${NUMACTL_PREFIX} ${remote_bin} --mode target --host-id ${ip}:${port} --tcp-port ${port} --buffer-size ${bufsz} --num-numas ${numas} > '${log_file}' 2>&1 &
-echo \$! > '${pid_file}'
+
+_mit_start_both() {
+    local slot="$1" ip="$2"
+    local port="${HOST_PORT[$ip]}"
+    local cmd="${HOST_CMD[$slot]}"
+    local workdir="${HOST_WORKDIR[$ip]}"
+    local tag="mpcomm_both_${port}"
+    local launcher="/tmp/${tag}.sh"
+    local pid_file="/tmp/${tag}.pid"
+    local log_file="/tmp/${tag}.log"
+    local exitcode_file="/tmp/${tag}.exitcode"
+    local pid_sentinel="/tmp/mit_both_pid_$$_${slot}"
+
+    local launcher_body
+    launcher_body="$(cat <<EOF
+#!/bin/bash
+echo \$\$ > '${pid_file}'
+${ENV_EXPORTS}
+cd '${workdir}'
+stdbuf -oL ${cmd} > '${log_file}' 2>&1
+rc=\$?
+echo \$rc > '${exitcode_file}'
 EOF
 )"
 
-        printf '%s\n' "${launcher_body}" \
-            | $(ssh_cmd "$ip") "rm -f '${pid_file}'; cat > '${launcher}' && chmod +x '${launcher}'"
+    echo "----- both-launcher content for ${ip} (${launcher}) -----"
+    echo "${launcher_body}"
+    echo "----- end launcher content -----"
 
-        $(ssh_cmd "$ip") "setsid ${launcher} </dev/null >/dev/null 2>&1 &"
-        sleep 1
+    printf '%s\n' "${launcher_body}" \
+        | $(ssh_cmd "$ip") "rm -f '${exitcode_file}' '${pid_file}' '${log_file}'; cat > '${launcher}' && chmod +x '${launcher}'"
 
-        local remote_pid
-        remote_pid=$($(ssh_cmd "$ip") "cat ${pid_file} 2>/dev/null" || echo "")
-        remote_pid=$(echo "$remote_pid" | tail -1 | tr -d '[:space:]')
+    $(ssh_cmd "$ip") "nohup setsid '${launcher}' </dev/null >/dev/null 2>&1 & disown 2>/dev/null; exit 0"
+    sleep 1
 
-        if [ -n "$remote_pid" ] && [ "$remote_pid" -gt 0 ] 2>/dev/null; then
-            echo "$remote_pid" > "$pid_sentinel"
-            echo "[$slot] $ip:$port - started (PID: $remote_pid)"
-            return 0
-        fi
-        echo "[$slot] $ip:$port - failed to start target"
-        return 1
-    }
+    local remote_pid
+    remote_pid=$($(ssh_cmd "$ip") "cat ${pid_file} 2>/dev/null" || echo "")
+    remote_pid=$(echo "$remote_pid" | tail -1 | tr -d '[:space:]')
 
-    start_failed=()
-    parallel_foreach_ip _mit_start_target "start_target" start_failed "${TGT_IP[@]}"
-
-    START_FAIL=false
-    for slot in $(seq 0 $((${#ALL_TGT_KEYS[@]} - 1))); do
-        ip="${TGT_IP[$slot]}"
-        port="${TGT_PORT[$slot]}"
-        sentinel="/tmp/mit_tgt_pid_$$_${slot}"
-        if [ -f "$sentinel" ]; then
-            pid=$(cat "$sentinel")
-            TGT_PID[$slot]="$pid"
-            LAUNCHED_TARGETS+=("${ip}:${port}")
-            rm -f "$sentinel"
-            log_info "  [$slot] $ip:$port - started (PID: $pid)"
-        else
-            log_error "  [$slot] $ip:$port - failed to start target"
-            START_FAIL=true
-        fi
-    done
-    if $START_FAIL; then
-        log_error "One or more targets failed to start. Aborting."
-        exit 1
+    if [ -n "$remote_pid" ] && [ "$remote_pid" -gt 0 ] 2>/dev/null; then
+        echo "$remote_pid" > "$pid_sentinel"
+        echo "[$slot] $ip:$port - started (launcher PID: $remote_pid)"
+        return 0
     fi
+    echo "[$slot] $ip:$port - failed to start 'both' process"
+    return 1
+}
+
+start_failed=()
+parallel_foreach_ip _mit_start_both "start_both" start_failed "${HOST_LIST[@]}"
+
+START_FAIL=false
+for slot in $(seq 0 $((${#HOST_LIST[@]} - 1))); do
+    ip="${HOST_LIST[$slot]}"
+    port="${HOST_PORT[$ip]}"
+    sentinel="/tmp/mit_both_pid_$$_${slot}"
+    if [ -f "$sentinel" ]; then
+        pid=$(cat "$sentinel")
+        HOST_REMOTE_PID[$slot]="$pid"
+        LAUNCHED_TARGETS+=("${ip}:${port}")
+        rm -f "$sentinel"
+        log_info "  [$slot] $ip:$port - 'both' process running (PID: $pid)"
+    else
+        log_error "  [$slot] $ip:$port - failed to start"
+        START_FAIL=true
+    fi
+done
+if $START_FAIL; then
+    log_error "One or more 'both' processes failed to start. Aborting."
+    exit 1
 fi
 echo ""
 
 # =============================================================================
-# Step 6: Wait for every target to be ready
+# Step 6: Wait for every host to finish publishing its serve buffers and
+# reach the "Ready - waiting for connections" marker. (Hosts with no --serve
+# still reach this marker; the binary prints it after startAcceptThread.)
 # =============================================================================
-log_step "Step 6: Waiting for all targets to be ready (timeout: ${STARTUP_WAIT}s)..."
+log_step "Step 6: Waiting for all 'both' processes to be ready (timeout: ${STARTUP_WAIT}s)..."
 ALL_READY=true
+# Match both the new both-mode marker and the legacy target-mode marker.
+BOTH_READY_REGEX='Ready - waiting for connections\|Waiting for connections'
+
 if ! $DRY_RUN; then
     PHASE_A_ROUNDS=3
     PENDING=()
-    for slot in $(seq 0 $((${#ALL_TGT_KEYS[@]} - 1))); do
+    for slot in $(seq 0 $((${#HOST_LIST[@]} - 1))); do
         PENDING+=("$slot")
     done
 
     _mit_ready_check() {
         local slot="$1" ip="$2"
-        local port="${TGT_PORT[$slot]}"
-        local pid="${TGT_PID[$slot]}"
-        local log_file="/tmp/mpcomm_target_${port}.log"
+        local port="${HOST_PORT[$ip]}"
+        local pid="${HOST_REMOTE_PID[$slot]}"
+        local log_file="/tmp/mpcomm_both_${port}.log"
         local ready_sentinel="/tmp/mit_ready_$$_${slot}"
         local dead_sentinel="/tmp/mit_dead_$$_${slot}"
 
@@ -771,7 +977,7 @@ if ! $DRY_RUN; then
                 tail -20 ${log_file} 2>/dev/null
                 exit 0
             fi
-            if grep -q '${READY_MARKER}' ${log_file} 2>/dev/null; then
+            if grep -q '${BOTH_READY_REGEX}' ${log_file} 2>/dev/null; then
                 echo READY
                 exit 0
             fi
@@ -789,15 +995,9 @@ if ! $DRY_RUN; then
 
     for round in $(seq 1 "$PHASE_A_ROUNDS"); do
         [ ${#PENDING[@]} -eq 0 ] && break
-        log_info "  Round $round: checking ${#PENDING[@]} target(s)..."
-        # Build IP list restricted to pending slots
+        log_info "  Round $round: checking ${#PENDING[@]} host(s)..."
         _ips=()
-        for slot in "${PENDING[@]}"; do _ips+=("${TGT_IP[$slot]}"); done
-        # But the worker needs the slot index; parallel_foreach_ip passes the
-        # position in the supplied IP list as slot_index. So we need to map
-        # that back — easiest fix: run one worker at a time with its real slot.
-        # Implementation: temporarily replace TGT_PORT/TGT_PID lookups via a
-        # slot->real_slot map built before dispatch.
+        for slot in "${PENDING[@]}"; do _ips+=("${HOST_LIST[$slot]}"); done
         declare -a _real_slot=()
         for slot in "${PENDING[@]}"; do _real_slot+=("$slot"); done
 
@@ -815,10 +1015,10 @@ if ! $DRY_RUN; then
             ready_sentinel="/tmp/mit_ready_$$_${slot}"
             dead_sentinel="/tmp/mit_dead_$$_${slot}"
             if [ -f "$ready_sentinel" ]; then
-                log_info "    [$slot] ${TGT_IP[$slot]}:${TGT_PORT[$slot]} - ready"
+                log_info "    [$slot] ${HOST_LIST[$slot]} - ready"
                 rm -f "$ready_sentinel"
             elif [ -f "$dead_sentinel" ]; then
-                log_error "    [$slot] ${TGT_IP[$slot]}:${TGT_PORT[$slot]} - process DIED"
+                log_error "    [$slot] ${HOST_LIST[$slot]} - process DIED"
                 sed 's/^/      /' "$dead_sentinel" >&2
                 rm -f "$dead_sentinel"
                 ALL_READY=false
@@ -831,15 +1031,15 @@ if ! $DRY_RUN; then
     done
 
     if [ ${#PENDING[@]} -gt 0 ] && $ALL_READY; then
-        log_info "  Phase B: polling ${#PENDING[@]} slow target(s) individually..."
+        log_info "  Phase B: polling ${#PENDING[@]} slow host(s) individually..."
         MAX_ELAPSED=$((STARTUP_WAIT - PHASE_A_ROUNDS))
         [ "$MAX_ELAPSED" -lt 5 ] && MAX_ELAPSED=5
         for slot in "${PENDING[@]}"; do
-            ip="${TGT_IP[$slot]}"
-            port="${TGT_PORT[$slot]}"
-            pid="${TGT_PID[$slot]}"
-            LOG_FILE="/tmp/mpcomm_target_${port}.log"
-            log_info "  [$slot] Waiting for $ip:$port (max ${MAX_ELAPSED}s)..."
+            ip="${HOST_LIST[$slot]}"
+            port="${HOST_PORT[$ip]}"
+            pid="${HOST_REMOTE_PID[$slot]}"
+            LOG_FILE="/tmp/mpcomm_both_${port}.log"
+            log_info "  [$slot] Waiting for $ip (max ${MAX_ELAPSED}s)..."
             ELAPSED=0
             READY=false
             while [ "$ELAPSED" -lt "$MAX_ELAPSED" ]; do
@@ -849,7 +1049,7 @@ if ! $DRY_RUN; then
                     ALL_READY=false
                     break
                 fi
-                if $(ssh_cmd "$ip") "grep -q '${READY_MARKER}' ${LOG_FILE} 2>/dev/null"; then
+                if $(ssh_cmd "$ip") "grep -q '${BOTH_READY_REGEX}' ${LOG_FILE} 2>/dev/null"; then
                     READY=true
                     break
                 fi
@@ -857,9 +1057,9 @@ if ! $DRY_RUN; then
                 ELAPSED=$((ELAPSED + 1))
             done
             if $READY; then
-                log_info "  [$slot] $ip:$port - ready"
+                log_info "  [$slot] $ip - ready"
             elif $ALL_READY; then
-                log_error "  [$slot] $ip:$port - NOT ready after ${STARTUP_WAIT}s"
+                log_error "  [$slot] $ip - NOT ready after ${STARTUP_WAIT}s"
                 $(ssh_cmd "$ip") "tail -20 ${LOG_FILE} 2>/dev/null" || true
                 ALL_READY=false
             fi
@@ -868,270 +1068,172 @@ if ! $DRY_RUN; then
 fi
 
 if ! $ALL_READY && ! $DRY_RUN; then
-    log_error "Some targets failed to become ready. Aborting."
+    log_error "Some 'both' processes failed to become ready. Aborting."
     exit 1
 fi
-log_info "All ${#ALL_TGT_KEYS[@]} targets ready."
+log_info "All ${#HOST_LIST[@]} host(s) ready. Initiator workloads will now run inside each 'both' process."
 echo ""
 
 # =============================================================================
-# Step 7: Launch every initiator in parallel (via SSH, including the host that
-# may be the orchestrator machine itself, for symmetry).
+# Step 7: Wait for every logical job to finish. A job is finished when its
+# initiator host's log contains the line "[both] Job '<name>' complete." or
+# "[both] Job '<name>' failed". The 'both' process keeps running afterwards
+# (serving buffers), so we don't wait for process exit.
 # =============================================================================
-log_step "Step 7: Launching ${#JOB_NAMES[@]} initiator(s) in parallel (via SSH)..."
+log_step "Step 7: Waiting for ${#JOB_NAMES[@]} job(s) to complete (heartbeat every 10s)..."
 
-build_initiator_cmd() {
-    local name="$1"
-    local remote_bin="$2"
-    local specs="${JOB_TGT_SPECS[$name]}"
-    # Bind the initiator process to the first NUMA node from its numas spec
-    # (e.g. "0,1" -> "0"). The prefix is evaluated on the remote host at
-    # launch time so that missing numactl falls back gracefully.
-    local bind_node="${JOB_INI_NUMAS[$name]%%,*}"
-    local cmd
-    if [ -n "$bind_node" ]; then
-        cmd="\$(command -v numactl >/dev/null 2>&1 && echo \"numactl --cpunodebind=${bind_node} --membind=${bind_node}\" || { echo \"[WARN] numactl not found on \$(hostname); initiator will run without NUMA binding\" >&2; echo \"\"; }) ${remote_bin}"
-    else
-        cmd="${remote_bin}"
-    fi
-    local i=0
-    IFS='|' read -r -a arr <<< "$specs"
-    for s in "${arr[@]}"; do
-        local tip="${s%%:*}"
-        local rest="${s#*:}"
-        local tport="${rest%%:*}"
-        cmd+=" --target t${i}:${tip}:${tport}"
-        i=$((i + 1))
-    done
-    local v
-    v="$(get_param "$name" size)";        [ -n "$v" ] && cmd+=" --size $v"
-    v="$(get_param "$name" iterations)";  [ -n "$v" ] && cmd+=" --iterations $v"
-    v="$(get_param "$name" warmup)";      [ -n "$v" ] && cmd+=" --warmup $v"
-    v="$(get_param "$name" batch-size)";  [ -n "$v" ] && cmd+=" --batch-size $v"
-    v="$(get_param "$name" gpu)";         [ -n "$v" ] && cmd+=" --gpu $v"
-    v="$(get_param "$name" both)";        [ "$v" = "true" ] && cmd+=" --both"
-    v="$(get_param "$name" test-type)";   [ -n "$v" ] && cmd+=" --test-type $v"
-    cmd+=" --num-numas ${JOB_INI_NUMAS[$name]}"
-    echo "$cmd"
-}
-
-# Arrays indexed by job slot
-declare -a JOB_IP=()
-declare -a JOB_PORT=()
-declare -a JOB_CMD=()
-for name in "${JOB_NAMES[@]}"; do
-    ip="${JOB_INI_IP[$name]}"
-    port="${JOB_INI_PORT[$name]}"
-    bin="${HOST_BINARY[$ip]}"
-    JOB_IP+=("$ip")
-    JOB_PORT+=("$port")
-    JOB_CMD+=("$(build_initiator_cmd "$name" "$bin")")
-done
-
-# Print the full plan before launching
-for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
-    name="${JOB_NAMES[$i]}"
-    log_info "  [${name}] ${JOB_IP[$i]} :: ${JOB_CMD[$i]}"
-done
-
-if $DRY_RUN; then
-    log_warn "DRY RUN - skipping actual execution"
-    exit 0
-fi
-
-# For each job, write an initiator launcher script on its host, launch via
-# setsid (fully detached), and record the PID. stdout/stderr is captured to
-# /tmp/mpcomm_ini_<job>.log on the remote host; we'll pull it back later.
-declare -a JOB_REMOTE_PID=()
-for _ in "${JOB_NAMES[@]}"; do JOB_REMOTE_PID+=(""); done
-
-_mit_start_initiator() {
-    local pos="$1" ip="$2"
-    local name="${JOB_NAMES[$pos]}"
-    local port="${JOB_PORT[$pos]}"
-    local cmd="${JOB_CMD[$pos]}"
-    local workdir="${HOST_WORKDIR[$ip]}"
-    local tag="mpcomm_ini_${name}_${port}"
-    local launcher="/tmp/${tag}.sh"
-    local pid_file="/tmp/${tag}.pid"
-    local log_file="/tmp/${tag}.log"
-    local exitcode_file="/tmp/${tag}.exitcode"
-    local pid_sentinel="/tmp/mit_ini_pid_$$_${pos}"
-
-    # Build the launcher script body locally as a single string. Using a
-    # single-variable interpolation here (not nested heredocs) guarantees
-    # that values like "1G" / "512M" are never re-parsed by any shell layer.
-    # The launcher writes its own PID to pid_file; it lives until the
-    # scatter_test child exits, so kill -0 reliably reflects liveness.
-    local launcher_body
-    launcher_body="$(cat <<EOF
-#!/bin/bash
-echo \$\$ > '${pid_file}'
-${ENV_EXPORTS}
-cd '${workdir}'
-stdbuf -oL ${cmd} > '${log_file}' 2>&1
-rc=\$?
-echo \$rc > '${exitcode_file}'
-EOF
-)"
-
-    # Print the exact launcher body for easy diagnosis.
-    echo "----- launcher content for [${name}] on ${ip} (${launcher}) -----"
-    echo "${launcher_body}"
-    echo "----- end launcher content -----"
-
-    # Step 1: Ship the launcher body via stdin and make it executable.
-    printf '%s\n' "${launcher_body}" \
-        | $(ssh_cmd "$ip") "rm -f '${exitcode_file}' '${pid_file}' '${log_file}'; cat > '${launcher}' && chmod +x '${launcher}'"
-
-    # Step 2: Launch it detached. The launcher itself writes its PID inside.
-    $(ssh_cmd "$ip") "nohup setsid '${launcher}' </dev/null >/dev/null 2>&1 & disown 2>/dev/null; exit 0"
-
-    # Wait briefly for the launcher to write its PID file.
-    sleep 1
-
-    local remote_pid
-    remote_pid=$($(ssh_cmd "$ip") "cat ${pid_file} 2>/dev/null" || echo "")
-    remote_pid=$(echo "$remote_pid" | tail -1 | tr -d '[:space:]')
-
-    if [ -n "$remote_pid" ] && [ "$remote_pid" -gt 0 ] 2>/dev/null; then
-        echo "$remote_pid" > "$pid_sentinel"
-        echo "[${name}] $ip - initiator started (launcher PID: $remote_pid)"
-        return 0
-    fi
-    echo "[${name}] $ip - failed to start initiator"
-    return 1
-}
-
-ini_failed=()
-parallel_foreach_ip _mit_start_initiator "start_initiator" ini_failed "${JOB_IP[@]}"
-
-START_FAIL=false
-for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
-    name="${JOB_NAMES[$i]}"
-    ip="${JOB_IP[$i]}"
-    port="${JOB_PORT[$i]}"
-    sentinel="/tmp/mit_ini_pid_$$_${i}"
-    if [ -f "$sentinel" ]; then
-        pid=$(cat "$sentinel")
-        JOB_REMOTE_PID[$i]="$pid"
-        LAUNCHED_INITIATORS+=("${ip}:${port}")
-        rm -f "$sentinel"
-        log_info "  [${name}] $ip - initiator running (PID: $pid)"
-    else
-        log_error "  [${name}] $ip - initiator failed to start"
-        START_FAIL=true
-    fi
-done
-if $START_FAIL; then
-    log_error "One or more initiators failed to start. Aborting."
-    exit 1
-fi
-echo ""
-
-# =============================================================================
-# Step 8: Wait for every initiator to finish, then fetch its log
-# =============================================================================
-log_step "Step 8: Waiting for ${#JOB_NAMES[@]} initiator(s) to complete..."
-
-# Pending list of job indices
-PENDING_JOBS=()
-for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do PENDING_JOBS+=("$i"); done
-
-declare -A JOB_EXIT_CODE=()
+declare -A JOB_STATUS=()   # job_name -> OK | FAIL | TIMEOUT
+PENDING_JOBS=("${JOB_NAMES[@]}")
 START_TS=$(date +%s)
 LAST_TICK=0
+
+# Map each job to its initiator's host + remote log path.
+declare -A JOB_LOGFILE=()
+declare -A JOB_HOST=()
+for name in "${JOB_NAMES[@]}"; do
+    ini_ip="${JOB_INI_IP[$name]}"
+    ini_port="${HOST_PORT[$ini_ip]}"
+    JOB_HOST[$name]="$ini_ip"
+    JOB_LOGFILE[$name]="/tmp/mpcomm_both_${ini_port}.log"
+done
 
 while [ ${#PENDING_JOBS[@]} -gt 0 ]; do
     NOW=$(date +%s)
     ELAPSED=$((NOW - START_TS))
 
-    # Print heartbeat every 10s
     if [ $((ELAPSED - LAST_TICK)) -ge 10 ]; then
         LAST_TICK=$ELAPSED
-        running_names=()
-        for i in "${PENDING_JOBS[@]}"; do running_names+=("${JOB_NAMES[$i]}"); done
-        log_info "  [${ELAPSED}s] still running: ${running_names[*]}"
+        log_info "  [${ELAPSED}s] still running: ${PENDING_JOBS[*]}"
     fi
 
-    # Timeout check
     if [ "$JOB_TIMEOUT" -gt 0 ] && [ "$ELAPSED" -gt "$JOB_TIMEOUT" ]; then
-        log_error "Job timeout (${JOB_TIMEOUT}s) reached; killing remaining initiators."
-        for i in "${PENDING_JOBS[@]}"; do
-            JOB_EXIT_CODE[$i]=124
-        done
+        log_error "Job timeout (${JOB_TIMEOUT}s) reached; marking remaining jobs as TIMEOUT."
+        for j in "${PENDING_JOBS[@]}"; do JOB_STATUS[$j]="TIMEOUT"; done
         break
     fi
 
     NEW_PENDING=()
-    for i in "${PENDING_JOBS[@]}"; do
-        name="${JOB_NAMES[$i]}"
-        ip="${JOB_IP[$i]}"
-        pid="${JOB_REMOTE_PID[$i]}"
-        port="${JOB_PORT[$i]}"
-        tag="mpcomm_ini_${name}_${port}"
-        exitcode_file="/tmp/${tag}.exitcode"
+    for name in "${PENDING_JOBS[@]}"; do
+        ip="${JOB_HOST[$name]}"
+        logf="${JOB_LOGFILE[$name]}"
+        # Find the pid of this host's 'both' launcher so we can detect death.
+        host_slot=""
+        for _s in $(seq 0 $((${#HOST_LIST[@]} - 1))); do
+            if [ "${HOST_LIST[$_s]}" = "$ip" ]; then host_slot="$_s"; break; fi
+        done
+        host_pid="${HOST_REMOTE_PID[$host_slot]:-}"
+        # Check for completion marker. Grep returns a non-empty line for OK,
+        # another for FAIL. We escape the single quotes around the job name
+        # in the search pattern by using double quotes on the remote side.
+        status=$($(ssh_cmd "$ip") "
+            if grep -q \"\\[both\\] Job '${name}' complete\\.\" ${logf} 2>/dev/null; then
+                echo OK
+            elif grep -q \"\\[both\\] Job '${name}' failed\" ${logf} 2>/dev/null; then
+                echo FAIL
+            elif [ -n '${host_pid}' ] && ! kill -0 ${host_pid:-1} 2>/dev/null; then
+                echo DEAD
+            else
+                echo PENDING
+            fi
+        " 2>/dev/null | tail -1 | tr -d '[:space:]')
 
-        # Is the remote PID still alive?
-        alive=$($(ssh_cmd "$ip") "kill -0 $pid 2>/dev/null && echo Y || echo N" 2>/dev/null || echo "N")
-        alive=$(echo "$alive" | tail -1 | tr -d '[:space:]')
-        if [ "$alive" = "Y" ]; then
-            NEW_PENDING+=("$i")
-            continue
-        fi
-        # Process exited; read the exit code file written by the launcher.
-        exitcode_file="/tmp/${tag}.exitcode"
-        rc=$($(ssh_cmd "$ip") "cat ${exitcode_file} 2>/dev/null" || echo "")
-        rc=$(echo "$rc" | tail -1 | tr -d '[:space:]')
-        if [ -z "$rc" ]; then
-            rc="?"
-        fi
-        JOB_EXIT_CODE[$i]="$rc"
-        log_info "  [${name}] finished after ${ELAPSED}s (rc=$rc)"
+        case "$status" in
+            OK)   JOB_STATUS[$name]="OK";   log_info "  [${name}] OK (after ${ELAPSED}s)" ;;
+            FAIL) JOB_STATUS[$name]="FAIL"; log_error "  [${name}] FAIL (after ${ELAPSED}s)" ;;
+            DEAD) JOB_STATUS[$name]="FAIL"; log_error "  [${name}] FAIL - 'both' process on $ip died before the job finished" ;;
+            *)    NEW_PENDING+=("$name") ;;
+        esac
     done
     PENDING_JOBS=("${NEW_PENDING[@]}")
     [ ${#PENDING_JOBS[@]} -gt 0 ] && sleep 2
 done
 
 echo ""
-log_step "Step 9: Fetching logs from every initiator..."
-declare -A JOB_LOCAL_LOG=()
-for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
-    name="${JOB_NAMES[$i]}"
-    ip="${JOB_IP[$i]}"
-    port="${JOB_PORT[$i]}"
-    tag="mpcomm_ini_${name}_${port}"
-    local_log="/tmp/mpcomm_job_${name}.log"
-    if $(ssh_cmd "$ip") "cat /tmp/${tag}.log" > "$local_log" 2>/dev/null; then
-        JOB_LOCAL_LOG[$name]="$local_log"
-        log_info "  [${name}] log saved to $local_log"
+
+# =============================================================================
+# Step 8: Fetch each host's 'both' log, then extract the per-job slice by
+# matching the "[both] === Running job 'NAME' ===" / "[both] Job 'NAME'
+# complete." bracket markers emitted by scatter_test.
+# =============================================================================
+log_step "Step 8: Fetching 'both' logs from every host..."
+declare -A HOST_LOCAL_LOG=()
+for ip in "${HOST_LIST[@]}"; do
+    port="${HOST_PORT[$ip]}"
+    local_log="/tmp/mpcomm_both_${ip}_${port}.log"
+    if $(ssh_cmd "$ip") "cat /tmp/mpcomm_both_${port}.log" > "$local_log" 2>/dev/null; then
+        HOST_LOCAL_LOG[$ip]="$local_log"
+        log_info "  $ip - log saved to $local_log"
     else
-        log_warn "  [${name}] failed to fetch log"
-        JOB_LOCAL_LOG[$name]=""
+        log_warn "  $ip - failed to fetch log"
+        HOST_LOCAL_LOG[$ip]=""
     fi
 done
 echo ""
 
+# Slice each host's log into per-job chunks, one file per job.
+declare -A JOB_LOCAL_LOG=()
+for name in "${JOB_NAMES[@]}"; do
+    ip="${JOB_HOST[$name]}"
+    src="${HOST_LOCAL_LOG[$ip]:-}"
+    dst="/tmp/mpcomm_job_${name}.log"
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        JOB_LOCAL_LOG[$name]=""
+        continue
+    fi
+    # awk: print lines between the job's opening marker (inclusive) and the
+    # closing marker (inclusive). scatter_test emits:
+    #   opening : [both] === Running job 'NAME' with N target(s) ===
+    #   closing : [both] Job 'NAME' complete.
+    #             [both] Job 'NAME' failed ...
+    # We match the opening line by prefix (up to and including "'NAME'") so
+    # we do not depend on the " with N target(s) ===" suffix wording. If the
+    # closing marker is missing (e.g. the process died mid-benchmark), we
+    # still emit everything from the opening marker to EOF.
+    awk -v jn="$name" '
+        BEGIN {
+            inside = 0
+            open_tag  = "[both] === Running job \x27" jn "\x27"
+            close_ok  = "[both] Job \x27" jn "\x27 complete."
+            close_bad = "[both] Job \x27" jn "\x27 failed"
+        }
+        {
+            if (!inside && index($0, open_tag) > 0) {
+                inside = 1
+            }
+            if (inside) {
+                print
+            }
+            if (inside && (index($0, close_ok) > 0 || index($0, close_bad) > 0)) {
+                inside = 0
+            }
+        }
+    ' "$src" > "$dst" 2>/dev/null || true
+    if [ -s "$dst" ]; then
+        JOB_LOCAL_LOG[$name]="$dst"
+    else
+        JOB_LOCAL_LOG[$name]=""
+    fi
+done
+
 # =============================================================================
-# Step 10: Print per-job results, one after another
+# Step 9: Print per-job results
 # =============================================================================
 echo "============================================================"
 echo "  Results"
 echo "============================================================"
 ALL_OK=true
-for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
-    name="${JOB_NAMES[$i]}"
-    rc="${JOB_EXIT_CODE[$i]:-?}"
+for name in "${JOB_NAMES[@]}"; do
+    st="${JOB_STATUS[$name]:-UNKNOWN}"
     echo ""
     echo "------------------------------------------------------------"
-    if [ "$rc" = "0" ]; then
-        echo "  [${name}] SUCCESS (${JOB_IP[$i]})"
+    if [ "$st" = "OK" ]; then
+        echo "  [${name}] SUCCESS (${JOB_HOST[$name]})"
     else
-        echo "  [${name}] FAILED (rc=$rc, ${JOB_IP[$i]})"
+        echo "  [${name}] FAILED/$(echo "$st" | tr '[:upper:]' '[:lower:]') (${JOB_HOST[$name]})"
         ALL_OK=false
     fi
     echo "------------------------------------------------------------"
-    logf="${JOB_LOCAL_LOG[$name]}"
+    logf="${JOB_LOCAL_LOG[$name]:-}"
     if $SHOW_LOGS; then
         if [ -n "$logf" ] && [ -f "$logf" ]; then
             cat "$logf"
@@ -1140,7 +1242,7 @@ for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
         fi
     else
         if [ -n "$logf" ] && [ -f "$logf" ]; then
-            echo "  (full log: $logf  --  rerun with --show-logs to print inline)"
+            echo "  (per-job log: $logf  --  rerun with --show-logs to print inline)"
         else
             echo "  (log unavailable)"
         fi
@@ -1148,22 +1250,35 @@ for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
 done
 
 # =============================================================================
-# Final bandwidth summary: compact per-job bandwidth table.
-# Extracted directly from each job's fetched log by matching the three
-# well-known anchor lines that scatter_test prints at the end of every run:
-#   --- <TestType> <Mem> Summary (...)
-#     Aggregate Avg: <wall> ms (<avg_gbps> Gbps, <avg_gbs> GB/s)
-#     Best BW:  <best_gbps> Gbps (...)  |  Worst BW: <worst_gbps> Gbps (...)
-# A single job may contain multiple test types (scatter, gather, broadcast)
-# and both DRAM / HBM sections, so we list every summary block we find.
+# Step 10: Stop every 'both' process (they are still running, serving buffers)
 # =============================================================================
 echo ""
+log_step "Step 10: Stopping all 'both' processes..."
+_stop_pids=()
+for slot in $(seq 0 $((${#HOST_LIST[@]} - 1))); do
+    ip="${HOST_LIST[$slot]}"
+    port="${HOST_PORT[$ip]}"
+    (
+        $(ssh_cmd "$ip") "pkill -f 'mpcomm_both_${port}\\.sh' 2>/dev/null; \
+                          pkill -f 'scatter_test --mode both --host-id ${ip}:${port}' 2>/dev/null; \
+                          true" 2>/dev/null || true
+    ) &
+    _stop_pids+=($!)
+done
+for p in "${_stop_pids[@]}"; do wait "$p" 2>/dev/null || true; done
+log_info "Stop signal sent."
+echo ""
+
+# =============================================================================
+# Final bandwidth summary: same extractor as before, but now labels come from
+# "--- <TestType> DRAM@<job> Summary" / "--- <TestType> HBM@<job> Summary"
+# lines emitted by scatter_test in both mode. We parse the "@<job>" suffix to
+# attribute each row to its originating job. Standalone (no @job) labels from
+# initiator-mode logs are still supported for backward compatibility.
+# =============================================================================
 echo "============================================================"
 echo "  Bandwidth Summary"
 echo "============================================================"
-# Column widths: tuned so that typical job names (<=14 chars) and test labels
-# like "Scatter/DRAM", "Broadcast/HBM" (<=14 chars) fit cleanly, and numeric
-# columns are wide enough for values up to 9999.99 GB/s with 2 decimals.
 SUM_FMT_HEADER="  %-14s %-14s %14s %14s %14s\n"
 SUM_FMT_NUM="  %-14s %-14s %14.2f %14.2f %14.2f\n"
 SUM_FMT_TEXT="  %-14s %-14s %14s %14s %14s\n"
@@ -1173,14 +1288,13 @@ printf "$SUM_FMT_HEADER" \
 printf "$SUM_FMT_HEADER" \
     "--------------" "--------------" "--------------" "--------------" "--------------"
 
-for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
-    name="${JOB_NAMES[$i]}"
-    rc="${JOB_EXIT_CODE[$i]:-?}"
-    logf="${JOB_LOCAL_LOG[$name]}"
+for name in "${JOB_NAMES[@]}"; do
+    st="${JOB_STATUS[$name]:-UNKNOWN}"
+    logf="${JOB_LOCAL_LOG[$name]:-}"
 
-    if [ "$rc" != "0" ]; then
+    if [ "$st" != "OK" ]; then
         printf "$SUM_FMT_TEXT" \
-            "$name" "-" "FAILED" "FAILED" "FAILED"
+            "$name" "-" "$st" "$st" "$st"
         continue
     fi
     if [ -z "$logf" ] || [ ! -f "$logf" ]; then
@@ -1189,46 +1303,37 @@ for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
         continue
     fi
 
-    # Parse summary blocks with awk (POSIX-compatible).
-    # State machine: when we see a "--- <Type> <Mem> Summary" line we remember
-    # the label; then for the next "Aggregate Avg" / "Best BW" lines we extract
-    # the GB/s numeric fields (the value in parentheses after the Gbps number)
-    # and emit one tab-separated row per block.
     awk -v jobname="$name" '
-        # Extract the first floating-point number in the substring that starts
-        # at position p of the current line. Returns "" if none found.
-        function extract_num(line, p,    rest, r) {
+        function extract_num(line, p,    rest) {
             rest = substr(line, p)
             if (match(rest, /[0-9]+\.[0-9]+|[0-9]+/)) {
                 return substr(rest, RSTART, RLENGTH)
             }
             return ""
         }
-        # Find the GB/s number that appears right after the "Gbps" token whose
-        # start position is at/after p in the current line. Returns "" if the
-        # token is not found.
         function extract_gbs(line, p,    q) {
             q = index(substr(line, p), "Gbps")
             if (q <= 0) return ""
-            # q is relative to substr(line,p); convert back to absolute pos.
             return extract_num(line, p + q - 1 + length("Gbps"))
         }
 
-        /^---[[:space:]]+[A-Za-z]+[[:space:]]+[A-Za-z]+[[:space:]]+Summary/ {
-            # Example: "--- Scatter DRAM Summary (2 targets, ...)"
-            # Field 2 = test type, field 3 = memory type.
-            label = $2 "/" $3
+        # "--- Scatter DRAM@jobA Summary (..." or "--- Scatter DRAM Summary ("
+        /^---[[:space:]]+[A-Za-z]+[[:space:]]+[A-Za-z0-9@_()[:space:]]+Summary/ {
+            # $2 = test type, $3..$(NF-1) assembled back to mem label.
+            test_type = $2
+            mem = $3
+            # Strip "@jobname" suffix if present.
+            at = index(mem, "@")
+            if (at > 0) mem = substr(mem, 1, at - 1)
+            label = test_type "/" mem
             avg = ""; best = ""; worst = ""
             next
         }
         /Aggregate Avg:/ {
-            # "  Aggregate Avg: 0.018 ms (298.99 Gbps, 37.37 GB/s)"
-            # Skip past the first "(" and grab the GB/s value following Gbps.
             p = index($0, "(")
             if (p > 0) avg = extract_gbs($0, p + 1)
         }
         /Best BW:/ {
-            # "  Best BW:  396.28 Gbps (49.53 GB/s)  |  Worst BW: 194.60 Gbps (24.33 GB/s)"
             pb = index($0, "Best BW:")
             pw = index($0, "Worst BW:")
             if (pb > 0) best  = extract_gbs($0, pb + length("Best BW:"))
@@ -1239,9 +1344,6 @@ for i in $(seq 0 $((${#JOB_NAMES[@]} - 1))); do
             }
         }
     ' "$logf" | while IFS=$'\t' read -r jname tlabel avg best worst; do
-        # Use the numeric format so values are always right-aligned with two
-        # decimals; if awk somehow produced a non-numeric string, fall back
-        # to the text format so the row still prints cleanly.
         if [[ "$avg" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             printf "$SUM_FMT_NUM" "$jname" "$tlabel" "$avg" "$best" "$worst"
         else

@@ -7,14 +7,12 @@
     # from the pip package directory.
     #
     # Usage:
-    #   bash deploy_tests.sh                    # current release (read VERSION)
-    #   bash deploy_tests.sh --debug            # current debug
-    #   bash deploy_tests.sh --version R01C02   # specific release
+    #   bash deploy_tests.sh                    # use VERSION from mirror
+    #   bash deploy_tests.sh --version R01C02   # specific version
     #   bash deploy_tests.sh --install-dir /opt/mpcomm_tests
     #
     #   # via pipe:
     #   wget -qO- <URL>/deploy_tests.sh | bash
-    #   wget -qO- <URL>/deploy_tests.sh | bash -s -- --debug
     #   wget -qO- <URL>/deploy_tests.sh | bash -s -- --version=R01C02
     #
     # Exit code: 0 = success, 1 = failure
@@ -24,12 +22,10 @@
     # ------------------------------------------------------------------
     # Parse arguments
     # ------------------------------------------------------------------
-    DEBUG_BUILD=false
     INSTALL_DIR="/opt/mpcomm_tests"
     MPCOMM_VERSION=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --debug)            DEBUG_BUILD=true; shift ;;
             --install-dir=*)    INSTALL_DIR="${1#*=}"; shift ;;
             --install-dir)      INSTALL_DIR="$2"; shift 2 ;;
             --version=*)        MPCOMM_VERSION="${1#*=}"; shift ;;
@@ -60,11 +56,7 @@
     error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
     echo "============================================"
-    if $DEBUG_BUILD; then
-        echo " MPComm Test Files Deployment (DEBUG)"
-    else
-        echo " MPComm Test Files Deployment"
-    fi
+    echo " MPComm Test Files Deployment"
     echo "============================================"
     echo "  Install dir: $INSTALL_DIR"
     echo ""

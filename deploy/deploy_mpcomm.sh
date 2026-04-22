@@ -170,7 +170,7 @@ info "mpcomm version: $MPCOMM_VERSION (wheel semver: $MPCOMM_SEMVER)"
 WHL_NAME="mpcomm-${MPCOMM_SEMVER}-${PY_TAG}-${PY_TAG}-linux_x86_64.whl"
 
 if $DEBUG_BUILD; then
-    WHL_URL="${MIRROR_BASE}/build/debug/${MPCOMM_VERSION}/${WHL_NAME}"
+    WHL_URL="${MIRROR_BASE}/build/${MPCOMM_VERSION}/debug/${WHL_NAME}"
 else
     WHL_URL="${MIRROR_BASE}/build/${MPCOMM_VERSION}/${WHL_NAME}"
 fi

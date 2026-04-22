@@ -651,7 +651,7 @@ private:
                                       const std::vector<size_t> &lengths,
                                       TransferDirection direction);
     int pollAllNicsForAsync(TransferContext& ctx);
-    void workerThreadLoop(size_t worker_id, int numa_id, int cpu_id);
+    void workerThreadLoop(size_t worker_id, int numa_id, std::vector<int> cpu_ids);
     int getNumaForAddr(uintptr_t addr) const;
     size_t selectWorkerForNuma(int numa_id);
 
@@ -1150,18 +1150,20 @@ int MPComm::Impl::init(const std::string &local_host_id,
     }
     
     // Start worker threads (kWorkersPerNuma workers per NUMA node)
+    // NUMA-only affinity: each worker is bound to the entire CPU set of its NUMA node,
+    // and the kernel scheduler picks an idle core. This avoids collisions when multiple
+    // mpcomm processes run on the same host.
     worker_running_.store(true);
     worker_threads_.resize(total_workers_);
     for (size_t numa = 0; numa < num_numa_nodes_; ++numa) {
         for (size_t w = 0; w < kWorkersPerNuma; ++w) {
             size_t worker_id = numa * kWorkersPerNuma + w;
-            // Assign CPU: cycle through available CPUs on this NUMA node
-            int cpu_id = -1;
-            if (!numa_cpus[numa].empty() && numa_cpus[numa][0] >= 0) {
-                cpu_id = numa_cpus[numa][w % numa_cpus[numa].size()];
-            }
+            // Pass the full CPU list of this NUMA node; workerThreadLoop will set
+            // affinity to all of them (intersected with sched_getaffinity).
+            std::vector<int> cpu_ids = numa_cpus[numa];
             worker_threads_[worker_id] = std::make_unique<std::thread>(
-                &MPComm::Impl::workerThreadLoop, this, worker_id, static_cast<int>(numa), cpu_id);
+                &MPComm::Impl::workerThreadLoop, this, worker_id,
+                static_cast<int>(numa), std::move(cpu_ids));
         }
     }
     MPCOMM_LOG_INFO("MPComm: Started %zu async worker threads (%zu per NUMA, %zu NUMA nodes)\n", 
@@ -4524,22 +4526,46 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
 └─────────────────────────────────────────┘
  */
 
-void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, int cpu_id) {
-    // Bind this thread to a specific CPU if requested
+void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<int> cpu_ids) {
+    // NUMA-only affinity: bind this thread to ALL CPUs of the given NUMA node,
+    // letting the kernel scheduler pick an idle core. This avoids multiple
+    // mpcomm processes on the same host colliding on the same single core.
 #ifdef __linux__
-    if (cpu_id >= 0) {
+    if (!cpu_ids.empty() && cpu_ids[0] >= 0) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(cpu_id, &cpuset);
-        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
-            MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) bound to CPU %d\n", 
-                   worker_id, numa_id, cpu_id);
+        // Intersect with the process's allowed CPU set so we respect external
+        // taskset / numactl --physcpubind constraints.
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        bool have_allowed = (sched_getaffinity(0, sizeof(allowed), &allowed) == 0);
+        int set_count = 0;
+        std::string cpu_list_str;
+        for (int c : cpu_ids) {
+            if (c < 0) continue;
+            if (have_allowed && !CPU_ISSET(c, &allowed)) continue;
+            CPU_SET(c, &cpuset);
+            ++set_count;
+            if (!cpu_list_str.empty()) cpu_list_str += ",";
+            cpu_list_str += std::to_string(c);
+        }
+        if (set_count > 0) {
+            if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+                MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) bound to CPUs [%s] (%d cores)\n",
+                       worker_id, numa_id, cpu_list_str.c_str(), set_count);
+            } else {
+                MPCOMM_LOG_WARN("MPComm: Worker %zu (NUMA %d) pthread_setaffinity_np failed, "
+                       "falling back to kernel scheduling\n", worker_id, numa_id);
+            }
+        } else {
+            MPCOMM_LOG_WARN("MPComm: Worker %zu (NUMA %d) has no allowed CPU after intersecting "
+                   "with process affinity, leaving thread unbound\n", worker_id, numa_id);
         }
     }
 #else
-    (void)cpu_id;  // Suppress unused parameter warning
+    (void)cpu_ids;  // Suppress unused parameter warning
 #endif
-    
+
     MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n", 
            worker_id, numa_id, static_cast<unsigned long>(pthread_self()));
     

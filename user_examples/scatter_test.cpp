@@ -2,7 +2,7 @@
 //
 // Demonstrates scatter_async, gather_async, and broadcast_async API usage
 // with DRAM and HBM (GPU) memory.
-// Supports both initiator and target modes in a single binary.
+// Supports initiator, target, and "both" modes in a single binary.
 // No data correctness verification — purely performance-oriented.
 //
 // Target mode (run on remote host first):
@@ -35,6 +35,37 @@
 //   ./scatter_test --target t1:10.0.0.1:12345 --test-type gather
 //   ./scatter_test --target t1:10.0.0.1:12345 --test-type broadcast
 //   ./scatter_test --target t1:10.0.0.1:12345 --test-type scatter,gather,broadcast
+//
+// Both mode (a single process simultaneously acts as target for some peers
+// and as initiator toward other peers, sharing one MPComm instance):
+//   ./scatter_test --mode both --host-id 29.1.1.1:12345 --tcp-port 12345 \
+//       --serve 1001:2G:0 \
+//       --serve 1002:2G:0 \
+//       --target B:29.1.1.2:12345:2001:0 \
+//       --target C:29.1.1.3:12345:2002:0
+//
+//   --serve  CHANNEL_ID:SIZE:NUMA
+//       Allocate a target buffer on NUMA and publish it under a composite tag
+//       ((CHANNEL_ID<<16)|NUMA). Repeatable. Each channel_id MUST be unique
+//       within this process; the remote initiator must know the same
+//       channel_id to query this buffer.
+//
+//   --target HOST_ID:ADDR:PORT[:CHANNEL_ID:PEER_NUMA]
+//       When the optional trailing ":CHANNEL_ID:PEER_NUMA" suffix is present
+//       the initiator benchmark will query the remote buffer using the
+//       composite tag ((CHANNEL_ID<<16)|PEER_NUMA) instead of the local
+//       initiator NUMA. Each --target can specify its own pair.
+//
+//   --job LABEL
+//       In both mode, groups subsequent --target entries under one logical
+//       "job". Each job is benchmarked independently (its own connect,
+//       allocate, scatter/gather/broadcast round), and its log lines are
+//       prefixed with "[job=LABEL] " so an orchestrator can attribute each
+//       summary block. Passing an empty label clears the grouping.
+//
+// After every initiator benchmark completes, a "both"-mode process keeps
+// running (serving published buffers) until it receives SIGINT/SIGTERM, so
+// that peers still performing RDMA reads/writes against us do not error out.
 
 #include <mpcomm.h>
 
@@ -77,13 +108,13 @@ static const char *opTypeName(TestOpType op) {
 }
 
 // =====================================================================
-// Signal handling for target mode graceful shutdown
+// Signal handling for target / both mode graceful shutdown
 // =====================================================================
 
 static std::atomic<bool> g_stop_requested{false};
 
 static void signalHandler(int signum) {
-    printf("\n[target] Received signal %d, stopping...\n", signum);
+    printf("\n[scatter_test] Received signal %d, stopping...\n", signum);
     g_stop_requested.store(true);
 }
 
@@ -91,16 +122,43 @@ static void signalHandler(int signum) {
 // Helpers
 // =====================================================================
 
+// A single remote target description for the initiator benchmark.
+// channel_id/peer_numa are optional; when channel_id == 0 the original
+// "match by initiator NUMA" fallback is used (backward compatible).
 struct TargetInfo {
     std::string host_id;
     std::string tcp_addr;
     int tcp_port = 0;
+    int channel_id = 0;   // 0 = not specified (use legacy NUMA matching)
+    int peer_numa = 0;    // used only if channel_id > 0
+    std::string job_label; // empty = default job; otherwise which logical job
+                           //   this target belongs to (both mode only)
+};
+
+// A single local "served" buffer, exposed to remote peers via publishBuffer.
+// Each entry produces one registered + published buffer in "both" mode.
+struct ServeSpec {
+    int channel_id = 0;   // must be > 0, unique within the process
+    size_t size = 0;
+    int numa = 0;
 };
 
 enum RunMode {
     MODE_INITIATOR = 0,
     MODE_TARGET = 1,
+    MODE_BOTH = 2,
 };
+
+// Encode (channel_id, numa) -> 32-bit composite tag used as the
+// numa_node argument of publishBuffer / queryRemoteBufferByNuma.
+// Layout: (channel_id << 16) | (numa & 0xFFFF).
+// channel_id == 0 means "no tag" (legacy behaviour).
+static inline int encodeBufferTag(int channel_id, int numa) {
+    if (channel_id <= 0) {
+        return numa;  // legacy: tag equals the real NUMA node
+    }
+    return (channel_id << 16) | (numa & 0xFFFF);
+}
 
 struct TestConfig {
     RunMode mode = MODE_INITIATOR;
@@ -125,6 +183,13 @@ struct TestConfig {
     size_t target_buffer_size = 2ULL * 1024 * 1024 * 1024;  // 2 GB default
     std::vector<int> numa_nodes;       // NUMA nodes to allocate buffers on
     bool verbose = false;
+
+    // --- Both mode ---
+    std::vector<ServeSpec> serves;     // buffers to publish for remote peers
+    // Tracks the most recent --job label seen during argument parsing so that
+    // subsequent --target entries get attached to that logical job. Reset to
+    // empty when a new --job is seen.
+    std::string _current_job_label;
 };
 
 // Parse size string with optional suffix (K/M/G/T)
@@ -180,6 +245,23 @@ static std::vector<int> parseNumaNodes(const std::string &str) {
     return nodes;
 }
 
+// Split a colon-separated string into tokens. Empty tokens are preserved
+// (so "a::b" splits to {"a", "", "b"}).
+static std::vector<std::string> splitColons(const std::string &str) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (true) {
+        size_t pos = str.find(':', start);
+        if (pos == std::string::npos) {
+            out.push_back(str.substr(start));
+            break;
+        }
+        out.push_back(str.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return out;
+}
+
 static void printUsage(const char *prog) {
     printf("MPComm C++ Scatter Test (initiator + target in one binary)\n\n");
     printf("Usage:\n");
@@ -187,8 +269,12 @@ static void printUsage(const char *prog) {
     printf("    %s --mode target --host-id HOST:PORT --tcp-port PORT [options]\n\n", prog);
     printf("  Initiator mode (default):\n");
     printf("    %s --target host_id:addr:port [--target ...] [options]\n\n", prog);
+    printf("  Both mode (initiator + target in one MPComm instance):\n");
+    printf("    %s --mode both --host-id HOST:PORT --tcp-port PORT \\\n", prog);
+    printf("        --serve CHANNEL_ID:SIZE:NUMA [--serve ...] \\\n");
+    printf("        --target host_id:addr:port:CHANNEL_ID:PEER_NUMA [--target ...]\n\n");
     printf("Common Options:\n");
-    printf("  --mode MODE                  'initiator' (default) or 'target'\n");
+    printf("  --mode MODE                  'initiator' (default), 'target', or 'both'\n");
     printf("  --host-id ID                 Local host ID (default: test:0)\n");
     printf("  --device DEVS                RDMA devices, comma-separated (default: auto)\n");
     printf("  --tcp-port PORT              TCP port for metadata exchange (default: 0=auto)\n");
@@ -197,7 +283,10 @@ static void printUsage(const char *prog) {
     printf("  --buffer-size SIZE           Buffer size with suffix K/M/G/T (default: 2G)\n");
     printf("  --verbose                    Print periodic buffer status\n");
     printf("\nInitiator Mode Options:\n");
-    printf("  --target HOST_ID:ADDR:PORT   Remote target (required, repeatable)\n");
+    printf("  --target HOST_ID:ADDR:PORT[:CHANNEL_ID:PEER_NUMA]\n");
+    printf("                               Remote target (required, repeatable). The optional\n");
+    printf("                               trailing ':CHANNEL_ID:PEER_NUMA' selects a specific\n");
+    printf("                               remote publish buffer (for 'both' mode).\n");
     printf("  --size BYTES                 Buffer size per target in bytes (default: 1000000000)\n");
     printf("  --iterations N               Number of timed iterations (default: 10)\n");
     printf("  --warmup N                   Number of warmup iterations (default: 2)\n");
@@ -206,6 +295,14 @@ static void printUsage(const char *prog) {
     printf("  --both                       Run both DRAM and HBM tests\n");
     printf("  --test-type TYPES            Comma-separated test types: scatter,gather,broadcast\n");
     printf("                               (default: all three)\n");
+    printf("\nBoth Mode Options:\n");
+    printf("  --serve CHANNEL_ID:SIZE:NUMA Publish a target buffer tagged by CHANNEL_ID on NUMA.\n");
+    printf("                               Repeatable. Each CHANNEL_ID must be unique in this\n");
+    printf("                               process; remote initiators look it up via --target.\n");
+    printf("  --job LABEL                  Group subsequent --target entries under a logical\n");
+    printf("                               job. Each job is benchmarked independently and its\n");
+    printf("                               log lines are prefixed with '[job=LABEL] '. An empty\n");
+    printf("                               LABEL clears the grouping.\n");
     printf("\nExamples:\n");
     printf("  # Target (remote host):\n");
     printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G\n", prog);
@@ -215,18 +312,103 @@ static void printUsage(const char *prog) {
     printf("  %s --target t1:10.0.0.1:12345 --gpu 0 --both\n", prog);
     printf("  # Multi-NUMA initiator:\n");
     printf("  %s --target t1:10.0.0.1:12345 --num-numas 0,1\n", prog);
+    printf("\n  # Both (single process, multiple publish buffers + multiple benchmarks):\n");
+    printf("  %s --mode both --host-id A:12345 --tcp-port 12345 \\\n", prog);
+    printf("      --serve 1001:2G:0 --serve 1002:2G:0 \\\n");
+    printf("      --target B:10.0.0.2:12345:2001:0 --target C:10.0.0.3:12345:2002:0\n");
 }
 
+// Parse a --target argument. Accepts:
+//   host_id:addr:port                          (channel_id=0, peer_numa=0)
+//   host_id:addr:port:channel_id:peer_numa     (explicit tag)
+//
+// host_id itself may contain ':' (e.g. "ip:port" form used by --mode both).
+// We therefore disambiguate by counting segments from the *right*:
+//   >=5 segments: last 2 are channel_id:peer_numa, preceding 2 are addr:port,
+//                 everything before that is the host_id (rejoined with ':').
+//   ==3 segments: host_id:addr:port (host_id has no ':'), channel_id=0.
 static bool parseTarget(const std::string &val, TargetInfo &info) {
-    size_t p1 = val.find(':');
-    size_t p2 = val.find(':', p1 + 1);
-    if (p1 == std::string::npos || p2 == std::string::npos) {
-        fprintf(stderr, "Error: --target format must be host_id:tcp_addr:tcp_port\n");
+    std::vector<std::string> parts = splitColons(val);
+    const size_t n = parts.size();
+    if (n != 3 && n < 5) {
+        fprintf(stderr, "Error: --target format must be host_id:tcp_addr:tcp_port "
+                        "or host_id:tcp_addr:tcp_port:channel_id:peer_numa "
+                        "(got '%s')\n", val.c_str());
         return false;
     }
-    info.host_id = val.substr(0, p1);
-    info.tcp_addr = val.substr(p1 + 1, p2 - p1 - 1);
-    info.tcp_port = std::stoi(val.substr(p2 + 1));
+
+    size_t addr_idx, port_idx;
+    bool has_tag = (n >= 5);
+    if (has_tag) {
+        // Last 2 segments are channel_id:peer_numa.
+        // The two immediately before them are addr:port.
+        // Everything before that (>=1 segment) forms host_id.
+        addr_idx = n - 4;
+        port_idx = n - 3;
+    } else {
+        // n == 3: host_id:addr:port
+        addr_idx = 1;
+        port_idx = 2;
+    }
+
+    // Rejoin host_id segments.
+    info.host_id = parts[0];
+    for (size_t k = 1; k < addr_idx; ++k) {
+        info.host_id += ":";
+        info.host_id += parts[k];
+    }
+    info.tcp_addr = parts[addr_idx];
+    try {
+        info.tcp_port = std::stoi(parts[port_idx]);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Error: invalid --target port '%s'\n",
+                parts[port_idx].c_str());
+        return false;
+    }
+    if (has_tag) {
+        try {
+            info.channel_id = std::stoi(parts[n - 2]);
+            info.peer_numa = std::stoi(parts[n - 1]);
+        } catch (const std::exception &e) {
+            fprintf(stderr, "Error: invalid --target channel_id/peer_numa in '%s'\n",
+                    val.c_str());
+            return false;
+        }
+        if (info.channel_id <= 0) {
+            fprintf(stderr, "Error: --target channel_id must be > 0 (got %d)\n",
+                    info.channel_id);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Parse a --serve argument: CHANNEL_ID:SIZE:NUMA
+static bool parseServe(const std::string &val, ServeSpec &spec) {
+    std::vector<std::string> parts = splitColons(val);
+    if (parts.size() != 3) {
+        fprintf(stderr, "Error: --serve format must be channel_id:size:numa "
+                        "(got '%s')\n", val.c_str());
+        return false;
+    }
+    try {
+        spec.channel_id = std::stoi(parts[0]);
+        spec.size = parseSize(parts[1]);
+        spec.numa = std::stoi(parts[2]);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Error: invalid --serve value '%s'\n", val.c_str());
+        return false;
+    }
+    if (spec.channel_id <= 0) {
+        fprintf(stderr, "Error: --serve channel_id must be > 0 (got %d)\n",
+                spec.channel_id);
+        return false;
+    }
+    if (spec.size == 0) {
+        fprintf(stderr, "Error: --serve size must be > 0 (got '%s')\n",
+                parts[1].c_str());
+        return false;
+    }
     return true;
 }
 
@@ -239,8 +421,10 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
                 cfg.mode = MODE_TARGET;
             } else if (mode_str == "initiator") {
                 cfg.mode = MODE_INITIATOR;
+            } else if (mode_str == "both") {
+                cfg.mode = MODE_BOTH;
             } else {
-                fprintf(stderr, "Error: --mode must be 'initiator' or 'target'\n");
+                fprintf(stderr, "Error: --mode must be 'initiator', 'target', or 'both'\n");
                 return false;
             }
         } else if (arg == "--target" && i + 1 < argc) {
@@ -248,7 +432,18 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
             if (!parseTarget(argv[++i], info)) {
                 return false;
             }
+            info.job_label = cfg._current_job_label;
             cfg.targets.push_back(std::move(info));
+        } else if (arg == "--job" && i + 1 < argc) {
+            // Group subsequent --target entries under this logical job name.
+            // An empty value ("--job \"\"") clears the grouping.
+            cfg._current_job_label = argv[++i];
+        } else if (arg == "--serve" && i + 1 < argc) {
+            ServeSpec spec;
+            if (!parseServe(argv[++i], spec)) {
+                return false;
+            }
+            cfg.serves.push_back(std::move(spec));
         } else if (arg == "--host-id" && i + 1 < argc) {
             cfg.host_id = argv[++i];
         } else if (arg == "--device" && i + 1 < argc) {
@@ -317,10 +512,35 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
             cfg.test_types.push_back(TestOpType::GATHER);
             cfg.test_types.push_back(TestOpType::BROADCAST);
         }
-    } else {
+    } else if (cfg.mode == MODE_TARGET) {
         // Target mode defaults
         if (cfg.numa_nodes.empty()) {
             cfg.numa_nodes.push_back(0);
+        }
+    } else {
+        // both mode: at least one --serve or one --target is required
+        if (cfg.serves.empty() && cfg.targets.empty()) {
+            fprintf(stderr, "Error: --mode both requires at least one --serve or --target\n");
+            printUsage(argv[0]);
+            return false;
+        }
+        // Reject duplicate serve channel_ids up front.
+        for (size_t i = 0; i < cfg.serves.size(); ++i) {
+            for (size_t j = i + 1; j < cfg.serves.size(); ++j) {
+                if (cfg.serves[i].channel_id == cfg.serves[j].channel_id) {
+                    fprintf(stderr, "Error: duplicate --serve channel_id %d\n",
+                            cfg.serves[i].channel_id);
+                    return false;
+                }
+            }
+        }
+        if (cfg.initiator_numas.empty()) {
+            cfg.initiator_numas.push_back(0);
+        }
+        if (cfg.test_types.empty()) {
+            cfg.test_types.push_back(TestOpType::SCATTER);
+            cfg.test_types.push_back(TestOpType::GATHER);
+            cfg.test_types.push_back(TestOpType::BROADCAST);
         }
     }
     return true;
@@ -891,24 +1111,28 @@ static int runTransferBenchmark(
 }
 
 // =====================================================================
-// Main
+// Initiator workflow (shared between MODE_INITIATOR and MODE_BOTH)
+//
+// Allocates per-NUMA DRAM buffers (and optionally an HBM buffer), connects
+// to every target, resolves remote buffer addresses, and then runs the
+// requested benchmarks.  Resources are cleaned up before return.
+// The MPComm instance is passed in; the caller owns its lifetime.
 // =====================================================================
 
-int main(int argc, char *argv[]) {
-    TestConfig cfg;
-    if (!parseArgs(argc, argv, cfg)) {
-        return 1;
-    }
-
-    // Dispatch based on mode
-    if (cfg.mode == MODE_TARGET) {
-        return runTargetMode(cfg);
-    }
-
-    // --- Initiator mode (original logic) ---
-    const size_t num_targets = cfg.targets.size();
+// Run the full initiator benchmark for one logical "job": allocate per-NUMA
+// buffers sized for that job's target list, connect, query remote buffers,
+// then run scatter/gather/broadcast as requested. This function is invoked
+// once per --job group in both mode, and exactly once in initiator mode.
+// `job_label` is emitted inside every log line prefix so the driver script
+// can extract per-job summaries from a shared log file.
+static int runInitiatorWorkloadForTargets(MPComm &comm,
+                                          const TestConfig &cfg,
+                                          const std::vector<TargetInfo> &targets,
+                                          const std::string &job_label) {
+    const size_t num_targets = targets.size();
     const size_t total_buffer_size = cfg.buffer_size * num_targets;
     const size_t num_initiator_numas = cfg.initiator_numas.size();
+    const std::string jp = job_label.empty() ? "" : ("[job=" + job_label + "] ");
 
     // Determine what to run
     bool run_dram = true;
@@ -927,24 +1151,14 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    // ---- Initialize MPComm ----
-    printf("Initializing MPComm (host=%s, device=%s)...\n",
-           cfg.host_id.c_str(),
-           cfg.device.empty() ? "auto" : cfg.device.c_str());
-
-    MPComm comm;
-    int ret = comm.init(cfg.host_id, cfg.device, 0);
-    if (ret != 0) {
-        fprintf(stderr, "MPComm init failed: %d\n", ret);
-        return 1;
-    }
-    printf("MPComm initialized with %zu NICs\n", comm.getNumNics());
+    int ret = 0;
 
     // ---- Allocate and register per-NUMA DRAM buffers ----
     std::vector<InitiatorNumaBuffer> dram_numa_buffers;
     if (run_dram) {
-        printf("Allocating DRAM buffers (%zu bytes per NUMA = %zu per target x %zu targets) "
+        printf("%sAllocating DRAM buffers (%zu bytes per NUMA = %zu per target x %zu targets) "
                "on %zu NUMA node(s)...\n",
+               jp.c_str(),
                total_buffer_size, cfg.buffer_size, num_targets, num_initiator_numas);
         for (size_t n = 0; n < num_initiator_numas; ++n) {
             int numa_node = cfg.initiator_numas[n];
@@ -958,7 +1172,6 @@ int main(int argc, char *argv[]) {
                     comm.unregisterMemory(b.ptr);
                     freeDRAM(b.ptr, b.alloc_size);
                 }
-                comm.shutdown();
                 return 1;
             }
             ret = comm.registerMemory(nbuf.ptr, total_buffer_size);
@@ -970,11 +1183,10 @@ int main(int argc, char *argv[]) {
                     comm.unregisterMemory(b.ptr);
                     freeDRAM(b.ptr, b.alloc_size);
                 }
-                comm.shutdown();
                 return 1;
             }
-            printf("  NUMA %d: DRAM buffer registered at %p (%zu bytes)\n",
-                   numa_node, nbuf.ptr, total_buffer_size);
+            printf("%s  NUMA %d: DRAM buffer registered at %p (%zu bytes)\n",
+                   jp.c_str(), numa_node, nbuf.ptr, total_buffer_size);
             dram_numa_buffers.push_back(nbuf);
         }
     }
@@ -984,7 +1196,8 @@ int main(int argc, char *argv[]) {
     std::vector<InitiatorNumaBuffer> hbm_numa_buffers;
 #ifdef USE_CUDA
     if (run_hbm) {
-        printf("Allocating HBM buffer (%zu bytes = %zu per target x %zu targets) on GPU %d...\n",
+        printf("%sAllocating HBM buffer (%zu bytes = %zu per target x %zu targets) on GPU %d...\n",
+               jp.c_str(),
                total_buffer_size, cfg.buffer_size, num_targets, cfg.gpu_device);
         hbm_buffer = allocHBM(total_buffer_size, cfg.gpu_device);
         if (!hbm_buffer) {
@@ -993,7 +1206,6 @@ int main(int argc, char *argv[]) {
                 comm.unregisterMemory(b.ptr);
                 freeDRAM(b.ptr, b.alloc_size);
             }
-            comm.shutdown();
             return 1;
         }
         ret = comm.registerMemory(hbm_buffer, total_buffer_size);
@@ -1004,7 +1216,6 @@ int main(int argc, char *argv[]) {
                 comm.unregisterMemory(b.ptr);
                 freeDRAM(b.ptr, b.alloc_size);
             }
-            comm.shutdown();
             return 1;
         }
         printf("HBM buffer registered at %p\n", hbm_buffer);
@@ -1018,8 +1229,6 @@ int main(int argc, char *argv[]) {
 #endif
 
     // ---- Connect to all targets and query remote buffers ----
-    // We need per-NUMA remote addresses:
-    //   remote_addrs_per_numa[numa_idx][target_idx] = remote buffer addr matching that NUMA
     {
         std::vector<std::string> host_list;
         std::vector<size_t> lengths;
@@ -1029,19 +1238,21 @@ int main(int argc, char *argv[]) {
         std::vector<std::vector<uintptr_t>> hbm_remote_addrs(1);
 
         for (size_t t = 0; t < num_targets; ++t) {
-            const auto &target = cfg.targets[t];
+            const auto &target = targets[t];
 
-            printf("Connecting to target[%zu] %s (%s:%d)...\n",
+            printf("%sConnecting to target[%zu] %s (%s:%d)%s...\n",
+                   jp.c_str(),
                    t, target.host_id.c_str(),
-                   target.tcp_addr.c_str(), target.tcp_port);
+                   target.tcp_addr.c_str(), target.tcp_port,
+                   target.channel_id > 0 ? " [channel-tagged]" : "");
 
             ret = comm.connect(target.host_id, target.tcp_addr, target.tcp_port);
             if (ret != 0) {
-                fprintf(stderr, "Failed to connect to target[%zu] %s: %d\n",
-                        t, target.host_id.c_str(), ret);
+                fprintf(stderr, "%sFailed to connect to target[%zu] %s: %d\n",
+                        jp.c_str(), t, target.host_id.c_str(), ret);
                 goto cleanup;
             }
-            printf("Connected to %s.\n", target.host_id.c_str());
+            printf("%sConnected to %s.\n", jp.c_str(), target.host_id.c_str());
 
             // Query all remote buffers from this target
             RemoteBufferInfo remote_info;
@@ -1053,12 +1264,12 @@ int main(int argc, char *argv[]) {
                 goto cleanup;
             }
 
-            printf("  Remote buffers from %s: %zu buffer(s)\n",
-                   target.host_id.c_str(), remote_info.buffers.size());
+            printf("%s  Remote buffers from %s: %zu buffer(s)\n",
+                   jp.c_str(), target.host_id.c_str(), remote_info.buffers.size());
             for (size_t b = 0; b < remote_info.buffers.size(); ++b) {
                 auto &buf = remote_info.buffers[b];
-                printf("    [%zu] addr=0x%lx, length=%lu, numa=%d\n",
-                       b, (unsigned long)buf.addr, (unsigned long)buf.length,
+                printf("%s    [%zu] addr=0x%lx, length=%lu, tag=%d\n",
+                       jp.c_str(), b, (unsigned long)buf.addr, (unsigned long)buf.length,
                        buf.numa_node);
             }
 
@@ -1071,19 +1282,38 @@ int main(int argc, char *argv[]) {
                 goto cleanup;
             }
 
-            // Match initiator NUMA nodes to remote NUMA buffers
+            // Resolve which remote buffer each initiator NUMA should target.
+            // Selection rules:
+            //   (1) If this --target carries an explicit channel_id, use the
+            //       composite tag (channel_id<<16)|peer_numa for ALL initiator
+            //       NUMAs — the initiator is deliberately pointed at a single
+            //       remote buffer chosen by the scheduler.
+            //   (2) Otherwise, fall back to legacy behaviour: match each
+            //       initiator NUMA to a remote buffer with the same numa_node,
+            //       falling back to index-based / first-buffer selection.
             for (size_t n = 0; n < num_initiator_numas; ++n) {
                 int want_numa = cfg.initiator_numas[n];
-                // Try to find a remote buffer with matching NUMA node
+                int want_tag = (target.channel_id > 0)
+                    ? encodeBufferTag(target.channel_id, target.peer_numa)
+                    : want_numa;
+
                 const RemoteBufferEntry *matched = nullptr;
                 for (const auto &buf : remote_info.buffers) {
-                    if (buf.numa_node == want_numa) {
+                    if (buf.numa_node == want_tag) {
                         matched = &buf;
                         break;
                     }
                 }
                 if (!matched) {
-                    // Fallback: use the Nth buffer if available, otherwise first
+                    if (target.channel_id > 0) {
+                        fprintf(stderr, "Error: target %s has no published buffer with tag %d "
+                                        "(channel_id=%d, peer_numa=%d). Check --serve on peer.\n",
+                                target.host_id.c_str(), want_tag,
+                                target.channel_id, target.peer_numa);
+                        ret = 1;
+                        goto cleanup;
+                    }
+                    // Legacy fallback: use the Nth buffer if available, otherwise first
                     if (n < remote_info.buffers.size()) {
                         matched = &remote_info.buffers[n];
                     } else {
@@ -1091,7 +1321,7 @@ int main(int argc, char *argv[]) {
                     }
                     if (num_initiator_numas > 1) {
                         printf("  Warning: No remote NUMA %d buffer for target %s, "
-                               "using NUMA %d buffer at 0x%lx\n",
+                               "using buffer with tag %d at 0x%lx\n",
                                want_numa, target.host_id.c_str(),
                                matched->numa_node, (unsigned long)matched->addr);
                     }
@@ -1108,35 +1338,43 @@ int main(int argc, char *argv[]) {
             lengths.push_back(cfg.buffer_size);
         }
 
-        printf("\nAll %zu targets connected and ready.\n", num_targets);
+        printf("\n%sAll %zu targets connected and ready.\n", jp.c_str(), num_targets);
 
         // ---- Run benchmarks for each requested test type ----
         for (TestOpType op : cfg.test_types) {
-            printf("\n>>> Running %s test <<<\n", opTypeName(op));
+            printf("\n%s>>> Running %s test <<<\n", jp.c_str(), opTypeName(op));
 
             // For broadcast, we use buffer_size as the single length
             // (same block sent to all targets), so prepare a matching lengths vector.
             std::vector<size_t> bench_lengths;
             if (op == TestOpType::BROADCAST) {
-                // broadcastAsync takes a single length; the bench function
-                // passes lengths[0] to broadcastAsync, but we still build a
-                // per-target lengths vector so the benchmark can compute data volume.
                 bench_lengths.assign(num_targets, cfg.buffer_size);
             } else {
                 bench_lengths = lengths;
             }
 
+            // The benchmark labels internally use "DRAM" / "HBM (GPU)"; when we
+            // are running inside a multi-job both process we prefix the label
+            // with the job name so the driver script's summary extractor can
+            // attribute every "--- X Y Summary" line to its originating job.
+            std::string dram_label = job_label.empty()
+                ? std::string("DRAM")
+                : ("DRAM@" + job_label);
+            std::string hbm_label = job_label.empty()
+                ? std::string("HBM (GPU)")
+                : ("HBM@" + job_label);
+
             if (run_dram) {
                 ret = runTransferBenchmark(comm, cfg, op, dram_numa_buffers,
                                           host_list, dram_remote_addrs,
-                                          bench_lengths, "DRAM");
+                                          bench_lengths, dram_label.c_str());
                 if (ret != 0) goto cleanup;
             }
 
             if (run_hbm) {
                 ret = runTransferBenchmark(comm, cfg, op, hbm_numa_buffers,
                                           host_list, hbm_remote_addrs,
-                                          bench_lengths, "HBM (GPU)");
+                                          bench_lengths, hbm_label.c_str());
                 if (ret != 0) goto cleanup;
             }
         }
@@ -1145,7 +1383,6 @@ int main(int argc, char *argv[]) {
     ret = 0;
 
 cleanup:
-    // ---- Cleanup ----
 #ifdef USE_CUDA
     if (hbm_buffer) {
         comm.unregisterMemory(hbm_buffer);
@@ -1158,7 +1395,229 @@ cleanup:
             freeDRAM(b.ptr, b.alloc_size);
         }
     }
-    comm.shutdown();
+    return ret;
+}
 
+// =====================================================================
+// Both mode: one MPComm instance serves its --serve buffers AND acts as
+// initiator for every --target. After all benchmarks finish, the process
+// keeps serving its published buffers until SIGINT/SIGTERM is received so
+// that remote peers still transferring against us do not error out.
+// =====================================================================
+
+static int runBothMode(const TestConfig &cfg) {
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+
+    printf("=== MPComm Both Mode ===\n");
+    printf("  Host ID:     %s\n", cfg.host_id.c_str());
+    printf("  TCP Port:    %d\n", cfg.tcp_port);
+    printf("  Serves:      %zu\n", cfg.serves.size());
+    for (const auto &s : cfg.serves) {
+        printf("    channel_id=%d, size=%s, numa=%d\n",
+               s.channel_id, formatBytes(s.size).c_str(), s.numa);
+    }
+    printf("  Targets:     %zu\n", cfg.targets.size());
+    for (const auto &t : cfg.targets) {
+        printf("    %s @ %s:%d", t.host_id.c_str(), t.tcp_addr.c_str(), t.tcp_port);
+        if (t.channel_id > 0) {
+            printf("  (channel_id=%d, peer_numa=%d -> tag %d)",
+                   t.channel_id, t.peer_numa,
+                   encodeBufferTag(t.channel_id, t.peer_numa));
+        }
+        printf("\n");
+    }
+    printf("\n");
+
+    MPComm comm;
+    int ret = comm.init(cfg.host_id, cfg.device, cfg.tcp_port);
+    if (ret != 0) {
+        fprintf(stderr, "MPComm init failed: %d\n", ret);
+        return 1;
+    }
+    printf("[both] Initialized MPComm with %zu NICs, TCP port %d\n",
+           comm.getNumNics(), comm.getTcpPort());
+
+    // ---- Allocate + register + publish all --serve buffers ----
+    std::vector<NumaBuffer> serve_buffers;
+    std::vector<int> serve_tags;  // parallel with serve_buffers
+    const size_t page_size = 4096;
+
+    auto freeServeBuffers = [&]() {
+        for (auto &nb : serve_buffers) {
+            if (nb.ptr) {
+                comm.unpublishBuffer(nb.ptr);
+                comm.unregisterMemory(nb.ptr);
+                if (numa_available() >= 0) {
+                    numa_free(nb.ptr, nb.alloc_size);
+                } else {
+                    free(nb.ptr);
+                }
+                nb.ptr = nullptr;
+            }
+        }
+    };
+
+    for (const auto &s : cfg.serves) {
+        size_t alloc_size = ((s.size + page_size - 1) / page_size) * page_size;
+        NumaBuffer nb;
+        nb.numa_node = s.numa;
+        nb.alloc_size = alloc_size;
+
+        if (numa_available() >= 0 && s.numa >= 0) {
+            nb.ptr = numa_alloc_onnode(alloc_size, s.numa);
+        }
+        if (!nb.ptr) {
+            nb.ptr = aligned_alloc(page_size, alloc_size);
+        }
+        if (!nb.ptr) {
+            fprintf(stderr, "Failed to allocate serve buffer (channel_id=%d, numa=%d)\n",
+                    s.channel_id, s.numa);
+            freeServeBuffers();
+            comm.shutdown();
+            return 1;
+        }
+        memset(nb.ptr, 0xAB, alloc_size);
+
+        ret = comm.registerMemory(nb.ptr, s.size);
+        if (ret != 0) {
+            fprintf(stderr, "registerMemory failed for serve channel_id=%d: %d\n",
+                    s.channel_id, ret);
+            if (numa_available() >= 0) numa_free(nb.ptr, alloc_size);
+            else free(nb.ptr);
+            freeServeBuffers();
+            comm.shutdown();
+            return 1;
+        }
+
+        int tag = encodeBufferTag(s.channel_id, s.numa);
+        ret = comm.publishBuffer(nb.ptr, s.size, tag);
+        if (ret != 0) {
+            fprintf(stderr, "publishBuffer failed for serve channel_id=%d (tag=%d): %d\n",
+                    s.channel_id, tag, ret);
+            comm.unregisterMemory(nb.ptr);
+            if (numa_available() >= 0) numa_free(nb.ptr, alloc_size);
+            else free(nb.ptr);
+            freeServeBuffers();
+            comm.shutdown();
+            return 1;
+        }
+        printf("[both] Published serve buffer: channel_id=%d, numa=%d, tag=%d, "
+               "size=%s, addr=%p\n",
+               s.channel_id, s.numa, tag, formatBytes(s.size).c_str(), nb.ptr);
+        serve_buffers.push_back(nb);
+        serve_tags.push_back(tag);
+    }
+
+    // ---- Start accept thread so remote initiators can connect + query ----
+    ret = comm.startAcceptThread();
+    if (ret != 0) {
+        fprintf(stderr, "Failed to start accept thread: %d\n", ret);
+        freeServeBuffers();
+        comm.shutdown();
+        return 1;
+    }
+
+    // Drivers grep this line to decide when it is safe to let peers connect.
+    // The word "connections" matches the existing target-mode ready marker so
+    // that orchestrators don't need two separate regexes.
+    printf("[both] Ready - waiting for connections... "
+           "(published %zu buffer(s); will now start initiator workload)\n",
+           serve_buffers.size());
+    fflush(stdout);
+
+    // ---- If we have --target entries, run the initiator workload(s). ----
+    // In both mode we partition cfg.targets by their job_label so that each
+    // logical job on this host is benchmarked independently (with its own
+    // connect/query/allocate round). Targets without a label are grouped into
+    // a single anonymous job, preserving legacy initiator semantics.
+    int workload_rc = 0;
+    if (!cfg.targets.empty()) {
+        // Preserve the first-seen order of job labels so output remains
+        // deterministic for the driver script.
+        std::vector<std::string> job_order;
+        for (const auto &t : cfg.targets) {
+            bool seen = false;
+            for (const auto &j : job_order) {
+                if (j == t.job_label) { seen = true; break; }
+            }
+            if (!seen) job_order.push_back(t.job_label);
+        }
+
+        for (const auto &label : job_order) {
+            std::vector<TargetInfo> group;
+            for (const auto &t : cfg.targets) {
+                if (t.job_label == label) group.push_back(t);
+            }
+            printf("\n[both] === Running job '%s' with %zu target(s) ===\n",
+                   label.empty() ? "(default)" : label.c_str(),
+                   group.size());
+            int rc = runInitiatorWorkloadForTargets(comm, cfg, group, label);
+            if (rc != 0) {
+                fprintf(stderr, "[both] Job '%s' failed with rc=%d\n",
+                        label.empty() ? "(default)" : label.c_str(), rc);
+                workload_rc = rc;
+                // Continue running other jobs so we still serve published
+                // buffers; peers may still be reading from us for their own
+                // benchmarks even if our initiator half failed.
+            } else {
+                printf("[both] Job '%s' complete.\n",
+                       label.empty() ? "(default)" : label.c_str());
+            }
+        }
+    } else {
+        printf("[both] No --target specified; skipping initiator workload.\n");
+    }
+
+    // ---- Keep serving published buffers until Ctrl+C ----
+    // Peers that are still performing RDMA transfers against us need our
+    // serve buffers to remain registered and published.
+    printf("\n[both] Benchmarks done. Still serving %zu buffer(s); "
+           "press Ctrl+C to stop.\n", serve_buffers.size());
+    while (!g_stop_requested.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    printf("[both] Shutting down...\n");
+    freeServeBuffers();
+    comm.stopAcceptThread();
+    comm.shutdown();
+    printf("[both] Stopped.\n");
+    return workload_rc;
+}
+
+// =====================================================================
+// Main
+// =====================================================================
+
+int main(int argc, char *argv[]) {
+    TestConfig cfg;
+    if (!parseArgs(argc, argv, cfg)) {
+        return 1;
+    }
+
+    // Dispatch based on mode
+    if (cfg.mode == MODE_TARGET) {
+        return runTargetMode(cfg);
+    }
+    if (cfg.mode == MODE_BOTH) {
+        return runBothMode(cfg);
+    }
+
+    // --- Initiator mode (legacy path; no --serve) ---
+    printf("Initializing MPComm (host=%s, device=%s)...\n",
+           cfg.host_id.c_str(),
+           cfg.device.empty() ? "auto" : cfg.device.c_str());
+
+    MPComm comm;
+    int ret = comm.init(cfg.host_id, cfg.device, 0);
+    if (ret != 0) {
+        fprintf(stderr, "MPComm init failed: %d\n", ret);
+        return 1;
+    }
+    printf("MPComm initialized with %zu NICs\n", comm.getNumNics());
+
+    ret = runInitiatorWorkloadForTargets(comm, cfg, cfg.targets, "");
+    comm.shutdown();
     return ret;
 }

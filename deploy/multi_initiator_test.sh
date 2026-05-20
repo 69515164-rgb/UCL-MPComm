@@ -4,15 +4,15 @@
 #
 # Runs MULTIPLE concurrent test jobs across a pool of machines. Each job has
 # its own initiator and its own set of targets. A physical machine may appear
-# as initiator in one job and as target in other jobs simultaneously (the user
-# is responsible for assigning non-conflicting TCP ports).
+# as initiator in one job and as target in other jobs simultaneously; every
+# host runs exactly one MPComm process bound to its single TCP port.
 #
-# This script does NOT replace multi_node_test.sh. Use it when you need to
-# stress-test asymmetric / mixed-traffic scenarios, e.g.:
+# Hosts (IP / TCP port / default NUMA) are described in hosts.txt. jobs.txt
+# only references hosts by their ID, e.g.:
 #
-#   Job A: machine-1 -> [machine-3, machine-4]
-#   Job B: machine-3 -> [machine-1, machine-2, machine-4]
-#   Job C: machine-4 -> [machine-1, machine-3]      (all jobs run concurrently)
+#   Job A: 1 -> [3, 4]
+#   Job B: 3 -> [1, 2, 4]
+#   Job C: 4 -> [1, 3]      (all jobs run concurrently)
 #
 # Prerequisites:
 #   - deploy_all.sh has been run, OR --skip-deploy is specified along with a
@@ -22,7 +22,7 @@
 #     used as an initiator/target).
 #
 # Usage:
-#   bash multi_initiator_test.sh --jobs jobs.txt [options]
+#   bash multi_initiator_test.sh [--hosts hosts.txt] [--jobs jobs.txt] [options]
 # =============================================================================
 
 set -euo pipefail
@@ -31,6 +31,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
 # ---- Multi-initiator defaults ----
+HOSTS_FILE="${HOSTS_FILE:-${SCRIPT_DIR}/hosts.txt}"
 JOBS_FILE="${JOBS_FILE:-${SCRIPT_DIR}/jobs.txt}"
 SKIP_DEPLOY=false
 STARTUP_WAIT=30
@@ -83,6 +84,7 @@ job whose initiator line names it). A host therefore opens a single TCP port
 for all of its roles.
 
 Options:
+  --hosts FILE          Host inventory file (default: hosts.txt)
   --jobs FILE           Jobs configuration file (default: jobs.txt)
   --binary PATH         Path to scatter_test binary on remote hosts
                         (default: \$TESTS_INSTALL_DIR/build/scatter_test)
@@ -101,25 +103,26 @@ Options:
   --dry-run             Print planned actions without executing
   -h, --help            Show this help
 
+Hosts file format (whitespace-separated columns):
+  ID  IP  TCP_PORT  NUMA_NODES
+Example:
+  1   29.1.1.1  12345  0
+  2   29.1.1.2  12345  0,1
+
 Jobs file format (INI-style, see jobs.txt.example):
   [global]               # optional defaults for all jobs
   size = 1G
   test-type = scatter
 
   [jobA]
-  initiator = 29.1.1.1 12345 0
-  target    = 29.1.1.3 22345 0
-  target    = 29.1.1.4 22345 0
+  initiator = 1
+  target    = 3 4       # multiple targets on one line, space-separated
 
   [jobB]
-  initiator = 29.1.1.3 12346 1
-  target    = 29.1.1.1 22346 1
+  initiator = 3[1]      # bracketed NUMA override (defaults come from hosts.txt)
+  target    = 1[0] 4    # per-target NUMA override; '4' uses its hosts.txt default
   size      = 512M
   test-type = gather
-
-Constraint: every appearance of a given host (whether as initiator or target,
-in any job) must use the SAME TCP port, because all of its roles are served
-by one MPComm instance.
 EOF
     exit 0
 }
@@ -127,6 +130,7 @@ EOF
 # ---- Parse Arguments ----
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --hosts)          HOSTS_FILE="$2"; shift 2 ;;
         --jobs)           JOBS_FILE="$2"; shift 2 ;;
         --binary)         BINARY_PATH="$2"; shift 2 ;;
         --ssh-user)       SSH_USER="$2"; shift 2 ;;
@@ -147,6 +151,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ ! -f "$HOSTS_FILE" ]; then
+    log_error "Hosts file not found: $HOSTS_FILE"
+    exit 1
+fi
+
 if [ ! -f "$JOBS_FILE" ]; then
     log_error "Jobs file not found: $JOBS_FILE"
     log_error "See ${SCRIPT_DIR}/jobs.txt.example for an example."
@@ -157,6 +166,11 @@ if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_JOBS" -lt 1 ]; then
     log_error "--parallel must be a positive integer (got: $PARALLEL_JOBS)"
     exit 1
 fi
+
+# Load host inventory first; jobs.txt references hosts by ID, so we need the
+# HOST_ID_TO_IP / HOST_ID_TO_PORT / HOST_ID_TO_NUMAS maps populated before
+# parse_jobs runs.
+parse_hosts "$HOSTS_FILE"
 
 # =============================================================================
 # Jobs file parser
@@ -199,7 +213,7 @@ _add_tgt_key() {
     local ipport="${key%:*}"
     if [ -n "${_seen_tgt_keys[$ipport]:-}" ]; then
         log_error "Duplicate target (ip:port) across jobs: $ipport"
-        log_error "Each (ip, port) pair must be unique. Fix ports in $JOBS_FILE."
+        log_error "Each (ip, port) pair must be unique. Check $HOSTS_FILE for duplicate entries."
         exit 1
     fi
     _seen_tgt_keys[$ipport]=1
@@ -304,31 +318,88 @@ parse_jobs() {
                     log_error "Line $line_no: job [$section] has more than one initiator"
                     exit 1
                 fi
-                local ip port numas
-                read -r ip port numas <<< "$val"
-                if [ -z "$ip" ] || [ -z "$port" ]; then
-                    log_error "Line $line_no: 'initiator' requires 'IP PORT [NUMAS]'"
+                # Exactly one token, either "ID" or "ID[NUMA]" (NUMA may
+                # contain commas, e.g. 1[0,1]).
+                local _ini_tokens
+                read -r -a _ini_tokens <<< "$val"
+                if [ "${#_ini_tokens[@]}" -eq 0 ]; then
+                    log_error "Line $line_no: 'initiator' requires 'HOST_ID' or 'HOST_ID[NUMA]'"
                     exit 1
                 fi
-                numas="${numas:-0}"
-                cur_ini_ip="$ip"; cur_ini_port="$port"; cur_ini_numas="$numas"
+                if [ "${#_ini_tokens[@]}" -gt 1 ]; then
+                    log_error "Line $line_no: 'initiator' accepts only one host (use 'ID[NUMA]' for NUMA override)"
+                    exit 1
+                fi
+                local _ini_tok="${_ini_tokens[0]}"
+                local hid numa_override
+                if [[ "$_ini_tok" == *"["*"]" ]]; then
+                    hid="${_ini_tok%%[*}"
+                    numa_override="${_ini_tok#*[}"; numa_override="${numa_override%]}"
+                    if [ -z "$numa_override" ]; then
+                        log_error "Line $line_no: empty NUMA override in '$_ini_tok'"
+                        exit 1
+                    fi
+                elif [[ "$_ini_tok" == *"["* || "$_ini_tok" == *"]"* ]]; then
+                    log_error "Line $line_no: malformed initiator token '$_ini_tok' (expected 'ID' or 'ID[NUMA]')"
+                    exit 1
+                else
+                    hid="$_ini_tok"
+                    numa_override=""
+                fi
+                if [ -z "$hid" ]; then
+                    log_error "Line $line_no: 'initiator' requires a host ID"
+                    exit 1
+                fi
+                if [ -z "${HOST_ID_TO_IP[$hid]:-}" ]; then
+                    log_error "Line $line_no: unknown host ID '$hid' (not defined in $HOSTS_FILE)"
+                    exit 1
+                fi
+                cur_ini_ip="${HOST_ID_TO_IP[$hid]}"
+                cur_ini_port="${HOST_ID_TO_PORT[$hid]}"
+                cur_ini_numas="${numa_override:-${HOST_ID_TO_NUMAS[$hid]}}"
                 ;;
             target)
                 if [ "$section" = "global" ]; then
                     log_error "Line $line_no: 'target' not allowed in [global]"
                     exit 1
                 fi
-                local ip port numas
-                read -r ip port numas <<< "$val"
-                if [ -z "$ip" ] || [ -z "$port" ]; then
-                    log_error "Line $line_no: 'target' requires 'IP PORT [NUMAS]'"
+                # Accept one OR multiple targets on the same line. Each token
+                # is either "ID" or "ID[NUMA]" (NUMA may itself contain commas,
+                # e.g. 3[0,1]).
+                local _tgt_tokens
+                read -r -a _tgt_tokens <<< "$val"
+                if [ "${#_tgt_tokens[@]}" -eq 0 ]; then
+                    log_error "Line $line_no: 'target' requires at least one HOST_ID"
                     exit 1
                 fi
-                numas="${numas:-0}"
-                if [ -n "$cur_tgt_specs" ]; then
-                    cur_tgt_specs+="|"
-                fi
-                cur_tgt_specs+="${ip}:${port}:${numas}"
+                local _tok hid numa_override ip port numas
+                for _tok in "${_tgt_tokens[@]}"; do
+                    if [[ "$_tok" == *"["*"]" ]]; then
+                        hid="${_tok%%[*}"
+                        numa_override="${_tok#*[}"; numa_override="${numa_override%]}"
+                        if [ -z "$numa_override" ]; then
+                            log_error "Line $line_no: empty NUMA override in '$_tok'"
+                            exit 1
+                        fi
+                    elif [[ "$_tok" == *"["* || "$_tok" == *"]"* ]]; then
+                        log_error "Line $line_no: malformed target token '$_tok' (expected 'ID' or 'ID[NUMA]')"
+                        exit 1
+                    else
+                        hid="$_tok"
+                        numa_override=""
+                    fi
+                    if [ -z "${HOST_ID_TO_IP[$hid]:-}" ]; then
+                        log_error "Line $line_no: unknown host ID '$hid' (not defined in $HOSTS_FILE)"
+                        exit 1
+                    fi
+                    ip="${HOST_ID_TO_IP[$hid]}"
+                    port="${HOST_ID_TO_PORT[$hid]}"
+                    numas="${numa_override:-${HOST_ID_TO_NUMAS[$hid]}}"
+                    if [ -n "$cur_tgt_specs" ]; then
+                        cur_tgt_specs+="|"
+                    fi
+                    cur_tgt_specs+="${ip}:${port}:${numas}"
+                done
                 ;;
             size|iterations|warmup|batch-size|gpu|both|test-type|buffer-size)
                 # Defense in depth: strip any stray CR from the value before
@@ -392,6 +463,7 @@ echo ""
 echo "============================================================"
 echo "  MPComm Multi-Initiator Test"
 echo "============================================================"
+echo "  Hosts file:    $HOSTS_FILE"
 echo "  Jobs file:     $JOBS_FILE"
 echo "  Jobs:          ${#JOB_NAMES[@]}"
 for name in "${JOB_NAMES[@]}"; do
@@ -452,6 +524,7 @@ cleanup() {
         (
             $(ssh_cmd "$ip") "pkill -f 'mpcomm_both_${port}\.sh' 2>/dev/null; \
                               pkill -f 'scatter_test --mode both --host-id ${ip}:${port}' 2>/dev/null; \
+                              rm -f /tmp/mpcomm_go_${port} 2>/dev/null; \
                               true" 2>/dev/null || true
         ) &
         pids+=($!)
@@ -635,7 +708,7 @@ _require_port() {
         if [ "${HOST_PORT[$ip]}" != "$port" ]; then
             log_error "Host $ip cannot use multiple ports in 'both' mode: "
             log_error "  already bound to port ${HOST_PORT[$ip]}, but $role wants port $port."
-            log_error "  Fix jobs.txt so every appearance of $ip uses the same port."
+            log_error "  This indicates an inconsistency in $HOSTS_FILE (the same IP is listed with different ports)."
             exit 1
         fi
     else
@@ -790,6 +863,11 @@ build_host_both_cmd() {
     cmd+=" --host-id ${ip}:${port}"
     cmd+=" --tcp-port ${port}"
     cmd+=" --num-numas ${numas}"
+    # Global barrier: scatter_test will block here after publishing buffers
+    # until the driver writes the go-file (Step 6.5 below). This guarantees
+    # that no initiator workload starts connecting before *every* peer has
+    # finished publishing and reached the "Ready" marker.
+    cmd+=" --wait-go-file /tmp/mpcomm_go_${port}"
 
     # All --serve entries (order does not matter).
     if [ -n "$serves" ]; then
@@ -902,7 +980,7 @@ EOF
     echo "----- end launcher content -----"
 
     printf '%s\n' "${launcher_body}" \
-        | $(ssh_cmd "$ip") "rm -f '${exitcode_file}' '${pid_file}' '${log_file}'; cat > '${launcher}' && chmod +x '${launcher}'"
+        | $(ssh_cmd "$ip") "rm -f '${exitcode_file}' '${pid_file}' '${log_file}' '/tmp/mpcomm_go_${port}'; cat > '${launcher}' && chmod +x '${launcher}'"
 
     $(ssh_cmd "$ip") "nohup setsid '${launcher}' </dev/null >/dev/null 2>&1 & disown 2>/dev/null; exit 0"
     sleep 1
@@ -1073,6 +1151,28 @@ if ! $ALL_READY && ! $DRY_RUN; then
 fi
 log_info "All ${#HOST_LIST[@]} host(s) ready. Initiator workloads will now run inside each 'both' process."
 echo ""
+
+# =============================================================================
+# Step 6.5: Global barrier - now that every host has reached the "Ready"
+# marker (i.e. has finished publishAll buffers and started its accept thread),
+# touch the go-file on every host so that the scatter_test processes can
+# leave their --wait-go-file barrier and start the initiator workload.
+# =============================================================================
+if ! $DRY_RUN; then
+    log_step "Step 6.5: Releasing global barrier (touching go-file on all hosts)..."
+    _mit_touch_go() {
+        local slot="$1" ip="$2"
+        local port="${HOST_PORT[$ip]}"
+        $(ssh_cmd "$ip") "touch /tmp/mpcomm_go_${port}" >/dev/null 2>&1
+    }
+    go_failed=()
+    parallel_foreach_ip _mit_touch_go "touch_go" go_failed "${HOST_LIST[@]}"
+    if [ ${#go_failed[@]} -gt 0 ]; then
+        log_warn "  Failed to touch go-file on ${#go_failed[@]} host(s); they may stall."
+    fi
+    log_info "Barrier released."
+    echo ""
+fi
 
 # =============================================================================
 # Step 7: Wait for every logical job to finish. A job is finished when its

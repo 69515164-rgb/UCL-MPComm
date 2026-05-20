@@ -5,14 +5,15 @@
 #
 # Sections:
 #   [global]      - Optional. Default test parameters inherited by every job.
-#   [jobs order]  - Optional. Comma/space separated list fixing job execution order.
-#                   If omitted, jobs run in the order they appear below.
+#   [jobs order]  - Optional. Comma/space separated list fixing job execution
+#                   order. If omitted, jobs run in the order they appear below.
 #   [<job_name>]  - One section per job. Each job defines one initiator and
 #                   one or more targets, plus optional per-job parameters.
 #
 # Per-job fields:
-#   initiator = <IP> <PORT> <NUMAS>      (required, exactly one)
-#   target    = <IP> <PORT> <NUMAS>      (required, one or more lines)
+#   initiator = <HOST>                       (required, exactly one)
+#   target    = <HOST> [<HOST> ...]          (required, one or more lines;
+#                                             multiple HOSTs may share a line)
 #   size        = ...    (optional)     override global --size
 #   iterations  = ...    (optional)
 #   warmup      = ...    (optional)
@@ -22,16 +23,28 @@
 #   test-type   = ...    (optional, comma-separated: scatter,gather,broadcast)
 #   buffer-size = ...    (optional)     target-side buffer size
 #
+# HOST syntax:
+#   ID                 - Use the default NUMA spec from hosts.txt.
+#   ID[NUMA]           - Override NUMA for this role only. NUMA may be a
+#                        comma list, e.g. 3[0,1].
+#
 # Notes:
-#   - A single physical machine may appear as initiator in one job AND as
-#     target in other jobs, but each (ip, port) pair must be UNIQUE across
-#     the whole file. Users are responsible for picking non-conflicting ports.
+#   - HOST IDs must match entries in hosts.txt. The IP, TCP port, and default
+#     NUMA spec are looked up there. A single physical machine may appear as
+#     initiator in one job AND as target in other jobs simultaneously, since
+#     each host runs exactly one MPComm process bound to its single TCP port.
+#   - 'target' lines can be repeated AND/OR list multiple hosts on one line.
+#     The two forms are equivalent:
+#         target = 3 4 5
+#         target = 3
+#         target = 4
+#         target = 5
 #   - Lines starting with '#' are comments. Blank lines are ignored.
 #
-# Example: 4-machine cross-traffic scenario
-#   Job A: machine-1 (initiator) -> machine-3, machine-4
-#   Job B: machine-3 (initiator) -> machine-1, machine-2, machine-4
-#   Job C: machine-4 (initiator) -> machine-1, machine-3
+# Example: 4-machine cross-traffic scenario (all referencing hosts.txt IDs)
+#   Job A: 1 (initiator) -> 3, 4
+#   Job B: 3 (initiator) -> 1, 2, 4
+#   Job C: 4 (initiator) -> 1, 3
 # =============================================================================
 
 [global]
@@ -42,19 +55,15 @@ test-type   = scatter
 buffer-size = 2G
 
 [jobA]
-initiator = 29.160.51.1 12345 0
-target    = 29.160.51.3 22345 0
-target    = 29.160.51.4 22345 0
+initiator = 1
+target    = 3 4
 
 [jobB]
-initiator = 29.160.51.3 12346 1
-target    = 29.160.51.1 22346 1
-target    = 29.160.51.2 22346 0
-target    = 29.160.51.4 22346 1
+initiator = 3[1]
+target    = 1[1] 2 4[1]
 size      = 512M
 test-type = gather
 
 [jobC]
-initiator = 29.160.51.4 12347 0
-target    = 29.160.51.1 22347 0
-target    = 29.160.51.3 22347 0
+initiator = 4
+target    = 1 3

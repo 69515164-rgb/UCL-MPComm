@@ -211,14 +211,26 @@ info "Downloading $WHL_NAME ..."
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
+info "URL: $WHL_URL"
+
+DL_RC=0
 if [[ "$DL_CMD" == "wget" ]]; then
-    wget -q --show-progress -O "$TMPDIR/$WHL_NAME" "$WHL_URL"
+    # NOTE: do NOT use -q here, otherwise real errors (404 / DNS / SSL) get
+    # swallowed and `set -e` makes the script exit silently.
+    wget --show-progress -O "$TMPDIR/$WHL_NAME" "$WHL_URL" || DL_RC=$?
 else
-    curl -fL --progress-bar -o "$TMPDIR/$WHL_NAME" "$WHL_URL"
+    curl -fL --progress-bar -o "$TMPDIR/$WHL_NAME" "$WHL_URL" || DL_RC=$?
 fi
 
-if [[ ! -f "$TMPDIR/$WHL_NAME" ]]; then
-    error "Download failed."
+if [[ $DL_RC -ne 0 || ! -s "$TMPDIR/$WHL_NAME" ]]; then
+    error "Download failed (rc=$DL_RC)."
+    error "  URL: $WHL_URL"
+    error "  Hint: try running the command manually to see the real error:"
+    if [[ "$DL_CMD" == "wget" ]]; then
+        error "    wget -v -O /tmp/test.whl '$WHL_URL'"
+    else
+        error "    curl -vL -o /tmp/test.whl '$WHL_URL'"
+    fi
     exit 1
 fi
 

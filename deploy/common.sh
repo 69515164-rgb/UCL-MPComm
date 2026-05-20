@@ -89,8 +89,22 @@ resolve_mpcomm_version() {
 }
 
 # ---- Read Hosts File ----
-# Populates: INITIATOR_IP, INITIATOR_PORT, INITIATOR_NUMAS,
-#             TARGET_IPS[], TARGET_PORTS[], TARGET_NUMA_LIST[], NUM_TARGETS
+# Hosts file format (4 columns, whitespace-separated):
+#   ID   IP   TCP_PORT   NUMA_NODES
+# - ID is a short label unique within the file. Can be any token that is
+#   NOT an IPv4 address (e.g. "1", "n1", "gpu-a"). Other config files
+#   (jobs.txt) reference hosts by ID.
+# - TCP_PORT may be omitted or written as "-" to fall back to 12345.
+# - NUMA_NODES may be omitted or "-" to fall back to "0". Multiple nodes are
+#   comma-separated, e.g. "0,1".
+#
+# Populates the following globals:
+#   INITIATOR_ID, INITIATOR_IP, INITIATOR_PORT, INITIATOR_NUMAS
+#   TARGET_IDS[], TARGET_IPS[], TARGET_PORTS[], TARGET_NUMA_LIST[], NUM_TARGETS
+#   HOST_IDS[]                 : ordered list of every ID (initiator first)
+#   HOST_ID_TO_IP[id]          : ID -> IP
+#   HOST_ID_TO_PORT[id]        : ID -> TCP port
+#   HOST_ID_TO_NUMAS[id]       : ID -> NUMA spec (e.g. "0" or "0,1")
 parse_hosts() {
     local hosts_file="${1:-$HOSTS_FILE}"
 
@@ -99,28 +113,62 @@ parse_hosts() {
         exit 1
     fi
 
+    INITIATOR_ID=""
     INITIATOR_IP=""
     INITIATOR_PORT=""
     INITIATOR_NUMAS=""
+    declare -g -a TARGET_IDS=()
     declare -g -a TARGET_IPS=()
     declare -g -a TARGET_PORTS=()
     declare -g -a TARGET_NUMA_LIST=()
+    declare -g -a HOST_IDS=()
+    declare -g -A HOST_ID_TO_IP=()
+    declare -g -A HOST_ID_TO_PORT=()
+    declare -g -A HOST_ID_TO_NUMAS=()
 
+    local line_no=0
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip comments and empty lines
+        line_no=$((line_no + 1))
+        # Strip trailing CR (Windows line endings) then comments and trim.
+        line="${line%$'\r'}"
         line=$(echo "$line" | sed 's/#.*//' | xargs)
         [ -z "$line" ] && continue
 
-        # Parse: IP  PORT  NUMAS
-        read -r ip port numas <<< "$line"
-        port="${port:-12345}"
-        numas="${numas:-0}"
+        # Parse: ID  IP  PORT  NUMAS
+        local id ip port numas
+        read -r id ip port numas <<< "$line"
+
+        if [ -z "$id" ] || [ -z "$ip" ]; then
+            log_error "$hosts_file:$line_no: expected 'ID IP [PORT] [NUMAS]', got: $line"
+            exit 1
+        fi
+        # Sanity: ID must not look like an IPv4 address (helps catch users who
+        # forgot to upgrade an old-format hosts.txt).
+        if [[ "$id" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_error "$hosts_file:$line_no: first column must be a host ID (label), not an IP."
+            log_error "  New format is: ID IP PORT NUMAS  (e.g. '1 29.1.1.1 12345 0')"
+            exit 1
+        fi
+        if [ -n "${HOST_ID_TO_IP[$id]:-}" ]; then
+            log_error "$hosts_file:$line_no: duplicate host ID '$id'"
+            exit 1
+        fi
+        # Optional defaults: '-' or empty -> fallback.
+        if [ -z "$port" ] || [ "$port" = "-" ]; then port="12345"; fi
+        if [ -z "$numas" ] || [ "$numas" = "-" ]; then numas="0"; fi
+
+        HOST_IDS+=("$id")
+        HOST_ID_TO_IP[$id]="$ip"
+        HOST_ID_TO_PORT[$id]="$port"
+        HOST_ID_TO_NUMAS[$id]="$numas"
 
         if [ -z "$INITIATOR_IP" ]; then
+            INITIATOR_ID="$id"
             INITIATOR_IP="$ip"
             INITIATOR_PORT="$port"
             INITIATOR_NUMAS="$numas"
         else
+            TARGET_IDS+=("$id")
             TARGET_IPS+=("$ip")
             TARGET_PORTS+=("$port")
             TARGET_NUMA_LIST+=("$numas")

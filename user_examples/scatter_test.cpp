@@ -30,11 +30,17 @@
 //   # Multi-NUMA initiator (dual NUMA buffers, each NUMA sends via its local NICs):
 //   ./scatter_test --target t1:10.0.0.1:12345 --target t2:10.0.0.2:12345 --num-numas 0,1
 //
-//   # Run specific test types (default: all):
+//   # Run specific test types (default: scatter,gather,broadcast):
 //   ./scatter_test --target t1:10.0.0.1:12345 --test-type scatter
 //   ./scatter_test --target t1:10.0.0.1:12345 --test-type gather
 //   ./scatter_test --target t1:10.0.0.1:12345 --test-type broadcast
 //   ./scatter_test --target t1:10.0.0.1:12345 --test-type scatter,gather,broadcast
+//
+//   # Single-target put / get (RDMA WRITE / READ to/from one peer):
+//   ./scatter_test --target t1:10.0.0.1:12345 --test-type put
+//   ./scatter_test --target t1:10.0.0.1:12345 --test-type get
+//   ./scatter_test --target t1:10.0.0.1:12345 --test-type put,get
+//   # NOTE: put and get require exactly one --target.
 //
 // Both mode (a single process simultaneously acts as target for some peers
 // and as initiator toward other peers, sharing one MPComm instance):
@@ -81,6 +87,7 @@
 #include <sstream>
 #include <numa.h>
 #include <numaif.h>
+#include <sys/stat.h>
 
 #ifdef USE_CUDA
 #include <cuda.h>
@@ -96,6 +103,8 @@ enum class TestOpType {
     SCATTER = 0,
     GATHER,
     BROADCAST,
+    PUT,
+    GET,
 };
 
 static const char *opTypeName(TestOpType op) {
@@ -103,8 +112,15 @@ static const char *opTypeName(TestOpType op) {
         case TestOpType::SCATTER:   return "scatter";
         case TestOpType::GATHER:    return "gather";
         case TestOpType::BROADCAST: return "broadcast";
+        case TestOpType::PUT:       return "put";
+        case TestOpType::GET:       return "get";
     }
     return "unknown";
+}
+
+// put/get only support a single (initiator, target) pair.
+static inline bool isSingleTargetOp(TestOpType op) {
+    return op == TestOpType::PUT || op == TestOpType::GET;
 }
 
 // =====================================================================
@@ -190,6 +206,12 @@ struct TestConfig {
     // subsequent --target entries get attached to that logical job. Reset to
     // empty when a new --job is seen.
     std::string _current_job_label;
+
+    // Optional: after publishing buffers and reaching the "Ready" marker,
+    // block until this file appears on the local filesystem. Drivers use
+    // this as a global barrier so that initiator workloads do not start
+    // connecting before every peer has finished publishing.
+    std::string wait_go_file;
 };
 
 // Parse size string with optional suffix (K/M/G/T)
@@ -293,8 +315,10 @@ static void printUsage(const char *prog) {
     printf("  --batch-size N               Async requests per batch (default: 1)\n");
     printf("  --gpu DEVICE_ID              GPU device for HBM test (default: -1, CPU only)\n");
     printf("  --both                       Run both DRAM and HBM tests\n");
-    printf("  --test-type TYPES            Comma-separated test types: scatter,gather,broadcast\n");
-    printf("                               (default: all three)\n");
+    printf("  --test-type TYPES            Comma-separated test types:\n");
+    printf("                               scatter,gather,broadcast,put,get\n");
+    printf("                               (default: scatter,gather,broadcast)\n");
+    printf("                               NOTE: put/get require exactly one --target.\n");
     printf("\nBoth Mode Options:\n");
     printf("  --serve CHANNEL_ID:SIZE:NUMA Publish a target buffer tagged by CHANNEL_ID on NUMA.\n");
     printf("                               Repeatable. Each CHANNEL_ID must be unique in this\n");
@@ -303,6 +327,10 @@ static void printUsage(const char *prog) {
     printf("                               job. Each job is benchmarked independently and its\n");
     printf("                               log lines are prefixed with '[job=LABEL] '. An empty\n");
     printf("                               LABEL clears the grouping.\n");
+    printf("  --wait-go-file PATH          After publishing buffers and printing the 'Ready'\n");
+    printf("                               marker, block until PATH appears on the local\n");
+    printf("                               filesystem before starting the initiator workload.\n");
+    printf("                               Used by orchestrators as a global barrier.\n");
     printf("\nExamples:\n");
     printf("  # Target (remote host):\n");
     printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G\n", prog);
@@ -480,12 +508,19 @@ static bool parseArgs(int argc, char *argv[], TestConfig &cfg) {
                     cfg.test_types.push_back(TestOpType::GATHER);
                 } else if (token == "broadcast") {
                     cfg.test_types.push_back(TestOpType::BROADCAST);
+                } else if (token == "put") {
+                    cfg.test_types.push_back(TestOpType::PUT);
+                } else if (token == "get") {
+                    cfg.test_types.push_back(TestOpType::GET);
                 } else {
                     fprintf(stderr, "Error: unknown test type '%s' "
-                            "(must be scatter, gather, or broadcast)\n", token.c_str());
+                            "(must be scatter, gather, broadcast, put, or get)\n",
+                            token.c_str());
                     return false;
                 }
             }
+        } else if (arg == "--wait-go-file" && i + 1 < argc) {
+            cfg.wait_go_file = argv[++i];
         } else if (arg == "--verbose" || arg == "-v") {
             cfg.verbose = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -827,6 +862,20 @@ static TransferHandle issueTransferAsync(
             // Use the first element of lengths as the broadcast length.
             if (lengths.empty()) return INVALID_TRANSFER_HANDLE;
             return comm.broadcastAsync(local_addr, lengths[0], host_list, remote_addrs);
+        case TestOpType::PUT:
+            // put: single (initiator, target) pair, RDMA WRITE local -> remote.
+            if (host_list.empty() || remote_addrs.empty() || lengths.empty()) {
+                return INVALID_TRANSFER_HANDLE;
+            }
+            return comm.putAsync(local_addr, host_list[0],
+                                 remote_addrs[0], lengths[0]);
+        case TestOpType::GET:
+            // get: single (initiator, target) pair, RDMA READ remote -> local.
+            if (host_list.empty() || remote_addrs.empty() || lengths.empty()) {
+                return INVALID_TRANSFER_HANDLE;
+            }
+            return comm.getAsync(local_addr, host_list[0],
+                                 remote_addrs[0], lengths[0]);
     }
     return INVALID_TRANSFER_HANDLE;
 }
@@ -857,14 +906,26 @@ static int runTransferBenchmark(
             op_name_upper = "Broadcast";
             op_direction = "local -> all remotes (same data)";
             break;
+        case TestOpType::PUT:
+            op_name_upper = "Put";
+            op_direction = "local -> remote (single target, RDMA WRITE)";
+            break;
+        case TestOpType::GET:
+            op_name_upper = "Get";
+            op_direction = "remote -> local (single target, RDMA READ)";
+            break;
     }
 
     // For broadcast, the effective per-NUMA size is length * num_targets
-    // (same data sent to each target), but the "data moved" is length * num_targets.
+    // (same data sent to each target). For put/get there is exactly one
+    // target so the per-NUMA size is simply lengths[0]. For scatter/gather
+    // it is the sum of per-target lengths.
     size_t per_numa_size = 0;
     if (op_type == TestOpType::BROADCAST) {
         // Broadcast sends the same block to all targets
         per_numa_size = (lengths.empty() ? 0 : lengths[0]) * host_list.size();
+    } else if (op_type == TestOpType::PUT || op_type == TestOpType::GET) {
+        per_numa_size = (lengths.empty() ? 0 : lengths[0]);
     } else {
         for (size_t l : lengths) per_numa_size += l;
     }
@@ -1246,10 +1307,39 @@ static int runInitiatorWorkloadForTargets(MPComm &comm,
                    target.tcp_addr.c_str(), target.tcp_port,
                    target.channel_id > 0 ? " [channel-tagged]" : "");
 
-            ret = comm.connect(target.host_id, target.tcp_addr, target.tcp_port);
+            // Retry connect to tolerate the target side not yet being
+            // ready to accept (e.g. peer process still publishing buffers).
+            // Defaults: 10 attempts, 1000 ms interval. Override with env vars
+            //   MPCOMM_CONNECT_RETRIES, MPCOMM_CONNECT_RETRY_INTERVAL_MS.
+            int max_retries = 10;
+            int retry_interval_ms = 1000;
+            if (const char* s = std::getenv("MPCOMM_CONNECT_RETRIES")) {
+                int v = std::atoi(s);
+                if (v > 0) max_retries = v;
+            }
+            if (const char* s = std::getenv("MPCOMM_CONNECT_RETRY_INTERVAL_MS")) {
+                int v = std::atoi(s);
+                if (v > 0) retry_interval_ms = v;
+            }
+
+            ret = -1;
+            for (int attempt = 1; attempt <= max_retries; ++attempt) {
+                ret = comm.connect(target.host_id, target.tcp_addr, target.tcp_port);
+                if (ret == 0) break;
+                if (attempt < max_retries) {
+                    fprintf(stderr,
+                            "%sConnect to target[%zu] %s failed (rc=%d), "
+                            "attempt %d/%d, retrying in %d ms...\n",
+                            jp.c_str(), t, target.host_id.c_str(), ret,
+                            attempt, max_retries, retry_interval_ms);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(retry_interval_ms));
+                }
+            }
             if (ret != 0) {
-                fprintf(stderr, "%sFailed to connect to target[%zu] %s: %d\n",
-                        jp.c_str(), t, target.host_id.c_str(), ret);
+                fprintf(stderr,
+                        "%sFailed to connect to target[%zu] %s after %d attempts: %d\n",
+                        jp.c_str(), t, target.host_id.c_str(), max_retries, ret);
                 goto cleanup;
             }
             printf("%sConnected to %s.\n", jp.c_str(), target.host_id.c_str());
@@ -1342,13 +1432,28 @@ static int runInitiatorWorkloadForTargets(MPComm &comm,
 
         // ---- Run benchmarks for each requested test type ----
         for (TestOpType op : cfg.test_types) {
+            // put/get only support exactly one target. Skip with a clear
+            // warning instead of failing the entire run, so a mixed
+            // --test-type list (e.g. "scatter,put") still completes the
+            // multi-target operations.
+            if (isSingleTargetOp(op) && num_targets != 1) {
+                fprintf(stderr,
+                        "%sWarning: skipping %s test - it requires exactly one "
+                        "--target (got %zu).\n",
+                        jp.c_str(), opTypeName(op), num_targets);
+                continue;
+            }
+
             printf("\n%s>>> Running %s test <<<\n", jp.c_str(), opTypeName(op));
 
             // For broadcast, we use buffer_size as the single length
             // (same block sent to all targets), so prepare a matching lengths vector.
+            // For put/get, we use a single-element vector.
             std::vector<size_t> bench_lengths;
             if (op == TestOpType::BROADCAST) {
                 bench_lengths.assign(num_targets, cfg.buffer_size);
+            } else if (op == TestOpType::PUT || op == TestOpType::GET) {
+                bench_lengths.assign(1, cfg.buffer_size);
             } else {
                 bench_lengths = lengths;
             }
@@ -1525,6 +1630,38 @@ static int runBothMode(const TestConfig &cfg) {
            "(published %zu buffer(s); will now start initiator workload)\n",
            serve_buffers.size());
     fflush(stdout);
+
+    // ---- Optional global barrier: wait for driver to release us. ----
+    // The driver writes the go-file only after it has confirmed that every
+    // host has reached the "Ready" marker above. This guarantees that no
+    // initiator starts connecting before all remote targets have finished
+    // publishing their buffers and started their accept thread.
+    if (!cfg.wait_go_file.empty()) {
+        printf("[both] Waiting for go-file: %s\n", cfg.wait_go_file.c_str());
+        fflush(stdout);
+        const auto wait_start = std::chrono::steady_clock::now();
+        while (true) {
+            struct stat st;
+            if (::stat(cfg.wait_go_file.c_str(), &st) == 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - wait_start).count();
+            // Print a heartbeat every 30s so the driver-side log shows progress.
+            if (elapsed > 0 && (elapsed % 30) == 0) {
+                static long last_print = -1;
+                if (elapsed != last_print) {
+                    printf("[both] Still waiting for go-file (%lds)...\n",
+                           (long)elapsed);
+                    fflush(stdout);
+                    last_print = elapsed;
+                }
+            }
+        }
+        printf("[both] Go-file detected, releasing initiator workload.\n");
+        fflush(stdout);
+    }
 
     // ---- If we have --target entries, run the initiator workload(s). ----
     // In both mode we partition cfg.targets by their job_label so that each

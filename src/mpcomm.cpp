@@ -334,7 +334,7 @@ struct TransferContext {
     struct PxnCopyingChunk {
         size_t chunk_idx;                   // Original chunk index in TransferContext
         uint64_t request_id;                // Copy thread request ID
-        CUdeviceptr proxy_addr;             // Address in proxy buffer
+        uint64_t proxy_addr;             // Address in proxy buffer (CUdeviceptr-compatible)
         size_t length;                      // Chunk length (for proxy buffer free)
         std::atomic<bool>* copy_done_flag;  // Set by CUDA callback when copy completes
         bool result_received;               // Whether PxnCopyResult has been received
@@ -3952,6 +3952,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     // use static data partitioning: front X% via direct NICs, back (100-X)%
     // via NVLink proxy GPUs (one proxy GPU per proxy NIC).
     bool use_pxn = false;
+#ifdef USE_CUDA
     int gpu_device_id = -1;
     if (pxn_manager_.isEnabled() && !pcie_affine.empty() &&
         direction == TransferDirection::SCATTER) {
@@ -4085,6 +4086,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
                     // (e.g. if the user allocated memory via a different context).
                     // Using the wrong src_ctx in cuMemcpyPeerAsync causes the driver
                     // to fall back to a slow CPU staging path (~30 GB/s vs ~384 GB/s).
+#ifdef USE_CUDA
                     CUcontext src_buf_ctx = nullptr;
                     CUresult ctx_res = cuPointerGetAttribute(
                         &src_buf_ctx, CU_POINTER_ATTRIBUTE_CONTEXT,
@@ -4141,6 +4143,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
                         MPCOMM_LOG_WARN("MPComm PXN: cuPointerGetAttribute(CONTEXT) failed: %d, "
                                        "falling back to primary context\n", ctx_res);
                     }
+#endif  // USE_CUDA
                     ctx->pxn_direct_nic_indices = pcie_affine;
                     ctx->pxn_proxy_nic_indices = proxy_nics;
 
@@ -4213,6 +4216,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
             }
         }
     }
+#endif  // USE_CUDA
 
     if (!use_pxn) {
         if (!pcie_affine.empty()) {
@@ -5228,7 +5232,9 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
 
         // Poll PXN copy results ONCE and dispatch to all active transfers.
         // This must happen before the per-context loop to avoid losing results.
+#ifdef USE_CUDA
         dispatch_pxn_copy_results_fn();
+#endif
 
         for (auto& ac : active_contexts) {
             TransferContext& ctx = *ac.ctx;
@@ -5272,13 +5278,13 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             // If a proxy NIC is selected, the chunk is assigned to its pipeline for
             // NVLink copy + deferred RDMA posting. Interleave proxy RDMA posting
             // periodically to keep proxy NICs' RDMA queues fed.
-            static constexpr size_t kPostBatchBeforeProxyRdma = 16;
             size_t post_batch_count = 0;
             auto t_direct0 = std::chrono::steady_clock::now();
             while (ctx.next_chunk_idx.load() < total_chunks) {
                 size_t chunk_idx = ctx.next_chunk_idx.load();
 
 #ifdef USE_CUDA
+                static constexpr size_t kPostBatchBeforeProxyRdma = 16;
                 // PXN: interleave proxy RDMA posting after every batch of posts.
                 if (ctx.pxn_enabled && post_batch_count >= kPostBatchBeforeProxyRdma &&
                     !ctx.finished.load()) {

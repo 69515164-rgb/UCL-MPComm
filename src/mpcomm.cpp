@@ -685,6 +685,7 @@ private:
     int listen_fd_;
     size_t max_rdma_transfer_size_;
     size_t qps_per_connection_;
+    int gid_index_;
 
     std::vector<NumaUniquePtr<NicContext>> nic_contexts_;
 
@@ -811,6 +812,7 @@ static const char* kMaxIdleSpinsEnvVar = "MPCOMM_MAX_IDLE_SPINS";
 static const char* kMaxSendWREnvVar = "MPCOMM_MAX_SEND_WR";
 static const char* kMaxOutstandingPerQPEnvVar = "MPCOMM_MAX_OUTSTANDING_PER_QP";
 static const char* kTransferStatsIntervalEnvVar = "MPCOMM_TRANSFER_STATS_INTERVAL";
+static const char* kGidIndexEnvVar = "MPCOMM_GID_INDEX";
 
 // Constants for QP setup
 static const uint8_t kMaxHopLimit = 16;
@@ -883,6 +885,7 @@ MPComm::Impl::Impl()
       listen_fd_(-1),
       max_rdma_transfer_size_(MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE),
       qps_per_connection_(MPCOMM_DEFAULT_QPS_PER_CONNECTION),
+      gid_index_(MPCOMM_DEFAULT_GID_INDEX),
       accept_running_(false),
       num_numa_nodes_(0),
       total_workers_(0),
@@ -922,6 +925,22 @@ MPComm::Impl::Impl()
             MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 1-64), using default %zu\n",
                     kQpsPerConnectionEnvVar, env_val,
                     qps_per_connection_);
+        }
+    }
+
+    // Read GID index from environment variable
+    // -1 means auto-select the first non-zero GID on each NIC.
+    env_val = std::getenv(kGidIndexEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        long val = strtol(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0' && val >= -1 && val <= 255) {
+            gid_index_ = static_cast<int>(val);
+            MPCOMM_LOG_INFO("MPComm: Using GID index from %s: %d\n",
+                   kGidIndexEnvVar, gid_index_);
+        } else {
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be -1 or 0-255), using default %d\n",
+                    kGidIndexEnvVar, env_val, gid_index_);
         }
     }
 
@@ -1424,7 +1443,7 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
         ctx->pd = nullptr;
         ctx->cq = nullptr;
         ctx->port = 1;
-        ctx->gid_index = 3;  // Default to GID index 3 (RoCEv2)
+        ctx->gid_index = gid_index_;
 
         int ret = setupNicContext(name, *ctx);
         if (ret == 0) {
@@ -6581,4 +6600,4 @@ int MPComm::tmaScatter(void *gpu_src, const long *indices,
                              block_size, max_sm_count, static_cast<int>(mode));
 }
 
-}  // namespace mpcomm
+}  

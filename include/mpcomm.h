@@ -76,6 +76,11 @@ static constexpr size_t MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE = 1ULL << 30;
 // Can be configured via environment variable MPCOMM_QPS_PER_CONNECTION
 static constexpr size_t MPCOMM_DEFAULT_QPS_PER_CONNECTION = 1;
 
+// Default GID index used for RoCE path setup (default: 3)
+// Can be overridden via environment variable MPCOMM_GID_INDEX.
+// Setting MPCOMM_GID_INDEX=-1 enables auto-selection of the first non-zero GID.
+static constexpr int MPCOMM_DEFAULT_GID_INDEX = 3;
+
 // NUMA topology information for a single NUMA node
 struct NumaTopology {
     int numa_node;

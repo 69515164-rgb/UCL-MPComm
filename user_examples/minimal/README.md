@@ -114,6 +114,7 @@ python3 hello_mpcomm.py initiator 29.160.51.248:0 \
 |---|---|
 | `MPCOMM_NIC_FILTER` | 允许使用的 RDMA 网卡列表，逗号分隔（例如 `mlx5_bond_1,mlx5_bond_2`） |
 | `MPCOMM_QPS_PER_CONNECTION` | 每个连接每块网卡上的 QP 数量（默认 1） |
+| `MPCOMM_GID_INDEX` | RoCE 使用的 GID index（默认 `3`）；设为 `-1` 时自动选择第一个非零 GID |
 | `MPCOMM_LOG_LEVEL` | 日志级别：`error` / `warn` / `info` / `debug` |
 
 示例：
@@ -121,6 +122,7 @@ python3 hello_mpcomm.py initiator 29.160.51.248:0 \
 ```bash
 export MPCOMM_NIC_FILTER="mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4"
 export MPCOMM_QPS_PER_CONNECTION=4
+export MPCOMM_GID_INDEX=3
 export MPCOMM_LOG_LEVEL=info
 ```
 

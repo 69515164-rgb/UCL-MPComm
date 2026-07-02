@@ -24,6 +24,16 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Installed header layout differs between standalone CMake installs and the
+# pip/scikit-build wheel layout. The exported targets must publish the actual
+# installed include path, otherwise consumers of the wheel see a broken
+# INTERFACE_INCLUDE_DIRECTORIES such as <site-packages>/include.
+if(SKBUILD)
+    set(MPCOMM_INSTALL_INCLUDEDIR "mpcomm/include")
+else()
+    set(MPCOMM_INSTALL_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+
 # Find ibverbs
 find_library(IBVERBS_LIBRARY ibverbs REQUIRED)
 find_path(IBVERBS_INCLUDE_DIR infiniband/verbs.h REQUIRED)
@@ -114,7 +124,7 @@ set_target_properties(mpcomm_static PROPERTIES
 
 target_include_directories(mpcomm_static PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    $<INSTALL_INTERFACE:${MPCOMM_INSTALL_INCLUDEDIR}>
     ${IBVERBS_INCLUDE_DIR}
 )
 target_include_directories(mpcomm_static PRIVATE
@@ -140,7 +150,7 @@ set_target_properties(mpcomm_shared PROPERTIES
 
 target_include_directories(mpcomm_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    $<INSTALL_INTERFACE:${MPCOMM_INSTALL_INCLUDEDIR}>
     ${IBVERBS_INCLUDE_DIR}
 )
 target_include_directories(mpcomm_shared PRIVATE

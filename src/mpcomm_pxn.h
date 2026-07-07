@@ -41,7 +41,7 @@ namespace mpcomm {
 
 template <typename T, size_t Capacity>
 class SpscQueue {
-public:
+ public:
     SpscQueue() : head_(0), tail_(0) {}
 
     // Non-copyable, non-movable
@@ -83,7 +83,7 @@ public:
         return (t >= h) ? (t - h) : (Capacity + 1 - h + t);
     }
 
-private:
+ private:
     T buffer_[Capacity + 1];  // One extra slot for full/empty disambiguation
     alignas(64) std::atomic<size_t> head_;
     alignas(64) std::atomic<size_t> tail_;
@@ -119,7 +119,7 @@ static constexpr size_t kPxnStreamsPerThread = 8;
 // Information about a single GPU's topology
 struct PxnGpuInfo {
     int device_id;                          // CUDA device ordinal
-    std::vector<size_t> direct_nic_indices; // PCIe-affine NIC indices
+    std::vector<size_t> direct_nic_indices;  // PCIe-affine NIC indices
     std::vector<int> nvlink_peers;          // NVLink-connected peer GPU device IDs
 };
 
@@ -296,7 +296,7 @@ struct PxnCopyThreadState {
 // =====================================================================
 
 class PxnManager {
-public:
+ public:
     PxnManager();
     ~PxnManager();
 
@@ -373,7 +373,7 @@ public:
     // Store lkey mapping (called during proxy buffer registration)
     void setProxyLkey(int proxy_gpu_device_id, size_t nic_index, uint32_t lkey);
 
-private:
+ private:
     // Discover NVLink topology between GPUs
     bool discoverNvlinkTopology();
 
@@ -421,7 +421,7 @@ private:
 
 // Stub PxnManager when CUDA is not available
 class PxnManager {
-public:
+ public:
     PxnManager() {}
     ~PxnManager() {}
     bool init(size_t, std::function<std::vector<size_t>(int)>) { return false; }

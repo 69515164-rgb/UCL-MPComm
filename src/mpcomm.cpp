@@ -366,7 +366,7 @@ struct TransferContext {
         size_t total_bytes_assigned;  // Total bytes assigned to this pipeline
         size_t total_bytes_copied;    // Total bytes copied via NVLink
         size_t total_chunks_posted;   // Total RDMA chunks posted from this pipeline
-        size_t total_copies_submitted; // Total NVLink copy requests submitted
+        size_t total_copies_submitted;  // Total NVLink copy requests submitted
     };
     std::vector<PxnProxyPipeline> pxn_proxy_pipelines;
     std::vector<size_t> pxn_direct_nic_indices;   // Direct NIC indices for this transfer
@@ -380,7 +380,7 @@ struct TransferContext {
 
     // PXN per-round timing aggregates
     size_t pxn_diag_proxy_chunks_timed;  // Number of proxy chunks with timing data
-    double pxn_diag_submit_to_result_us; // Sum of (t_result_recv - t_submit) across all proxy chunks
+    double pxn_diag_submit_to_result_us;  // Sum of (t_result_recv - t_submit) across all proxy chunks
     double pxn_diag_result_to_event_us;  // Sum of (t_event_done - t_result_recv) across all proxy chunks
     double pxn_diag_event_to_rdma_us;    // Sum of (t_rdma_posted - t_event_done) across all proxy chunks
     double pxn_diag_submit_to_rdma_us;   // Sum of (t_rdma_posted - t_submit) across all proxy chunks
@@ -464,8 +464,7 @@ struct TransferContext {
         , pxn_diag_ns_cq_polling(0)
         , pxn_bench_sequential(false)
         , pxn_bench_copies_done(false)
-        , pxn_proxy_nvlink_alpha(1.0)
-    {
+        , pxn_proxy_nvlink_alpha(1.0) {
         memset(pxn_is_proxy_nic, 0, sizeof(pxn_is_proxy_nic));
         memset(per_nic_posted, 0, sizeof(per_nic_posted));
         memset(per_nic_completed, 0, sizeof(per_nic_completed));
@@ -538,7 +537,7 @@ struct LockFreeQueue {
 };
 
 class MPComm::Impl {
-public:
+ public:
     Impl();
     ~Impl();
 
@@ -617,7 +616,7 @@ public:
                    uintptr_t dram_dev_ptr, int num_blocks, int block_size,
                    int max_sm_count, int mode);
 
-private:
+ private:
     // Topology discovery
     int getNumaNodeCount();
     int readNicNumaNode(const std::string& nic_name);
@@ -825,7 +824,7 @@ static const int kMaxSGE = 1;
 // QP UDP source port list for multi-path ECMP load balancing
 // These ports are used in round-robin fashion for each QP
 #if defined(USE_BNXT) || defined(USE_MLNX)
-static const uint16_t qp_port_list[] = {60000,60051,57663,57804};
+static const uint16_t qp_port_list[] = {60000, 60051, 57663, 57804};
 static std::atomic<int> qp_port_index{0};
 #endif
 
@@ -843,13 +842,13 @@ std::string gidToString(const union ibv_gid &gid) {
     snprintf(buf, sizeof(buf),
              "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:"
              "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
-             (unsigned)gid.raw[0], (unsigned)gid.raw[1], 
+             (unsigned)gid.raw[0], (unsigned)gid.raw[1],
              (unsigned)gid.raw[2], (unsigned)gid.raw[3],
-             (unsigned)gid.raw[4], (unsigned)gid.raw[5], 
+             (unsigned)gid.raw[4], (unsigned)gid.raw[5],
              (unsigned)gid.raw[6], (unsigned)gid.raw[7],
-             (unsigned)gid.raw[8], (unsigned)gid.raw[9], 
+             (unsigned)gid.raw[8], (unsigned)gid.raw[9],
              (unsigned)gid.raw[10], (unsigned)gid.raw[11],
-             (unsigned)gid.raw[12], (unsigned)gid.raw[13], 
+             (unsigned)gid.raw[12], (unsigned)gid.raw[13],
              (unsigned)gid.raw[14], (unsigned)gid.raw[15]);
     return std::string(buf);
 }
@@ -1124,11 +1123,11 @@ int MPComm::Impl::init(const std::string &local_host_id,
     }
 
     initialized_ = true;
-    
+
     // Discover NUMA topology and print results
     discoverTopology();
     printTopologyInfo();
-    
+
     // Start per-NUMA worker threads for fully async transfer processing
     // Multiple workers per NUMA node, each bound to different CPUs
     int numa_count = getNumaNodeCount();
@@ -1137,19 +1136,19 @@ int MPComm::Impl::init(const std::string &local_host_id,
         num_numa_nodes_ = kMaxNumaNodes;
     }
     total_workers_ = num_numa_nodes_ * kWorkersPerNuma;
-    
+
     // Initialize lock-free queues for each worker
     worker_queues_.resize(total_workers_);
     for (size_t i = 0; i < total_workers_; ++i) {
         worker_queues_[i] = std::make_unique<LockFreeQueue>();
     }
-    
+
     // Initialize per-NUMA round-robin counters
     numa_worker_rr_.resize(num_numa_nodes_);
     for (size_t i = 0; i < num_numa_nodes_; ++i) {
         numa_worker_rr_[i] = std::make_unique<std::atomic<size_t>>(0);
     }
-    
+
     // Get CPU list for each NUMA node
     std::vector<std::vector<int>> numa_cpus(num_numa_nodes_);
     for (size_t numa = 0; numa < num_numa_nodes_; ++numa) {
@@ -1185,7 +1184,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
             numa_cpus[numa].push_back(-1);
         }
     }
-    
+
     // Start worker threads (kWorkersPerNuma workers per NUMA node)
     // NUMA-only affinity: each worker is bound to the entire CPU set of its NUMA node,
     // and the kernel scheduler picks an idle core. This avoids collisions when multiple
@@ -1203,9 +1202,9 @@ int MPComm::Impl::init(const std::string &local_host_id,
                 static_cast<int>(numa), std::move(cpu_ids));
         }
     }
-    MPCOMM_LOG_INFO("MPComm: Started %zu async worker threads (%zu per NUMA, %zu NUMA nodes)\n", 
+    MPCOMM_LOG_INFO("MPComm: Started %zu async worker threads (%zu per NUMA, %zu NUMA nodes)\n",
            total_workers_, kWorkersPerNuma, num_numa_nodes_);
-    
+
     MPCOMM_LOG_INFO("MPComm: Initialized with %zu NICs, TCP port %d\n",
            nic_contexts_.size(), tcp_port_);
 
@@ -1272,7 +1271,8 @@ int MPComm::Impl::init(const std::string &local_host_id,
                 size_t keyPos, colonPos, valueStart, valueEnd;
                 if ((keyPos = content.find(key)) == std::string::npos) throw std::exception();
                 if ((colonPos = content.find(':', keyPos + key.length())) == std::string::npos) throw std::exception();
-                if ((valueStart = content.find_first_not_of(" \t\n\r", colonPos + 1)) == std::string::npos) throw std::exception();
+                if ((valueStart = content.find_first_not_of(" \t\n\r", colonPos + 1)) == std::string::npos)
+                    throw std::exception();
                 if ((valueEnd = content.find('"', valueStart + 1)) == std::string::npos) throw std::exception();
                 std::string version_prev = content.substr(valueStart + 1, valueEnd - valueStart - 1);
                 if (version_prev == MPCOMM_VERSION) {
@@ -1289,8 +1289,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
         std::time_t now_time_t = std::chrono::system_clock::to_time_t(now);
         std::tm now_tm = *std::localtime(&now_time_t);
         auto now_ms = std::chrono::duration_cast<std::chrono::microseconds>(
-            now.time_since_epoch() % std::chrono::seconds(1)
-        );
+            now.time_since_epoch() % std::chrono::seconds(1));
         std::stringstream ss;
         ss << std::put_time(&now_tm, "%Y-%m-%dT%H:%M:%S")
            << "." << std::setfill('0') << std::setw(6) << now_ms.count();
@@ -1420,7 +1419,7 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
 
     for (int i = 0; i < num_devices; ++i) {
         const char *name = ibv_get_device_name(devices[i]);
-        
+
         // Apply filter if specified
         if (!filter.empty()) {
             bool found = false;
@@ -1485,7 +1484,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
     // Open device
     ctx.context = ibv_open_device(target_device);
     ibv_free_device_list(devices);
-    
+
     if (!ctx.context) {
         MPCOMM_LOG_ERROR("MPComm: Failed to open device %s\n",
                 device_name.c_str());
@@ -1518,7 +1517,7 @@ int MPComm::Impl::setupNicContext(const std::string &device_name, NicContext &ct
             union ibv_gid gid;
             if (ibv_query_gid(ctx.context, ctx.port, i, &gid) != 0) continue;
             if (isNullGid(&gid)) continue;
-            
+
             ctx.gid_index = i;
             ctx.gid = gid;
             break;
@@ -1661,7 +1660,7 @@ int MPComm::Impl::registerMemory(void *addr, size_t length) {
     // Register on all NICs
     for (size_t i = 0; i < nic_contexts_.size(); ++i) {
         auto &ctx = *nic_contexts_[i];
-        
+
         struct ibv_mr *mr = ibv_reg_mr(ctx.pd, addr, length, access_flags);
         if (!mr) {
             MPCOMM_LOG_ERROR("MPComm: Failed to register %s memory on %s (errno=%d: %s)\n",
@@ -1735,17 +1734,17 @@ uint32_t MPComm::Impl::getLkey(size_t nic_index, void *addr) const {
 
     const auto &ctx = *nic_contexts_[nic_index];
     // Note: We can't lock here in const method, assume read-only after init
-    
+
     for (const auto &mr_info : ctx.memory_regions) {
         char *mr_start = static_cast<char *>(mr_info.addr);
         char *mr_end = mr_start + mr_info.length;
         char *target = static_cast<char *>(addr);
-        
+
         if (target >= mr_start && target < mr_end) {
             return mr_info.lkey;
         }
     }
-    
+
     return 0;
 }
 
@@ -1753,24 +1752,24 @@ uint32_t MPComm::Impl::getRkey(size_t nic_index, void *addr) const {
     if (nic_index >= nic_contexts_.size()) return 0;
 
     const auto &ctx = *nic_contexts_[nic_index];
-    
+
     for (const auto &mr_info : ctx.memory_regions) {
         char *mr_start = static_cast<char *>(mr_info.addr);
         char *mr_end = mr_start + mr_info.length;
         char *target = static_cast<char *>(addr);
-        
+
         if (target >= mr_start && target < mr_end) {
             return mr_info.rkey;
         }
     }
-    
+
     return 0;
 }
 
 int MPComm::Impl::updateRemoteMemoryInfo(const std::string &remote_host_id,
                                    const std::vector<uint32_t> &rkeys) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
-    
+
     auto it = connections_.find(remote_host_id);
     if (it == connections_.end()) {
         MPCOMM_LOG_ERROR("MPComm: Host %s not connected\n", remote_host_id.c_str());
@@ -1821,20 +1820,20 @@ size_t MPComm::Impl::getQpsPerConnection() const {
 // Returns -1 if no numeric suffix found
 static int extractNicSuffix(const std::string& nic_name) {
     if (nic_name.empty()) return -1;
-    
+
     // Find the last sequence of digits
     size_t end = nic_name.length();
     size_t start = end;
-    
+
     // Scan backwards to find digits
     while (start > 0 && std::isdigit(nic_name[start - 1])) {
         --start;
     }
-    
+
     if (start == end) {
         return -1;  // No digits found
     }
-    
+
     // Extract the number
     std::string num_str = nic_name.substr(start, end - start);
     return std::stoi(num_str);
@@ -1869,7 +1868,7 @@ int MPComm::Impl::readNicNumaNode(const std::string& nic_name) {
 // Get candidate NICs (either from MPCOMM_NIC_FILTER or all available)
 std::vector<std::string> MPComm::Impl::getCandidateNics() {
     std::vector<std::string> candidates;
-    
+
     // Check MPCOMM_NIC_FILTER environment variable
     const char* filter = std::getenv(kNicFilterEnvVar);
     if (filter && strlen(filter) > 0) {
@@ -1902,26 +1901,26 @@ std::vector<std::string> MPComm::Impl::getCandidateNics() {
 void MPComm::Impl::discoverTopology() {
     int numa_count = getNumaNodeCount();
     std::vector<std::string> candidates = getCandidateNics();
-    
+
     // Initialize NUMA topology for each node
     numa_topology_.resize(numa_count);
     for (int i = 0; i < numa_count; i++) {
         numa_topology_[i].numa_node = i;
     }
-    
+
     // Build NIC topology info and assign NICs to NUMA nodes
     nic_topology_.clear();
     nic_topology_.reserve(candidates.size());
-    
+
     for (const auto& nic : candidates) {
         int numa_node = readNicNumaNode(nic);
-        
+
         // Store NIC topology info
         NicTopologyInfo info;
         info.nic_name = nic;
         info.numa_node = numa_node;
         nic_topology_.push_back(info);
-        
+
         // Assign NIC to appropriate NUMA node
         if (numa_node >= 0 && numa_node < numa_count) {
             // NIC is local to this NUMA node
@@ -1933,7 +1932,7 @@ void MPComm::Impl::discoverTopology() {
             }
         }
     }
-    
+
     // For NUMA nodes without local NICs, populate remote_nics as fallback
     for (int i = 0; i < numa_count; i++) {
         if (numa_topology_[i].local_nics.empty()) {
@@ -2028,9 +2027,9 @@ int MPComm::Impl::getNicNumaNode(const std::string& nic_name) const {
 // Get NUMA node for a given memory address (check registered memory regions)
 int MPComm::Impl::getNumaNodeForAddr(void* addr) const {
     if (!addr || nic_contexts_.empty()) return -1;
-    
+
     uintptr_t target = reinterpret_cast<uintptr_t>(addr);
-    
+
     // Check the first NIC's memory regions (all NICs share the same regions)
     const auto& ctx = *nic_contexts_[0];
     for (const auto& mr : ctx.memory_regions) {
@@ -2046,12 +2045,12 @@ int MPComm::Impl::getNumaNodeForAddr(void* addr) const {
 // Get local NIC indices for a specific NUMA node
 std::vector<size_t> MPComm::Impl::getLocalNicIndicesForNuma(int numa_node) const {
     std::vector<size_t> indices;
-    
+
     // If numa_node is invalid, return empty (will fallback to all NICs)
     if (numa_node < 0) {
         return indices;
     }
-    
+
     // Find NIC indices that belong to this NUMA node
     for (size_t i = 0; i < nic_contexts_.size(); ++i) {
         const auto& device_name = nic_contexts_[i]->device_name;
@@ -2062,7 +2061,7 @@ std::vector<size_t> MPComm::Impl::getLocalNicIndicesForNuma(int numa_node) const
             }
         }
     }
-    
+
     return indices;
 }
 
@@ -2299,12 +2298,12 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
     if (!addr || length == 0) return MPCOMM_ERR_INVALID_ARG;
 
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
-    
+
     // Create published buffer info if not exists
     if (!published_buffer_) {
         published_buffer_ = std::make_unique<PublishedBufferInfo>();
     }
-    
+
     // Check if buffer already published (update if so)
     uint64_t buf_addr = reinterpret_cast<uint64_t>(addr);
     for (auto &entry : published_buffer_->buffers) {
@@ -2317,13 +2316,13 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
             return MPCOMM_SUCCESS;
         }
     }
-    
+
     // Create new buffer entry
     PublishedBufferEntry entry;
     entry.addr = buf_addr;
     entry.length = length;
     entry.numa_node = (numa_node >= 0) ? numa_node : getNumaNodeForAddr(addr);
-    
+
     // Get rkeys for all NICs
     entry.rkeys.reserve(nic_contexts_.size());
     for (size_t i = 0; i < nic_contexts_.size(); ++i) {
@@ -2334,9 +2333,9 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
         }
         entry.rkeys.push_back(rkey);
     }
-    
+
     published_buffer_->buffers.push_back(std::move(entry));
-    
+
     const auto &added = published_buffer_->buffers.back();
     {
         std::string rkeys_str;
@@ -2347,22 +2346,22 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
         MPCOMM_LOG_INFO("MPComm: Published buffer addr=%p, length=%zu, numa=%d, rkeys=[%s] (total %zu buffers)\n",
                addr, length, added.numa_node, rkeys_str.c_str(), published_buffer_->buffers.size());
     }
-    
+
     return MPCOMM_SUCCESS;
 }
 
 int MPComm::Impl::unpublishBuffer(void *addr) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
-    
+
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
-    
+
     if (!published_buffer_) {
         return MPCOMM_ERR_INVALID_ARG;
     }
-    
+
     uint64_t buf_addr = reinterpret_cast<uint64_t>(addr);
     auto &buffers = published_buffer_->buffers;
-    
+
     for (auto it = buffers.begin(); it != buffers.end(); ++it) {
         if (it->addr == buf_addr) {
             buffers.erase(it);
@@ -2371,13 +2370,13 @@ int MPComm::Impl::unpublishBuffer(void *addr) {
             return MPCOMM_SUCCESS;
         }
     }
-    
+
     return MPCOMM_ERR_INVALID_ARG;
 }
 
 void MPComm::Impl::unpublishAllBuffers() {
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
-    
+
     if (published_buffer_) {
         size_t count = published_buffer_->buffers.size();
         published_buffer_->buffers.clear();
@@ -2411,7 +2410,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(remote_tcp_port);
-    
+
     if (inet_pton(AF_INET, remote_tcp_addr.c_str(), &addr.sin_addr) <= 0) {
         struct hostent *he = gethostbyname(remote_tcp_addr.c_str());
         if (!he) {
@@ -2540,9 +2539,9 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
         std::lock_guard<std::mutex> lock(connections_mutex_);
         auto conn_it = connections_.find(remote_host_id);
         if (conn_it != connections_.end()) {
-            MPCOMM_LOG_INFO("MPComm: Matching rkeys for %zu endpoints\n", 
+            MPCOMM_LOG_INFO("MPComm: Matching rkeys for %zu endpoints\n",
                    conn_it->second.nic_endpoints.size());
-            
+
             // Store all remote buffers for multi-NUMA parallel access
             conn_it->second.remote_buffers.clear();
             for (const auto &buf : out_info.buffers) {
@@ -2552,7 +2551,7 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
                 reordered_entry.length = buf.length;
                 reordered_entry.numa_node = buf.numa_node;
                 reordered_entry.rkeys.resize(conn_it->second.nic_endpoints.size());
-                
+
                 // Reorder rkeys to match local NIC endpoint indices
                 for (size_t ep_idx = 0; ep_idx < conn_it->second.nic_endpoints.size(); ++ep_idx) {
                     const std::string &ep_gid = conn_it->second.nic_endpoints[ep_idx].gid;
@@ -2563,17 +2562,17 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
                         }
                     }
                 }
-                
+
                 conn_it->second.remote_buffers[buf.addr] = reordered_entry;
                 MPCOMM_LOG_INFO("MPComm: Stored remote buffer: addr=0x%lx, numa=%d, rkeys=[",
                        buf.addr, buf.numa_node);
                 for (size_t i = 0; i < reordered_entry.rkeys.size(); ++i) {
-                    MPCOMM_LOG_INFO("%u%s", reordered_entry.rkeys[i], 
+                    MPCOMM_LOG_INFO("%u%s", reordered_entry.rkeys[i],
                            i < reordered_entry.rkeys.size() - 1 ? "," : "");
                 }
                 MPCOMM_LOG_INFO("]\n");
             }
-            
+
             // Also update nic_endpoints with first buffer's rkeys for backward compatibility
             const auto &first_buf = out_info.buffers[0];
             for (size_t ep_idx = 0; ep_idx < conn_it->second.nic_endpoints.size(); ++ep_idx) {
@@ -2643,7 +2642,7 @@ const PublishedBufferInfo* MPComm::Impl::getPublishedBufferInfo() const {
 
 void MPComm::Impl::handleBufferQuery(int client_fd) {
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
-    
+
     // Check if any buffers are published
     uint32_t num_buffers = 0;
     if (published_buffer_) {
@@ -2725,7 +2724,7 @@ void MPComm::Impl::handleBufferQuery(int client_fd) {
 int MPComm::Impl::createQP(NicContext &ctx, struct ibv_qp **qp) {
     struct ibv_qp_init_attr init_attr;
     memset(&init_attr, 0, sizeof(init_attr));
-    
+
     init_attr.send_cq = ctx.cq;
     init_attr.recv_cq = ctx.cq;
     init_attr.qp_type = IBV_QPT_RC;
@@ -2747,7 +2746,7 @@ int MPComm::Impl::createQP(NicContext &ctx, struct ibv_qp **qp) {
 int MPComm::Impl::modifyQPToInit(NicContext &ctx, struct ibv_qp *qp) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
-    
+
     attr.qp_state = IBV_QPS_INIT;
     attr.port_num = ctx.port;
     attr.pkey_index = 0;
@@ -2756,7 +2755,7 @@ int MPComm::Impl::modifyQPToInit(NicContext &ctx, struct ibv_qp *qp) {
 
     int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
                 IBV_QP_ACCESS_FLAGS;
-    
+
     if (ibv_modify_qp(qp, &attr, flags) != 0) {
         MPCOMM_PLOG_ERROR("MPComm: Failed to modify QP to INIT");
         return MPCOMM_ERR_CONNECTION;
@@ -2769,7 +2768,7 @@ int MPComm::Impl::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
                           const RemoteEndpointInfo &remote) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
-    
+
     attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = IBV_MTU_4096;
     attr.dest_qp_num = remote.qp_num;
@@ -2806,7 +2805,7 @@ int MPComm::Impl::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
 int MPComm::Impl::modifyQPToRTS(struct ibv_qp *qp) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
-    
+
     attr.qp_state = IBV_QPS_RTS;
     attr.timeout = kTimeout;
     attr.retry_cnt = kRetryCnt;
@@ -2868,7 +2867,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(remote_tcp_port);
-    
+
     if (inet_pton(AF_INET, remote_tcp_addr.c_str(), &addr.sin_addr) <= 0) {
         // Try hostname resolution
         struct hostent *he = gethostbyname(remote_tcp_addr.c_str());
@@ -2963,7 +2962,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
 
     MPCOMM_LOG_INFO("MPComm: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
     for (size_t i = 0; i < remote_num_nics; ++i) {
-        MPCOMM_LOG_INFO("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
+        MPCOMM_LOG_INFO("NIC%zu->NUMA%d%s", i, remote_nic_numa[i],
                (i < remote_num_nics - 1) ? ", " : "\n");
     }
 
@@ -3030,7 +3029,7 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         }
     }
     size_t actual_remote_numa_count = remote_nic_numa_set.size();
-    
+
     // Build per-NUMA NIC lists for remote side
     std::map<int, std::vector<size_t>> remote_numa_to_nics;
     for (size_t i = 0; i < remote_num_nics; ++i) {
@@ -3039,9 +3038,9 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
             remote_numa_to_nics[numa].push_back(i);
         }
     }
-    
+
     MPCOMM_LOG_INFO("MPComm: Remote NICs span %zu distinct NUMA node(s)\n", actual_remote_numa_count);
-    
+
     // Store all remote endpoints (one per remote NIC)
     conn_info.nic_endpoints.resize(remote_num_nics);
 
@@ -3068,14 +3067,14 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
 
     // Name-based NUMA-aware connection strategy:
     // - Match local and remote NICs by their name suffix (e.g., mlx5_bond_0 matches with mlx5_0)
-    // - If remote NICs span multiple NUMA nodes: connect to matching NIC AND 
+    // - If remote NICs span multiple NUMA nodes: connect to matching NIC AND
     //   corresponding NIC in other NUMA nodes with same suffix offset
     //   Example: local aa0 connects to remote bb0 (same suffix) and bb4 (same position in NUMA1)
     // - If all remote NICs are on the same NUMA node: simple suffix-based matching
-    
+
     size_t total_connections = 0;
     size_t skipped_connections = 0;
-    
+
     // Suffix-based matching strategy with cross-NUMA support:
     // Local NIC with suffix N connects to:
     //   1. Remote NIC with same suffix N (same relative position, primary)
@@ -3083,23 +3082,23 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     // This ensures that local NUMA1 NICs (suffix 4-7) can reach remote NUMA0 NICs (suffix 0-3)
     // Example: local mlx5_bond_5 -> remote mlx5_bond_5 (same NUMA) + mlx5_bond_1 (cross NUMA)
     //          local mlx5_bond_1 -> remote mlx5_bond_1 (same NUMA) + mlx5_bond_5 (cross NUMA)
-    
+
     MPCOMM_LOG_INFO("MPComm: Using suffix-based matching (N -> N and N%%4 for cross-NUMA)\n");
-    
+
     for (size_t local_nic = 0; local_nic < num_nics; ++local_nic) {
         auto &ctx = *nic_contexts_[local_nic];
         const std::string& local_name = ctx.device_name;
         int local_suffix = extractNicSuffix(local_name);
-        
+
         // Calculate which remote NICs this local NIC should connect to
         std::vector<size_t> target_remote_nics;
-        
+
         // Primary: find remote NIC with same suffix N
         auto it = remote_suffix_to_nics.find(local_suffix);
         if (it != remote_suffix_to_nics.end() && !it->second.empty()) {
             target_remote_nics.push_back(it->second[0]);
         }
-        
+
         // Secondary: find remote NIC with cross-NUMA suffix
         // If local suffix >= 4, try N-4 (e.g., 5 -> 1); otherwise try N+4 (e.g., 1 -> 5)
         int cross_numa_suffix = (local_suffix >= 4) ? (local_suffix - 4) : (local_suffix + 4);
@@ -3107,33 +3106,33 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         if (it2 != remote_suffix_to_nics.end() && !it2->second.empty()) {
             target_remote_nics.push_back(it2->second[0]);
         }
-        
+
         if (target_remote_nics.empty()) {
             // No matching suffix found, skip this local NIC
             MPCOMM_LOG_INFO("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC (checked %d and %d), skipping\n",
                    local_nic, local_name.c_str(), local_suffix, local_suffix, cross_numa_suffix);
             continue;
         }
-        
+
         if (target_remote_nics.empty()) {
             continue;  // No remote NICs to connect to
         }
-        
-        MPCOMM_LOG_INFO("MPComm: Local NIC%zu (%s, suffix=%d) connecting to remote NICs: ", 
+
+        MPCOMM_LOG_INFO("MPComm: Local NIC%zu (%s, suffix=%d) connecting to remote NICs: ",
                local_nic, local_name.c_str(), local_suffix);
         for (size_t idx = 0; idx < target_remote_nics.size(); ++idx) {
             size_t r = target_remote_nics[idx];
             MPCOMM_LOG_INFO("%zu(%s)%s", r, remote_nic_names[r].c_str(),
                    (idx < target_remote_nics.size() - 1) ? ", " : "\n");
         }
-        
+
         // Store the local-to-remote NIC mapping for later use in transfers
         conn_info.local_to_remote_nic_map[local_nic] = target_remote_nics;
-        
+
         // Create connections to each target remote NIC
         for (size_t remote_nic : target_remote_nics) {
             bool connection_failed = false;
-            std::string key = remote_host_id + ":" + std::to_string(local_nic) + 
+            std::string key = remote_host_id + ":" + std::to_string(local_nic) +
                               ":" + std::to_string(remote_nic);
             std::vector<struct ibv_qp *> qp_list;
             qp_list.reserve(actual_qps);
@@ -3299,13 +3298,14 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     }
 
     if (skipped_connections > 0) {
-        MPCOMM_LOG_WARN("MPComm: Connected to %s with %zu NIC connections (%zu skipped due to unreachable NICs), %zu QPs each\n",
+        MPCOMM_LOG_WARN("MPComm: Connected to %s with %zu NIC connections "
+                        "(%zu skipped due to unreachable NICs), %zu QPs each\n",
                remote_host_id.c_str(), total_connections, skipped_connections, actual_qps);
     } else {
         MPCOMM_LOG_INFO("MPComm: Connected to %s with %zu NIC connections (NUMA-aware), %zu QPs each\n",
                remote_host_id.c_str(), total_connections, actual_qps);
     }
-    
+
     return MPCOMM_SUCCESS;
 }
 
@@ -3322,7 +3322,7 @@ int MPComm::Impl::startAcceptThread() {
 
 void MPComm::Impl::stopAcceptThread() {
     accept_running_ = false;
-    
+
     // Interrupt accept() by connecting to ourselves
     if (listen_fd_ >= 0 && accept_thread_) {
         int dummy_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -3347,7 +3347,7 @@ void MPComm::Impl::acceptLoop() {
     while (accept_running_) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
-        
+
         int client_fd = accept(listen_fd_, (struct sockaddr *)&client_addr,
                                &addr_len);
         if (client_fd < 0) {
@@ -3454,7 +3454,7 @@ void MPComm::Impl::acceptLoop() {
 
         MPCOMM_LOG_INFO("MPComm: Passive side: Remote NUMA count=%d, Remote NIC NUMA mapping: ", remote_numa_count);
         for (size_t i = 0; i < remote_num_nics; ++i) {
-            MPCOMM_LOG_INFO("NIC%zu->NUMA%d%s", i, remote_nic_numa[i], 
+            MPCOMM_LOG_INFO("NIC%zu->NUMA%d%s", i, remote_nic_numa[i],
                    (i < remote_num_nics - 1) ? ", " : "\n");
         }
 
@@ -3544,7 +3544,7 @@ void MPComm::Impl::acceptLoop() {
                 remote_nic_numa_set.insert(remote_nic_numa[i]);
             }
         }
-        
+
         // Build per-NUMA NIC lists for remote side
         std::map<int, std::vector<size_t>> remote_numa_to_nics;
         for (size_t i = 0; i < remote_num_nics; ++i) {
@@ -3553,7 +3553,7 @@ void MPComm::Impl::acceptLoop() {
                 remote_numa_to_nics[numa].push_back(i);
             }
         }
-        
+
         // Build suffix to local NIC mapping for quick lookup
         std::map<int, size_t> local_suffix_to_nic;
         for (size_t i = 0; i < num_nics; ++i) {
@@ -3562,37 +3562,37 @@ void MPComm::Impl::acceptLoop() {
                 local_suffix_to_nic[suffix] = i;
             }
         }
-        
+
         MPCOMM_LOG_INFO("MPComm: Passive side: Using suffix-based matching (N -> N and cross-NUMA)\n");
-        
+
         // Calculate expected number of connections (must match active side exactly)
         // Active side: for each local NIC with suffix N, connects to remote NICs with suffix N and cross-NUMA
         // On passive side, we need to calculate how many remote NICs will connect to us
         size_t expected_connections = 0;
-        
+
         // For each remote NIC (which is the active side's local NIC)
         for (size_t remote_nic = 0; remote_nic < remote_num_nics; ++remote_nic) {
             int remote_suffix = extractNicSuffix(remote_nic_names[remote_nic]);
-            
+
             // Active side with suffix N will try to connect to local NICs with suffix N and cross-NUMA
             // Count connections where we have matching suffix N (same as remote)
             if (local_suffix_to_nic.count(remote_suffix) > 0) {
                 expected_connections++;  // Primary: N -> N
             }
-            
-            // Count connections where we have cross-NUMA suffix 
+
+            // Count connections where we have cross-NUMA suffix
             // Active side N connects to our N-4 (if N>=4) or N+4 (if N<4)
             int cross_numa_suffix = (remote_suffix >= 4) ? (remote_suffix - 4) : (remote_suffix + 4);
             if (local_suffix_to_nic.count(cross_numa_suffix) > 0) {
                 expected_connections++;  // Secondary: cross-NUMA
             }
         }
-        
+
         MPCOMM_LOG_INFO("MPComm: Passive side: Expecting %zu connections\n", expected_connections);
 
         bool success = true;
         size_t total_connections = 0;
-        
+
         // Receive connections from active side - the active side determines which
         // local NIC connects to which remote NIC (encoded in remote_info)
         // remote_info.addr = target local NIC on passive side
@@ -3624,7 +3624,7 @@ void MPComm::Impl::acceptLoop() {
             }
 
             auto &ctx = *nic_contexts_[local_nic];
-            std::string key = remote_host_id + ":" + std::to_string(local_nic) + 
+            std::string key = remote_host_id + ":" + std::to_string(local_nic) +
                               ":" + std::to_string(remote_nic);
             std::vector<struct ibv_qp *> qp_list;
             qp_list.reserve(actual_qps);
@@ -3728,7 +3728,7 @@ void MPComm::Impl::acceptLoop() {
                 std::lock_guard<std::mutex> lock(ctx.qp_mutex);
                 ctx.qp_map[key] = std::move(qp_list);
                 total_connections++;
-                
+
                 // Store the local-to-remote NIC mapping
                 // On passive side: local_nic is our NIC, remote_nic is the active side's NIC
                 conn_info.local_to_remote_nic_map[local_nic].push_back(remote_nic);
@@ -3761,7 +3761,7 @@ struct ibv_qp *MPComm::Impl::getOrCreateQP(size_t local_nic_index,
 
     auto &ctx = *nic_contexts_[local_nic_index];
     // New key format: "host_id:local_nic:remote_nic" for NUMA-aware connections
-    std::string key = remote_host_id + ":" + std::to_string(local_nic_index) + 
+    std::string key = remote_host_id + ":" + std::to_string(local_nic_index) +
                       ":" + std::to_string(remote_nic_index);
 
     std::lock_guard<std::mutex> lock(ctx.qp_mutex);
@@ -3856,13 +3856,13 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
                                           TransferDirection direction) {
     const char* op_name = (direction == TransferDirection::SCATTER) ? "ScatterAsync" :
                           (direction == TransferDirection::GATHER) ? "GatherAsync" : "BroadcastAsync";
-    
+
     // Validation
     if (!initialized_) {
         MPCOMM_LOG_ERROR("MPComm: %s failed - not initialized\n", op_name);
         return INVALID_TRANSFER_HANDLE;
     }
-    
+
     size_t host_count = host_list.size();
     if (host_count == 0 || remote_addrs.size() != host_count ||
         lengths.size() != host_count) {
@@ -3896,15 +3896,15 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     ctx->lengths = lengths;
     ctx->direction = direction;
     ctx->start_time = std::chrono::steady_clock::now();
-    
+
     // Prepare all chunks (same logic as transferImplDynamic)
     const size_t max_chunk_size = max_rdma_transfer_size_;
     size_t total_chunks = 0;
-    
+
     // Calculate total chunks and local offsets
     std::vector<size_t> host_chunk_starts(host_count);
     std::vector<size_t> host_local_offsets(host_count);
-    
+
     size_t running_local_offset = 0;
     for (size_t i = 0; i < host_count; ++i) {
         host_chunk_starts[i] = total_chunks;
@@ -3916,9 +3916,9 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
             running_local_offset += lengths[i];
         }
     }
-    
+
     ctx->prep_chunks_calc_time = std::chrono::steady_clock::now();
-    
+
     // Handle empty transfer
     if (total_chunks == 0) {
         ctx->total_chunks.store(0);
@@ -3935,7 +3935,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         ctx->first_post_time = now;
         ctx->all_posted_time = now;
         ctx->end_time = now;
-        
+
         TransferHandle handle = ctx->handle;
         ctx->numa_id = transfer_numa_id;
         {
@@ -3948,20 +3948,20 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         }
         return handle;
     }
-    
+
     // Store chunk metadata for lazy computation (no pre-allocated chunk array)
     ctx->max_chunk_size = max_chunk_size;
     ctx->host_chunk_starts = std::move(host_chunk_starts);
     ctx->host_local_offsets = std::move(host_local_offsets);
-    
+
     ctx->total_chunks.store(total_chunks);
     ctx->next_chunk_idx.store(0);
-    
+
     ctx->prep_chunks_meta_time = std::chrono::steady_clock::now();
-    
+
     // NUMA-aware NIC selection (with PCIe-affine upgrade for GPU memory)
     int memory_numa_node = getNumaNodeForAddr(reinterpret_cast<void*>(local_addr));
-    
+
     // For GPU memory, prefer PCIe-affine NICs (sharing closest PCIe switch)
     // This provides much finer granularity than NUMA-level selection,
     // especially when all NICs are on the same NUMA node.
@@ -4119,7 +4119,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
                             MPCOMM_LOG_DEBUG("MPComm PXN: Source buffer context (%p) differs "
                                            "from primary context (%p) for GPU %d, "
                                            "enabling P2P access from user context\n",
-                                           (void*)src_buf_ctx, (void*)primary_ctx,
+                                           reinterpret_cast<void*>(src_buf_ctx), reinterpret_cast<void*>(primary_ctx),
                                            gpu_device_id);
                             // The user allocated GPU memory in a non-primary context.
                             // cuCtxEnablePeerAccess is per-context, so we must also
@@ -4139,16 +4139,16 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
                                         MPCOMM_LOG_WARN("MPComm PXN: cuCtxEnablePeerAccess "
                                                        "user_ctx(%p) -> GPU %d primary_ctx(%p) "
                                                        "failed: %d\n",
-                                                       (void*)src_buf_ctx,
+                                                       reinterpret_cast<void*>(src_buf_ctx),
                                                        peer_dev,
-                                                       (void*)peer_pb->cuda_ctx,
+                                                       reinterpret_cast<void*>(peer_pb->cuda_ctx),
                                                        pa_res);
                                     } else {
                                         MPCOMM_LOG_DEBUG("MPComm PXN: Enabled P2P access from "
                                                         "user_ctx(%p) -> GPU %d primary_ctx(%p)\n",
-                                                        (void*)src_buf_ctx,
+                                                        reinterpret_cast<void*>(src_buf_ctx),
                                                         peer_dev,
-                                                        (void*)peer_pb->cuda_ctx);
+                                                        reinterpret_cast<void*>(peer_pb->cuda_ctx));
                                     }
                                 }
                                 cuCtxPopCurrent(&old_ctx);
@@ -4245,7 +4245,7 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
             ctx->candidate_nic_indices = getLocalNicIndicesForNuma(memory_numa_node);
         }
     }
-    
+
     if (ctx->candidate_nic_indices.empty()) {
         ctx->candidate_nic_indices.reserve(num_nics);
         for (size_t i = 0; i < num_nics; ++i) {
@@ -4268,30 +4268,30 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         }
         // else: all quarantined — keep original list to avoid total blackout
     }
-    
+
     ctx->prep_numa_query_time = std::chrono::steady_clock::now();
-    
+
     // Record NIC/QP counts for flow control arrays (arrays already zero-initialized in ctor)
     ctx->num_nics_used = num_nics;
     ctx->num_qps_used = qps_per_connection_;
-    
+
     ctx->prep_flowctrl_time = std::chrono::steady_clock::now();
-    
-    
+
+
     // MPCOMM_LOG_INFO("MPComm: %s queued with %zu chunks across %zu candidate NICs (handle=%lu, numa=%d)\n",
     //        op_name, total_chunks, ctx->candidate_nic_indices.size(), ctx->handle, memory_numa_node);
-    
+
     // Fully async mode: submit task to a worker thread via lock-free queue
     // Worker thread will handle all post and poll operations
     TransferHandle handle = ctx->handle;
-    
+
     // Use the NUMA node determined earlier (before allocation)
     int numa_id = transfer_numa_id;
     ctx->numa_id = numa_id;
-    
+
     // Record queued time before moving ctx
     ctx->queued_time = std::chrono::steady_clock::now();
-    
+
     // Store context in per-NUMA map (avoids cross-NUMA lock contention)
     {
         std::lock_guard<std::mutex> lock(per_numa_transfers_[numa_id].mutex);
@@ -4301,15 +4301,15 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         std::lock_guard<std::mutex> lock(handle_numa_mutex_);
         handle_numa_map_[handle] = numa_id;
     }
-    
+
     // Select a worker within the NUMA node (round-robin)
     size_t worker_id = selectWorkerForNuma(numa_id);
-    
+
     // Submit to worker's lock-free queue (busy-wait if queue is full)
     while (!worker_queues_[worker_id]->tryPush(handle)) {
         _mm_pause();  // CPU spin hint
     }
-    
+
     return handle;
 }
 
@@ -4323,7 +4323,7 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
     struct ibv_wc wc_array[64];  // Fixed max size; actual poll count controlled by poll_batch_size
     size_t num_nics = nic_contexts_.size();
     size_t num_candidate_nics = ctx.candidate_nic_indices.size();
-    
+
     // Poll only candidate NICs for better performance
     for (size_t idx = 0; idx < num_candidate_nics; ++idx) {
         size_t nic = ctx.candidate_nic_indices[idx];
@@ -4354,12 +4354,12 @@ int MPComm::Impl::pollAllNicsForAsync(TransferContext& ctx) {
                 }
                 continue;
             }
-            
+
             // Decode nic_index, qp_index, and transfer_handle from wr_id
             size_t completed_nic = WrIdEncoding::decodeNic(wc_array[i].wr_id);
             size_t completed_qp = WrIdEncoding::decodeQp(wc_array[i].wr_id);
             TransferHandle wc_handle = WrIdEncoding::decodeHandle(wc_array[i].wr_id);
-            
+
             // Route completion to the correct TransferContext
             if (wc_handle == ctx.handle) {
                 // Completion belongs to current context
@@ -4431,12 +4431,12 @@ int MPComm::Impl::waitTransfer(TransferHandle handle, int timeout_ms) {
         if (it == nts.active_transfers.end()) return MPCOMM_ERR_INVALID_HANDLE;
         ctx_ptr = it->second.get();
     }
-    
+
     // Busy-wait on the finished flag (no mutex, no sleep)
     auto start_time = std::chrono::steady_clock::now();
     while (!ctx_ptr->finished.load(std::memory_order_acquire)) {
         _mm_pause();  // CPU spin hint
-        
+
         // Check timeout
         if (timeout_ms >= 0) {
             auto elapsed = std::chrono::steady_clock::now() - start_time;
@@ -4451,7 +4451,7 @@ int MPComm::Impl::waitTransfer(TransferHandle handle, int timeout_ms) {
 
 TransferResult MPComm::Impl::getTransferResult(TransferHandle handle) {
     TransferResult result = {MPCOMM_ERR_INVALID_HANDLE, 0, 0.0};
-    
+
     int numa_id = -1;
     {
         std::lock_guard<std::mutex> lock(handle_numa_mutex_);
@@ -4465,21 +4465,21 @@ TransferResult MPComm::Impl::getTransferResult(TransferHandle handle) {
     if (it == nts.active_transfers.end()) {
         return result;
     }
-    
+
     TransferContext& ctx = *it->second;
     result.error_code = ctx.error_code.load();
-    
+
     // Calculate bytes transferred
     size_t total_bytes = 0;
     for (size_t i = 0; i < ctx.num_nics_used; ++i) {
         total_bytes += ctx.per_nic_bytes[i];
     }
     result.bytes_transferred = total_bytes;
-    
+
     // Calculate elapsed time
     auto end = ctx.finished.load() ? ctx.end_time : std::chrono::steady_clock::now();
     result.elapsed_ms = std::chrono::duration<double, std::milli>(end - ctx.start_time).count();
-    
+
     return result;
 }
 
@@ -4507,24 +4507,24 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
                                   (ctx.direction == TransferDirection::GATHER) ? "GatherAsync" : "BroadcastAsync";
             double transfer_ms = std::chrono::duration<double, std::milli>(
                 ctx.end_time - ctx.start_time).count();
-            
+
             size_t total_bytes = 0;
             for (size_t i = 0; i < ctx.num_nics_used; ++i) {
                 total_bytes += ctx.per_nic_bytes[i];
             }
             double total_bandwidth_gbps = (total_bytes * 8.0) / (transfer_ms * 1e6);
-            
+
             if (!ctx.timing_breakdown_str.empty()) {
                 // Print timing breakdown first (buffered from worker thread)
                 MPCOMM_LOG_DEBUG("%s", ctx.timing_breakdown_str.c_str());
                 MPCOMM_LOG_DEBUG("\n========== %s Statistics (handle=%lu) ==========\n", op_name, handle);
-                MPCOMM_LOG_DEBUG("%-20s %15s %12s %12s %12s %8s\n", 
+                MPCOMM_LOG_DEBUG("%-20s %15s %12s %12s %12s %8s\n",
                        "NIC", "Bytes", "Chunks", "Share(%)", "BW(Gbps)",
                        ctx.pxn_enabled ? "Type" : "");
                 MPCOMM_LOG_DEBUG("------------------------------------------------------------------------\n");
                 size_t num_nics = nic_contexts_.size();
                 for (size_t nic = 0; nic < num_nics; ++nic) {
-                    double share_pct = (total_bytes > 0) ? 
+                    double share_pct = (total_bytes > 0) ?
                                        (100.0 * ctx.per_nic_bytes[nic] / total_bytes) : 0.0;
                     double nic_bandwidth_gbps = (ctx.per_nic_bytes[nic] * 8.0) / (transfer_ms * 1e6);
                     const char* nic_type = "";
@@ -4566,7 +4566,7 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
                 MPCOMM_LOG_DEBUG("==============================================================\n\n");
             }
         }
-        
+
         nts.active_transfers.erase(it);
     }
 
@@ -4630,14 +4630,14 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
     (void)cpu_ids;  // Suppress unused parameter warning
 #endif
 
-    MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n", 
+    MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n",
            worker_id, numa_id, static_cast<unsigned long>(pthread_self()));
-    
+
     const size_t kMaxIdleSpins = max_idle_spins_;
     const size_t max_outstanding_per_nic = max_outstanding_per_qp_ * qps_per_connection_;
     const size_t kMaxOutstandingPerQP = max_outstanding_per_qp_;
     size_t num_nics = nic_contexts_.size();
-    
+
     // Worker-level outstanding tracking (shared across all active contexts on this worker).
     // These track the ACTUAL NIC-level outstanding WRs, which is what matters for flow control
     // since all contexts share the same NIC CQs.
@@ -4646,7 +4646,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
     size_t worker_nic_completed[kMaxNics] = {};
     size_t worker_nic_qp_posted[kMaxNics][kMaxQPsPerNic] = {};
     size_t worker_nic_qp_completed[kMaxNics][kMaxQPsPerNic] = {};
-    
+
     // Active context set: contexts currently being processed by this worker.
     // Contexts are added when popped from the queue, removed when all chunks are completed.
     struct ActiveContext {
@@ -4655,7 +4655,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
         bool first_post_recorded;
     };
     std::vector<ActiveContext> active_contexts;
-    
+
     // Union of all candidate NIC indices across all active contexts (for CQ polling)
     std::vector<size_t> poll_nic_indices;
     std::vector<ActiveContextInfo> active_ctx_info;  // Reusable buffer for poll routing
@@ -4956,9 +4956,9 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
         return rdma_posted_count;
     };
 #endif
-    
+
     size_t idle_spins = 0;
-    
+
     // ---- Fault injection support ----
     // MPCOMM_FAULT_INJECT_AFTER_SEC: delay before injecting fault
     // MPCOMM_FAULT_INJECT_NIC: which NIC index to fault (default: 0)
@@ -4977,7 +4977,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
     bool fi_recovered = false;
     auto fi_start_time = std::chrono::steady_clock::now();
     auto fi_fault_time = fi_start_time;  // Will be set when fault fires
-    
+
     // Record of faulted QPs for recovery
     struct FaultedQPInfo {
         size_t nic_idx;
@@ -4987,7 +4987,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
         RemoteEndpointInfo remote_info;
     };
     std::vector<FaultedQPInfo> fi_faulted_qps;
-    
+
     while (worker_running_.load(std::memory_order_relaxed)) {
         // Fault injection: after delay, force QP(s) into ERROR state
         if (fi_delay > 0.0 && !fi_triggered && worker_id == 0) {
@@ -4997,14 +4997,14 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 fi_triggered = true;
                 fi_fault_time = now;
                 size_t fi_fault_count = 0;
-                
+
                 // Determine which NICs to fault
                 size_t nic_start = 0, nic_end = num_nics;
                 if (fi_mode != "all_nic") {
                     nic_start = fi_nic_idx < num_nics ? fi_nic_idx : 0;
                     nic_end = nic_start + 1;
                 }
-                
+
                 for (size_t nic = nic_start; nic < nic_end; ++nic) {
                     auto& nic_ctx = *nic_contexts_[nic];
                     std::lock_guard<std::mutex> lock(nic_ctx.qp_mutex);
@@ -5014,7 +5014,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                             attr.qp_state = IBV_QPS_ERR;
                             int rc = ibv_modify_qp(qps[qi], &attr, IBV_QP_STATE);
                             fi_fault_count++;
-                            
+
                             // Record for potential recovery
                             if (fi_recover_delay > 0.0 && rc == 0) {
                                 // Parse key "host_id:local_nic:remote_nic" to get remote_nic
@@ -5022,12 +5022,12 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                                 size_t second_colon = key.rfind(':', last_colon - 1);
                                 size_t remote_nic = std::stoul(key.substr(last_colon + 1));
                                 std::string host_id = key.substr(0, second_colon);
-                                
+
                                 RemoteEndpointInfo rinfo = {};
                                 {
                                     std::lock_guard<std::mutex> conn_lock(connections_mutex_);
                                     auto conn_it = connections_.find(host_id);
-                                    if (conn_it != connections_.end() && 
+                                    if (conn_it != connections_.end() &&
                                         remote_nic < conn_it->second.nic_endpoints.size()) {
                                         rinfo = conn_it->second.nic_endpoints[remote_nic];
                                         // Each QP has its own remote QPN; nic_endpoints only stores
@@ -5043,7 +5043,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                                 }
                                 fi_faulted_qps.push_back({nic, key, qi, qps[qi], rinfo});
                             }
-                            
+
                             if (rc != 0) {
                                 MPCOMM_LOG_ERROR("MPComm: [FAULT INJECT] Failed to fault QP[%zu] on NIC %zu (rc=%d)\n",
                                        qi, nic, rc);
@@ -5053,14 +5053,14 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                         if (fi_mode == "single_qp") break;
                     }
                 }
-                
+
                 MPCOMM_LOG_WARN("MPComm: [FAULT INJECT] mode=%s, faulted %zu QP(s) after %.1fs "
                        "(NIC range [%zu, %zu))%s\n",
                        fi_mode.c_str(), fi_fault_count, elapsed, nic_start, nic_end,
                        fi_recover_delay > 0.0 ? ", recovery scheduled" : "");
             }
         }
-        
+
         // Fault recovery: after recover_delay seconds past fault, restore QPs
         if (fi_triggered && !fi_recovered && fi_recover_delay > 0.0 && worker_id == 0) {
             auto now = std::chrono::steady_clock::now();
@@ -5068,10 +5068,10 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             if (since_fault >= fi_recover_delay) {
                 fi_recovered = true;
                 size_t recovered = 0, failed = 0;
-                
+
                 for (auto& fqp : fi_faulted_qps) {
                     auto& nic_ctx = *nic_contexts_[fqp.nic_idx];
-                    
+
                     // RESET the QP first
                     struct ibv_qp_attr attr = {};
                     attr.qp_state = IBV_QPS_RESET;
@@ -5080,31 +5080,31 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                         failed++;
                         continue;
                     }
-                    
+
                     // INIT
                     if (modifyQPToInit(nic_ctx, fqp.qp) != 0) {
                         MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed INIT on NIC %zu\n", fqp.nic_idx);
                         failed++;
                         continue;
                     }
-                    
+
                     // RTR (needs remote endpoint info)
                     if (modifyQPToRTR(nic_ctx, fqp.qp, fqp.remote_info) != 0) {
                         MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed RTR on NIC %zu\n", fqp.nic_idx);
                         failed++;
                         continue;
                     }
-                    
+
                     // RTS
                     if (modifyQPToRTS(fqp.qp) != 0) {
                         MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed RTS on NIC %zu\n", fqp.nic_idx);
                         failed++;
                         continue;
                     }
-                    
+
                     recovered++;
                 }
-                
+
                 MPCOMM_LOG_WARN("MPComm: [FAULT RECOVER] Recovered %zu/%zu QP(s) after %.1fs "
                        "(failed=%zu)\n",
                        recovered, fi_faulted_qps.size(), since_fault, failed);
@@ -5207,7 +5207,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 }
             }
         }
-        
+
         // If no active contexts and no pending PXN handles, just idle-spin
         if (active_contexts.empty() && pending_pxn_handles.empty()) {
             ++idle_spins;
@@ -5218,7 +5218,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             continue;
         }
         idle_spins = 0;
-        
+
         // ---- Phase 2: Post chunks from all active contexts (unified flow control) ----
         // For PXN-enabled transfers with static partition:
         //   - Direct chunks (front X%) are posted to direct NICs only
@@ -5291,7 +5291,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                                  "starting RDMA posting (handle=%lu)\n", ctx.handle);
             }
 #endif  // USE_CUDA
-            
+
             // Post as many chunks as possible from this context.
             // For PXN: unified min_outstanding NIC selection across direct + proxy NICs.
             // If a proxy NIC is selected, the chunk is assigned to its pipeline for
@@ -5383,7 +5383,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                         }
                     }
                 }
-                
+
                 if (best_nic == num_nics) {
                     diag_iter_direct_break_nic_full++;
                     break;  // All NICs are full — break out and poll
@@ -5406,17 +5406,17 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     continue;  // No direct RDMA post — chunk goes through NVLink copy pipeline
                 }
 #endif  // USE_CUDA
-                
+
                 if (ctx.pxn_enabled) {
                     ctx.pxn_diag_direct_chunks++;
                 }
-                
+
                 // Select QP with lowest outstanding within this NIC (worker-level)
                 size_t qp_index = 0;
                 size_t min_qp_outstanding = SIZE_MAX;
                 bool found_available_qp = false;
                 for (size_t qp = 0; qp < qps_per_connection_; ++qp) {
-                    size_t qp_outstanding = worker_nic_qp_posted[best_nic][qp] - 
+                    size_t qp_outstanding = worker_nic_qp_posted[best_nic][qp] -
                                             worker_nic_qp_completed[best_nic][qp];
                     if (qp_outstanding < kMaxOutstandingPerQP && qp_outstanding < min_qp_outstanding) {
                         min_qp_outstanding = qp_outstanding;
@@ -5428,16 +5428,16 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     diag_iter_direct_break_qp_full++;
                     break;  // All QPs full on best NIC — poll for completions
                 }
-                
+
                 // Resolve connection info from cache
                 size_t host_idx_for_qp = chunk.host_idx;
                 uint64_t cache_key = (static_cast<uint64_t>(host_idx_for_qp) << 16) | best_nic;
                 auto cache_it = ac.cache.find(cache_key);
-                
+
                 uint32_t lkey, rkey;
                 size_t remote_nic;
                 struct ibv_qp *qp;
-                
+
                 if (cache_it != ac.cache.end()) {
                     const auto& cached = cache_it->second;
                     lkey = cached.lkey;
@@ -5464,7 +5464,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     }
                     qp = getOrCreateQP(best_nic, ctx.host_list[host_idx_for_qp], remote_nic, qp_index);
                 }
-                
+
                 // Validate lkey, rkey, qp
                 if (lkey == 0 || rkey == 0 || !qp) {
                     if (lkey == 0)
@@ -5482,7 +5482,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     ctx.finished.store(true);  // Must be last write to ctx (release fence)
                     break;  // Skip this context, will be removed in Phase 4
                 }
-                
+
                 // Prepare and post RDMA WR
                 struct ibv_sge sge;
                 memset(&sge, 0, sizeof(sge));
@@ -5490,7 +5490,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 sge.lkey = lkey;
 
                 sge.addr = chunk.local_addr;
-                
+
                 struct ibv_send_wr wr;
                 memset(&wr, 0, sizeof(wr));
                 wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
@@ -5500,7 +5500,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 wr.send_flags = IBV_SEND_SIGNALED;
                 wr.wr.rdma.remote_addr = chunk.remote_addr;
                 wr.wr.rdma.rkey = rkey;
-                
+
                 struct ibv_send_wr *bad_wr = nullptr;
                 int ret = ibv_post_send(qp, &wr, &bad_wr);
                 if (ret != 0) {
@@ -5510,11 +5510,11 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     ctx.finished.store(true);  // Must be last write to ctx (release fence)
                     break;
                 }
-                
+
                 // Update worker-level flow control counters
                 worker_nic_posted[best_nic]++;
                 worker_nic_qp_posted[best_nic][qp_index]++;
-                
+
                 // Update per-context counters (for stats and per-context completion tracking)
                 ctx.per_nic_posted[best_nic]++;
                 ctx.per_nic_qp_posted[best_nic][qp_index]++;
@@ -5522,7 +5522,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 ctx.next_chunk_idx.fetch_add(1);
                 post_batch_count++;
                 diag_iter_direct_posted++;
-                
+
                 // Record per-NIC first post time (for per-NIC BW measurement)
                 if (ctx.per_nic_first_post[best_nic].time_since_epoch().count() == 0) {
                     ctx.per_nic_first_post[best_nic] = std::chrono::steady_clock::now();
@@ -5552,15 +5552,15 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     std::chrono::duration_cast<std::chrono::nanoseconds>(t_px1 - t_px0).count());
             }
 #endif  // USE_CUDA
-            
+
             // Record all_posted_time when all direct chunks have been posted (only once)
             total_chunks = ctx.total_chunks.load();
-            if (ctx.next_chunk_idx.load() >= total_chunks && 
+            if (ctx.next_chunk_idx.load() >= total_chunks &&
                 ctx.all_posted_time.time_since_epoch().count() == 0) {
                 ctx.all_posted_time = std::chrono::steady_clock::now();
             }
         }
-        
+
         // ---- PXN diagnostics: sample outstanding BEFORE CQ polling ----
         for (auto& ac : active_contexts) {
             TransferContext& ctx = *ac.ctx;
@@ -5585,7 +5585,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             for (const auto& ac : active_contexts) {
                 active_ctx_info.push_back({ac.ctx->handle, ac.ctx});
             }
-            
+
             auto t_poll0 = std::chrono::steady_clock::now();
             int poll_ret = pollAllNicsForWorker(numa_id, poll_nic_indices,
                                                 worker_nic_completed,
@@ -5655,7 +5655,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             }
         }
 #endif  // USE_CUDA
-        
+
         // ---- PXN diagnostics: accumulate per-iteration stats ----
         for (auto& ac : active_contexts) {
             TransferContext& ctx = *ac.ctx;
@@ -5674,14 +5674,14 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             // Track CQ completions polled this iteration
             // (outstanding peak is now sampled before CQ polling above)
         }
-        
+
         // ---- Phase 4: Remove completed contexts ----
         {
             bool any_removed = false;
             for (size_t i = 0; i < active_contexts.size(); ) {
                 TransferContext& ctx = *active_contexts[i].ctx;
                 size_t total_chunks = ctx.total_chunks.load();
-                
+
                 if (ctx.finished.load()) {
                     // Already finished (error case) — finalize stats and remove
 #ifdef USE_CUDA
@@ -5723,7 +5723,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     any_removed = true;
                     continue;
                 }
-                
+
                 if (ctx.total_completed.load() >= total_chunks) {
                     // All chunks completed — mark finished
 #ifdef USE_CUDA
@@ -5770,7 +5770,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 }
                 ++i;
             }
-            
+
             // Rebuild poll NIC indices if contexts were removed
             if (any_removed) {
                 poll_nic_indices.clear();
@@ -5880,7 +5880,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             }
         }
     }
-    
+
     MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
 }
 
@@ -5945,12 +5945,11 @@ int MPComm::Impl::pollAllNicsForWorker(
     const std::vector<size_t>& poll_nic_indices,
     size_t (&worker_nic_completed)[kMaxNics],
     size_t (&worker_nic_qp_completed)[kMaxNics][kMaxQPsPerNic],
-    const std::vector<ActiveContextInfo>& active_ctx_info)
-{
+    const std::vector<ActiveContextInfo>& active_ctx_info) {
     const int poll_batch_size = static_cast<int>(poll_batch_size_);
     struct ibv_wc wc_array[64];
     size_t num_nics = nic_contexts_.size();
-    
+
     for (size_t nic : poll_nic_indices) {
         auto &nic_ctx = *nic_contexts_[nic];
         int n = ibv_poll_cq(nic_ctx.cq, poll_batch_size, wc_array);
@@ -5962,7 +5961,7 @@ int MPComm::Impl::pollAllNicsForWorker(
             size_t completed_nic = WrIdEncoding::decodeNic(wc_array[i].wr_id);
             size_t completed_qp = WrIdEncoding::decodeQp(wc_array[i].wr_id);
             TransferHandle wc_handle = WrIdEncoding::decodeHandle(wc_array[i].wr_id);
-            
+
             // Update worker-level flow control counters (always, regardless of success)
             if (completed_nic < num_nics) {
                 worker_nic_completed[completed_nic]++;
@@ -5970,7 +5969,7 @@ int MPComm::Impl::pollAllNicsForWorker(
                     worker_nic_qp_completed[completed_nic][completed_qp]++;
                 }
             }
-            
+
             // Fast path: find target context in local active list (no lock needed)
             TransferContext* target_ctx = nullptr;
             for (const auto& aci : active_ctx_info) {
@@ -5979,7 +5978,7 @@ int MPComm::Impl::pollAllNicsForWorker(
                     break;
                 }
             }
-            
+
             // Slow path: handle belongs to another transfer on same NUMA (rare)
             if (!target_ctx) {
                 auto& nts = per_numa_transfers_[numa_id];
@@ -5989,12 +5988,12 @@ int MPComm::Impl::pollAllNicsForWorker(
                     target_ctx = it->second.get();
                 }
             }
-            
+
             if (!target_ctx) {
                 // Orphaned completion (transfer already released) — ignore
                 continue;
             }
-            
+
             if (wc_array[i].status != IBV_WC_SUCCESS) {
                 // Quarantine the NIC that produced this WC error
                 if (nic < nic_quarantine_.size() && nic_quarantine_[nic]) {
@@ -6031,7 +6030,7 @@ int MPComm::Impl::pollAllNicsForWorker(
                     continue;
                 }
             }
-            
+
             // Route completion to the target context
             if (completed_nic < num_nics) {
                 target_ctx->per_nic_completed[completed_nic]++;
@@ -6066,34 +6065,40 @@ void MPComm::Impl::finalizeTransferStats(TransferContext& ctx) {
                     const std::chrono::steady_clock::time_point& end) -> double {
         return std::chrono::duration<double, std::micro>(end - start).count();
     };
-    
+
     size_t total_bytes = 0;
     for (size_t i = 0; i < ctx.lengths.size(); ++i) {
         total_bytes += ctx.lengths[i];
     }
     size_t total_chunks = ctx.total_chunks.load();
-    
+
     double total_time_us = to_us(ctx.start_time, ctx.end_time);
     double bandwidth_gbps = (total_bytes * 8.0) / (total_time_us * 1000.0);
-    
+
     char buf[256];
     auto& s = ctx.timing_breakdown_str;
     s.reserve(2048);
-    
+
     snprintf(buf, sizeof(buf), "MPComm: Transfer %lu timing breakdown (total=%.1f us, %.2f GB/s, %.1f Gbps):\n",
              ctx.handle, total_time_us, total_bytes / total_time_us / 1000.0, bandwidth_gbps);
     s += buf;
-    snprintf(buf, sizeof(buf), "  [1] Preparation (start->queued):     %8.1f us\n", to_us(ctx.start_time, ctx.queued_time));
+    snprintf(buf, sizeof(buf), "  [1] Preparation (start->queued):     %8.1f us\n",
+             to_us(ctx.start_time, ctx.queued_time));
     s += buf;
-    snprintf(buf, sizeof(buf), "  [2] Queue wait (queued->worker):     %8.1f us\n", to_us(ctx.queued_time, ctx.worker_start_time));
+    snprintf(buf, sizeof(buf), "  [2] Queue wait (queued->worker):     %8.1f us\n",
+             to_us(ctx.queued_time, ctx.worker_start_time));
     s += buf;
-    snprintf(buf, sizeof(buf), "  [3] Cache build (worker->cache):     %8.1f us\n", to_us(ctx.worker_start_time, ctx.cache_done_time));
+    snprintf(buf, sizeof(buf), "  [3] Cache build (worker->cache):     %8.1f us\n",
+             to_us(ctx.worker_start_time, ctx.cache_done_time));
     s += buf;
-    snprintf(buf, sizeof(buf), "  [4] First post (cache->first_post):  %8.1f us\n", to_us(ctx.cache_done_time, ctx.first_post_time));
+    snprintf(buf, sizeof(buf), "  [4] First post (cache->first_post):  %8.1f us\n",
+             to_us(ctx.cache_done_time, ctx.first_post_time));
     s += buf;
-    snprintf(buf, sizeof(buf), "  [5] Posting (first_post->all_posted):%8.1f us\n", to_us(ctx.first_post_time, ctx.all_posted_time));
+    snprintf(buf, sizeof(buf), "  [5] Posting (first_post->all_posted):%8.1f us\n",
+             to_us(ctx.first_post_time, ctx.all_posted_time));
     s += buf;
-    snprintf(buf, sizeof(buf), "  [6] Completion (all_posted->end):    %8.1f us\n", to_us(ctx.all_posted_time, ctx.end_time));
+    snprintf(buf, sizeof(buf), "  [6] Completion (all_posted->end):    %8.1f us\n",
+             to_us(ctx.all_posted_time, ctx.end_time));
     s += buf;
     snprintf(buf, sizeof(buf), "  Total chunks: %zu\n", total_chunks);
     s += buf;
@@ -6181,12 +6186,12 @@ void MPComm::Impl::finalizeTransferStats(TransferContext& ctx) {
 int MPComm::Impl::getNumaForAddr(uintptr_t addr) const {
     // Get NUMA node for the memory address
     int numa_node = getNumaNodeForAddr(reinterpret_cast<void*>(addr));
-    
+
     // If NUMA node is valid and within range, use it
     if (numa_node >= 0 && static_cast<size_t>(numa_node) < num_numa_nodes_) {
         return numa_node;
     }
-    
+
     // Fallback: use address hash to distribute across NUMA nodes
     return static_cast<int>((addr >> 12) % num_numa_nodes_);
 }
@@ -6196,10 +6201,10 @@ size_t MPComm::Impl::selectWorkerForNuma(int numa_id) {
     if (numa_id < 0 || static_cast<size_t>(numa_id) >= num_numa_nodes_) {
         numa_id = 0;
     }
-    
+
     // Round-robin selection among workers for this NUMA node
     size_t local_idx = numa_worker_rr_[numa_id]->fetch_add(1, std::memory_order_relaxed) % kWorkersPerNuma;
-    
+
     // Convert to global worker ID
     return static_cast<size_t>(numa_id) * kWorkersPerNuma + local_idx;
 }
@@ -6600,4 +6605,4 @@ int MPComm::tmaScatter(void *gpu_src, const long *indices,
                              block_size, max_sm_count, static_cast<int>(mode));
 }
 
-}  
+}  // namespace mpcomm

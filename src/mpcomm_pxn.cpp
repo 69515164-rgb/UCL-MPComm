@@ -14,11 +14,12 @@
 
 #include "mpcomm_pxn.h"
 
+#include <immintrin.h>  // _mm_pause
+#include <pthread.h>    // pthread_self
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <immintrin.h>  // _mm_pause
-#include <pthread.h>    // pthread_self
 #include <set>
 
 namespace mpcomm {
@@ -39,7 +40,6 @@ PxnManager::~PxnManager() {
 bool PxnManager::init(
     size_t nic_count,
     std::function<std::vector<size_t>(int gpu_device_id)> get_gpu_pcie_nics) {
-
     // Check environment variable
     const char* env_enable = std::getenv(kPxnEnableEnvVar);
     if (!env_enable || std::string(env_enable) != "1") {

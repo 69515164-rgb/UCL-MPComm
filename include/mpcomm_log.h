@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef MPCOMM_LOG_H_
-#define MPCOMM_LOG_H_
+#ifndef TRMT_MPCOMM_INCLUDE_MPCOMM_LOG_H_
+#define TRMT_MPCOMM_INCLUDE_MPCOMM_LOG_H_
+
+#include <pthread.h>
 
 #include <cerrno>
 #include <chrono>
@@ -21,7 +23,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <pthread.h>
 
 namespace mpcomm {
 
@@ -56,11 +57,11 @@ inline int mpcomm_get_log_level() {
         if (!env || env[0] == '\0') return default_level;
         // Accept numeric or string values
         if (strcmp(env, "0") == 0 || strcmp(env, "error") == 0 || strcmp(env, "ERROR") == 0)
-            return (int)MPCOMM_LOG_LEVEL_ERROR;
+            return static_cast<int>(MPCOMM_LOG_LEVEL_ERROR);
         if (strcmp(env, "1") == 0 || strcmp(env, "warn") == 0 || strcmp(env, "WARN") == 0)
-            return (int)MPCOMM_LOG_LEVEL_WARN;
+            return static_cast<int>(MPCOMM_LOG_LEVEL_WARN);
         if (strcmp(env, "2") == 0 || strcmp(env, "info") == 0 || strcmp(env, "INFO") == 0)
-            return (int)MPCOMM_LOG_LEVEL_INFO;
+            return static_cast<int>(MPCOMM_LOG_LEVEL_INFO);
         if (strcmp(env, "3") == 0 || strcmp(env, "debug") == 0 || strcmp(env, "DEBUG") == 0)
             return (int)MPCOMM_LOG_LEVEL_DEBUG;
         return default_level;
@@ -78,7 +79,7 @@ inline void mpcomm_log_timestamp(char* buf, size_t len) {
     localtime_r(&t, &tm_buf);
     snprintf(buf, len, "%02d:%02d:%02d.%03d",
              tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
-             (int)ms.count());
+             static_cast<int>(ms.count()));
 }
 
 // Get lightweight thread ID (low 16 bits of pthread_self, avoids gettid syscall)
@@ -147,4 +148,4 @@ inline unsigned int mpcomm_log_tid() {
 
 }  // namespace mpcomm
 
-#endif  // MPCOMM_LOG_H_
+#endif  // TRMT_MPCOMM_INCLUDE_MPCOMM_LOG_H_

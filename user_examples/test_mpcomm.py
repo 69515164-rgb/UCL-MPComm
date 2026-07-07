@@ -27,43 +27,44 @@ layer handles multi-NIC dispatching and worker-thread binding internally.
 
 Usage:
     # Basic scatter test (single NUMA, default NUMA 0)
-    python test_mpcomm.py --mode scatter --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --targets target1:<target_ip>:12345
 
     # Gather test
-    python test_mpcomm.py --mode gather --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode gather --targets target1:<target_ip>:12345
 
     # Broadcast test (same data to all targets)
-    python test_mpcomm.py --mode broadcast --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode broadcast --targets target1:<target_ip>:12345
 
     # All modes (scatter + gather + broadcast + put + get)
-    python test_mpcomm.py --mode all --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode all --targets target1:<target_ip>:12345
 
     # Put test (write to a single remote host)
-    python test_mpcomm.py --mode put --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode put --targets target1:<target_ip>:12345
 
     # Get test (read from a single remote host)
-    python test_mpcomm.py --mode get --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode get --targets target1:<target_ip>:12345
 
     # Polling completion mode
-    python test_mpcomm.py --mode scatter --async-mode polling --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --async-mode polling --targets target1:<target_ip>:12345
 
     # GPU source (GPUDirect RDMA via nvidia-peermem)
-    python test_mpcomm.py --mode scatter --gpu 0 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --gpu 0 --targets target1:<target_ip>:12345
 
     # GPU performance test
-    python test_mpcomm.py --mode scatter --gpu 0 --test-mode performance --iterations 10 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --gpu 0 --test-mode performance --iterations 10 --targets target1:<target_ip>:12345
 
     # Multi-NUMA buffers (single MPComm, multiple buffers on different NUMA nodes)
-    python test_mpcomm.py --mode scatter --num-numas 0,1 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --num-numas 0,1 --targets target1:<target_ip>:12345
 
     # Single specific NUMA node
-    python test_mpcomm.py --mode scatter --num-numas 1 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --num-numas 1 --targets target1:<target_ip>:12345
 
     # Batch mode: submit multiple async requests per NUMA per iteration
-    python test_mpcomm.py --mode scatter --batch-size 4 --test-mode performance --iterations 10 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --batch-size 4 --test-mode performance \
+        --iterations 10 --targets target1:<target_ip>:12345
 
     # Explicit buffer info (legacy)
-    python test_mpcomm.py --mode scatter --targets target1:192.168.1.100:12345:0x7f1234:12345678
+    python test_mpcomm.py --mode scatter --targets target1:<target_ip>:12345:0x7f1234:12345678
 
 Environment variables:
     MPCOMM_HOST_ID: Local host identifier
@@ -184,7 +185,7 @@ class TargetInfo:
 
     def get_buffer_for_numa(self, numa_node: int) -> dict:
         """Get buffer info for specific NUMA node.
-        
+
         Returns buffer dict with 'addr', 'length', 'numa_node', 'rkeys'.
         Falls back to remote_addr/rkeys if no NUMA-specific buffer found.
         """
@@ -1378,15 +1379,15 @@ def parse_target(target_str: str) -> TargetInfo:
     """
     Parse target string in format:
         host_id:tcp_addr:tcp_port[:remote_addr:rkey1,rkey2,...]
-    
+
     If remote_addr and rkeys are not provided, they will be queried from remote.
-    
+
     Examples:
         # Auto-query buffer info (recommended)
-        target1:192.168.1.100:12345
-        
+        target1:<target_ip>:12345
+
         # Explicit buffer info (legacy)
-        target1:192.168.1.100:12345:0x7f1234000000:12345678,87654321
+        target1:<target_ip>:12345:0x7f1234000000:12345678,87654321
     """
     parts = target_str.strip().split(":")
     if len(parts) < 3:
@@ -1398,11 +1399,11 @@ def parse_target(target_str: str) -> TargetInfo:
     host_id = parts[0]
     tcp_addr = parts[1]
     tcp_port = int(parts[2])
-    
+
     # Optional: remote_addr and rkeys (can be queried from remote)
     remote_addr = 0
     rkeys = []
-    
+
     if len(parts) >= 5:
         remote_addr = int(parts[3], 0)  # Support hex
         rkeys = [int(r, 0) for r in parts[4].split(",")]
@@ -1430,42 +1431,42 @@ Target format:
 
 Examples:
     # Basic scatter (single NUMA 0, wait completion)
-    python test_mpcomm.py --mode scatter --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --targets target1:<target_ip>:12345
 
     # Broadcast (same data to all targets)
-    python test_mpcomm.py --mode broadcast --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode broadcast --targets target1:<target_ip>:12345
 
     # All modes (scatter + gather + broadcast)
-    python test_mpcomm.py --mode all --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode all --targets target1:<target_ip>:12345
 
     # Polling completion mode
-    python test_mpcomm.py --mode scatter --async-mode polling --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --async-mode polling --targets target1:<target_ip>:12345
 
     # GPU source scatter (GPUDirect RDMA via nvidia-peermem)
-    python test_mpcomm.py --mode scatter --gpu 0 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --gpu 0 --targets target1:<target_ip>:12345
 
     # GPU performance test
     python test_mpcomm.py --mode scatter --gpu 0 --test-mode performance --iterations 10 \\
-        --targets target1:192.168.1.100:12345
+        --targets target1:<target_ip>:12345
 
     # Multi-NUMA (single MPComm, multiple buffers on different NUMA nodes)
-    python test_mpcomm.py --mode scatter --num-numas 0,1 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --num-numas 0,1 --targets target1:<target_ip>:12345
 
     # Single specific NUMA node
-    python test_mpcomm.py --mode scatter --num-numas 1 --targets target1:192.168.1.100:12345
+    python test_mpcomm.py --mode scatter --num-numas 1 --targets target1:<target_ip>:12345
 
     # Batch mode (multiple concurrent async requests per NUMA per iteration)
     python test_mpcomm.py --mode scatter --batch-size 4 --test-mode performance --iterations 10 \\
-        --targets target1:192.168.1.100:12345
+        --targets target1:<target_ip>:12345
 
     # Multiple targets
     python test_mpcomm.py --mode both \\
-        --targets target1:192.168.1.100:12345 \\
-        --targets target2:114.193.206.253:12345
+        --targets target1:<target_ip>:12345 \\
+        --targets target2:<target2_ip>:12345
 
     # Broadcast performance test
     python test_mpcomm.py --mode broadcast --test-mode performance --iterations 10 \\
-        --targets target1:192.168.1.100:12345
+        --targets target1:<target_ip>:12345
 """,
     )
 

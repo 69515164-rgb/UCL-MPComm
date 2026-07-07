@@ -21,7 +21,7 @@ This script runs on the target host and waits for incoming RDMA connections.
 
 Usage:
     python mpcomm_target.py --host-id target1 --tcp-port 12345 --device mlx5_0
-    
+
     # Multi-NUMA mode (allocate separate buffer on specified NUMA nodes)
     python mpcomm_target.py --host-id target1 --tcp-port 12345 --num-numas 0,1
 
@@ -163,7 +163,7 @@ class MPCommTargetServer:
         """Initialize buffer with IPv4 pattern for verification."""
         pattern_size = min(self.buffer_size, 1024 * 1024)  # Initialize first 1MB
         payload = _build_ipv4_pattern(self._ipv4_bytes, pattern_size)
-        
+
         ret = self.comm.write_bytes_to_buffer(self.buffer_addr, payload, len(payload))
         if ret != 0:
             print("[target] Warning: failed to seed buffer with IPv4 pattern", file=sys.stderr)
@@ -239,13 +239,13 @@ class MPCommTargetServer:
 
 class MultiNumaTargetServer:
     """Target server that maintains buffers with NUMA regions.
-    
+
     This class allocates a buffer for each NUMA node and publishes each buffer
     with its NUMA info. Initiator can query all buffers and match NUMA-to-NUMA:
     - initiator NUMA 0 -> target buffer with numa_node=0
     - initiator NUMA 1 -> target buffer with numa_node=1
     - etc.
-    
+
     Each buffer is published separately with publish_buffer(addr, length, numa_node).
     The new multi-buffer API allows querying all buffers with their NUMA info.
     """
@@ -292,7 +292,7 @@ class MultiNumaTargetServer:
         self._ipv4_bytes = _resolve_ipv4_bytes(host_id)
         self._libnuma = None  # Will be set by _allocate_numa_buffers
         self._allocate_numa_buffers()
-        
+
         # Initialize each NUMA buffer with IPv4 pattern
         for idx, numa_node in enumerate(numa_nodes):
             self._initialize_buffer_pattern(idx, self.numa_buffer_addrs[idx])
@@ -311,7 +311,7 @@ class MultiNumaTargetServer:
     def _allocate_numa_buffers(self) -> None:
         """Allocate tensor buffers on different NUMA nodes using libnuma."""
         import ctypes
-        
+
         # Try to load libnuma for explicit NUMA allocation
         try:
             libnuma = ctypes.CDLL("libnuma.so.1", mode=ctypes.RTLD_GLOBAL)
@@ -320,16 +320,16 @@ class MultiNumaTargetServer:
             libnuma.numa_alloc_onnode.restype = ctypes.c_void_p
             libnuma.numa_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
             libnuma.numa_max_node.restype = ctypes.c_int
-            
+
             if libnuma.numa_available() < 0:
                 libnuma = None
                 print("[multi-numa target] WARNING: libnuma not available, falling back to default allocation")
         except OSError:
             libnuma = None
             print("[multi-numa target] WARNING: libnuma.so.1 not found, falling back to default allocation")
-        
+
         self._libnuma = libnuma  # Store for cleanup
-        
+
         for idx, target_numa in enumerate(self.numa_nodes):
             try:
                 if libnuma is not None:
@@ -337,24 +337,24 @@ class MultiNumaTargetServer:
                     max_node = libnuma.numa_max_node()
                     if target_numa > max_node:
                         raise RuntimeError(f"NUMA node {target_numa} exceeds max node {max_node}")
-                    
+
                     # Allocate aligned to page size for better performance
                     page_size = 4096
                     alloc_size = ((self.buffer_size + page_size - 1) // page_size) * page_size
-                    
+
                     ptr = libnuma.numa_alloc_onnode(alloc_size, target_numa)
                     if not ptr:
                         raise RuntimeError(f"numa_alloc_onnode failed for NUMA {target_numa}")
-                    
+
                     # Touch all pages to ensure they are allocated
                     ctypes.memset(ptr, 0, alloc_size)
-                    
+
                     addr = ptr
                     ret = self.comm.register_memory(addr, self.buffer_size)
                     if ret != 0:
                         libnuma.numa_free(ptr, alloc_size)
                         raise RuntimeError(f"Failed to register memory for NUMA {target_numa}: {ret}")
-                    
+
                     # Store as tuple: (ptr, alloc_size, is_numa_alloc)
                     self._tensors.append((ptr, alloc_size, True))
                     self.numa_buffer_addrs.append(addr)
@@ -401,7 +401,7 @@ class MultiNumaTargetServer:
         """Get buffer information for exchange with initiator."""
         # Return info for all NUMA buffers
         buffers_info = []
-        for idx, (numa_node, addr) in enumerate(zip(self.numa_nodes, self.numa_buffer_addrs)):
+        for numa_node, addr in zip(self.numa_nodes, self.numa_buffer_addrs):
             buffers_info.append({
                 "numa_node": numa_node,  # Use actual NUMA node ID
                 "addr": addr,
@@ -426,7 +426,7 @@ class MultiNumaTargetServer:
     def close(self) -> None:
         """Cleanup resources."""
         self._unpublish_buffers()
-        for numa_id, (addr, tensor_info) in enumerate(zip(self.numa_buffer_addrs, self._tensors)):
+        for addr, tensor_info in zip(self.numa_buffer_addrs, self._tensors):
             if addr:
                 self.comm.unregister_memory(addr)
                 # Check if this was a numa allocation
@@ -500,14 +500,14 @@ Examples:
     python mpcomm_target.py --host-id target1:12345
 
     # Start target server with specific device
-    python mpcomm_target.py --host-id 10.0.0.2:12345 --device mlx5_0
+    python mpcomm_target.py --host-id <target_ip>:12345 --device mlx5_0
 
     # Start target server with larger buffer
     python mpcomm_target.py --host-id target1:12345 --buffer-size 20GB
-    
+
     # Multi-NUMA mode (use NUMA nodes 0 and 1, each with separate buffer)
     python mpcomm_target.py --host-id target1:12345 --num-numas 0,1
-    
+
     # Multi-NUMA with custom buffer size per NUMA
     python mpcomm_target.py --host-id target1:12345 --num-numas 0,1 --buffer-size 10GB
 """,
@@ -584,7 +584,7 @@ def main() -> None:
     args = parse_args()
 
     buffer_size = parse_size(args.buffer_size)
-    
+
     # Parse NUMA nodes (e.g. "0", "1", "0,1")
     numa_nodes_str = args.num_numas.strip()
     numa_nodes = [int(n.strip()) for n in numa_nodes_str.split(",") if n.strip()]

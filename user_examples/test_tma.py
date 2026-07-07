@@ -43,11 +43,10 @@ Usage:
 import argparse
 import os
 import sys
-import time
-
-import torch
 import ctypes
 import ctypes.util
+
+import torch
 
 
 def _alloc_aligned(num_bytes, alignment=1024):
@@ -623,7 +622,7 @@ def main():
         print(f"   TMA 内核可能无法执行! 建议使用 --mode sm")
 
     # Bind DRAM allocation to GPU-local NUMA node for optimal PCIe bandwidth
-    gpu_numa = _bind_numa_to_gpu(args.gpu)
+    _bind_numa_to_gpu(args.gpu)
 
     # 初始化 MPComm (本地模式，无需 RDMA 连接)
     comm = mpcomm.MPComm()

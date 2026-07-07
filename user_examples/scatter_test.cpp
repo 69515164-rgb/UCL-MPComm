@@ -1,3 +1,17 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // MPComm C++ Scatter / Gather / Broadcast Performance Test
 //
 // Demonstrates scatter_async, gather_async, and broadcast_async API usage
@@ -19,27 +33,27 @@
 //   ./scatter_test --target target1:192.168.1.100:12345 --target target2:114.193.206.253:12345
 //
 //   # Multiple targets with custom per-target size and iterations:
-//   ./scatter_test --target t1:10.0.0.1:12345 --target t2:10.0.0.2:12345 --size 500000000 --iterations 20
+//   ./scatter_test --target t1:<ip1>:12345 --target t2:<ip2>:12345 --size 500000000 --iterations 20
 //
 //   # HBM (GPU) scatter to multiple targets:
-//   ./scatter_test --target t1:10.0.0.1:12345 --target t2:10.0.0.2:12345 --gpu 0
+//   ./scatter_test --target t1:<ip1>:12345 --target t2:<ip2>:12345 --gpu 0
 //
 //   # Both DRAM and HBM:
-//   ./scatter_test --target t1:10.0.0.1:12345 --target t2:10.0.0.2:12345 --gpu 0 --both
+//   ./scatter_test --target t1:<ip1>:12345 --target t2:<ip2>:12345 --gpu 0 --both
 //
 //   # Multi-NUMA initiator (dual NUMA buffers, each NUMA sends via its local NICs):
-//   ./scatter_test --target t1:10.0.0.1:12345 --target t2:10.0.0.2:12345 --num-numas 0,1
+//   ./scatter_test --target t1:<ip1>:12345 --target t2:<ip2>:12345 --num-numas 0,1
 //
 //   # Run specific test types (default: scatter,gather,broadcast):
-//   ./scatter_test --target t1:10.0.0.1:12345 --test-type scatter
-//   ./scatter_test --target t1:10.0.0.1:12345 --test-type gather
-//   ./scatter_test --target t1:10.0.0.1:12345 --test-type broadcast
-//   ./scatter_test --target t1:10.0.0.1:12345 --test-type scatter,gather,broadcast
+//   ./scatter_test --target t1:<ip1>:12345 --test-type scatter
+//   ./scatter_test --target t1:<ip1>:12345 --test-type gather
+//   ./scatter_test --target t1:<ip1>:12345 --test-type broadcast
+//   ./scatter_test --target t1:<ip1>:12345 --test-type scatter,gather,broadcast
 //
 //   # Single-target put / get (RDMA WRITE / READ to/from one peer):
-//   ./scatter_test --target t1:10.0.0.1:12345 --test-type put
-//   ./scatter_test --target t1:10.0.0.1:12345 --test-type get
-//   ./scatter_test --target t1:10.0.0.1:12345 --test-type put,get
+//   ./scatter_test --target t1:<ip1>:12345 --test-type put
+//   ./scatter_test --target t1:<ip1>:12345 --test-type get
+//   ./scatter_test --target t1:<ip1>:12345 --test-type put,get
 //   # NOTE: put and get require exactly one --target.
 //
 // Both mode (a single process simultaneously acts as target for some peers
@@ -75,6 +89,10 @@
 
 #include <mpcomm.h>
 
+#include <numa.h>
+#include <numaif.h>
+#include <sys/stat.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -85,9 +103,6 @@
 #include <atomic>
 #include <csignal>
 #include <sstream>
-#include <numa.h>
-#include <numaif.h>
-#include <sys/stat.h>
 
 #ifdef USE_CUDA
 #include <cuda.h>
@@ -147,7 +162,7 @@ struct TargetInfo {
     int tcp_port = 0;
     int channel_id = 0;   // 0 = not specified (use legacy NUMA matching)
     int peer_numa = 0;    // used only if channel_id > 0
-    std::string job_label; // empty = default job; otherwise which logical job
+    std::string job_label;  // empty = default job; otherwise which logical job
                            //   this target belongs to (both mode only)
 };
 
@@ -193,7 +208,7 @@ struct TestConfig {
     int gpu_device = -1;               // -1 = CPU only
     bool run_both = false;             // run both DRAM and HBM
     std::vector<int> initiator_numas;  // NUMA nodes for initiator buffers
-    std::vector<TestOpType> test_types; // which operations to benchmark
+    std::vector<TestOpType> test_types;  // which operations to benchmark
 
     // --- Target mode ---
     size_t target_buffer_size = 2ULL * 1024 * 1024 * 1024;  // 2 GB default
@@ -236,7 +251,7 @@ static size_t parseSize(const std::string &str) {
     std::string suffix = str.substr(suffix_start);
 
     // Convert suffix to uppercase
-    for (auto &c : suffix) c = (char)toupper((unsigned char)c);
+    for (auto &c : suffix) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
 
     size_t multiplier = 1;
     if (suffix.empty() || suffix == "B") {
@@ -334,16 +349,17 @@ static void printUsage(const char *prog) {
     printf("\nExamples:\n");
     printf("  # Target (remote host):\n");
     printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G\n", prog);
-    printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G --num-numas 0,1\n", prog);
+    printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 "
+           "--buffer-size 2G --num-numas 0,1\n", prog);
     printf("\n  # Initiator (local host):\n");
-    printf("  %s --target t1:10.0.0.1:12345 --target t2:10.0.0.2:12345\n", prog);
-    printf("  %s --target t1:10.0.0.1:12345 --gpu 0 --both\n", prog);
+    printf("  %s --target t1:<ip1>:12345 --target t2:<ip2>:12345\n", prog);
+    printf("  %s --target t1:<ip1>:12345 --gpu 0 --both\n", prog);
     printf("  # Multi-NUMA initiator:\n");
-    printf("  %s --target t1:10.0.0.1:12345 --num-numas 0,1\n", prog);
+    printf("  %s --target t1:<ip1>:12345 --num-numas 0,1\n", prog);
     printf("\n  # Both (single process, multiple publish buffers + multiple benchmarks):\n");
     printf("  %s --mode both --host-id A:12345 --tcp-port 12345 \\\n", prog);
     printf("      --serve 1001:2G:0 --serve 1002:2G:0 \\\n");
-    printf("      --target B:10.0.0.2:12345:2001:0 --target C:10.0.0.3:12345:2002:0\n");
+    printf("      --target B:<ip2>:12345:2001:0 --target C:<ip3>:12345:2002:0\n");
 }
 
 // Parse a --target argument. Accepts:
@@ -850,8 +866,7 @@ static TransferHandle issueTransferAsync(
     uintptr_t local_addr,
     const std::vector<std::string> &host_list,
     const std::vector<uintptr_t> &remote_addrs,
-    const std::vector<size_t> &lengths)
-{
+    const std::vector<size_t> &lengths) {
     switch (op) {
         case TestOpType::SCATTER:
             return comm.scatterAsync(local_addr, host_list, remote_addrs, lengths);
@@ -889,8 +904,7 @@ static int runTransferBenchmark(
     // per-NUMA remote addresses: remote_addrs_per_numa[numa_idx][target_idx]
     const std::vector<std::vector<uintptr_t>> &remote_addrs_per_numa,
     const std::vector<size_t> &lengths,
-    const char *mem_type_label)
-{
+    const char *mem_type_label) {
     const char *op_name_upper = "";
     const char *op_direction = "";
     switch (op_type) {
@@ -1134,7 +1148,7 @@ static int runTransferBenchmark(
     printf("\n--- %s %s Summary (%zu targets, %zu NUMAs, batch_size=%d) ---\n",
            op_name_upper, mem_type_label, host_list.size(), num_numas, batch_size);
     printf("  Iterations: %d (%d async reqs per NUMA per iter, %d total reqs per iter)\n",
-           total_iters, batch_size, batch_size * (int)num_numas);
+           total_iters, batch_size, batch_size * static_cast<int>(num_numas));
     printf("  Data per iter: %s (%.2f MB per NUMA)\n",
            formatBytes(iter_total_size).c_str(), iter_per_numa_size / 1e6);
     printf("  Aggregate Avg: %.3f ms (%.2f Gbps, %.2f GB/s)\n",
@@ -1589,7 +1603,8 @@ static int runBothMode(const TestConfig &cfg) {
             fprintf(stderr, "registerMemory failed for serve channel_id=%d: %d\n",
                     s.channel_id, ret);
             if (numa_available() >= 0) numa_free(nb.ptr, alloc_size);
-            else free(nb.ptr);
+            else
+                free(nb.ptr);
             freeServeBuffers();
             comm.shutdown();
             return 1;
@@ -1602,7 +1617,8 @@ static int runBothMode(const TestConfig &cfg) {
                     s.channel_id, tag, ret);
             comm.unregisterMemory(nb.ptr);
             if (numa_available() >= 0) numa_free(nb.ptr, alloc_size);
-            else free(nb.ptr);
+            else
+                free(nb.ptr);
             freeServeBuffers();
             comm.shutdown();
             return 1;

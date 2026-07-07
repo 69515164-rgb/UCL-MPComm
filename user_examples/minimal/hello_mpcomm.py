@@ -4,10 +4,14 @@
 #   target    :  hello_mpcomm.py target    <host_id> <tcp_port>
 #   initiator :  hello_mpcomm.py initiator <host_id> <target_host_id> <target_ip> <target_port>
 
-import ctypes, signal, sys, time
+import ctypes
+import signal
+import sys
+import time
 import mpcomm
 
 BUF = 4 * 1024 * 1024  # 4 MiB
+
 
 def alloc(n):
     """Return (addr, keepalive) for an n-byte zeroed buffer."""
@@ -32,10 +36,13 @@ def run_target(host_id, tcp_port):
     stop = [False]
     signal.signal(signal.SIGINT,  lambda *_: stop.__setitem__(0, True))
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__(0, True))
-    while not stop[0]: time.sleep(0.2)
+    while not stop[0]:
+        time.sleep(0.2)
 
-    c.stop_accept_thread(); c.unpublish_all_buffers()
-    c.unregister_memory(addr); c.shutdown()
+    c.stop_accept_thread()
+    c.unpublish_all_buffers()
+    c.unregister_memory(addr)
+    c.shutdown()
     del keep
 
 def run_initiator(host_id, tid, tip, tport):
@@ -51,14 +58,18 @@ def run_initiator(host_id, tid, tip, tport):
     check(c.connect(tid, tip, tport),   "[init] connect")
 
     remote = c.query_remote_buffer_by_numa(tid, tip, tport, -1)
-    if not remote: sys.exit("[init] query failed")
+    if not remote:
+        sys.exit("[init] query failed")
     print(f"[init] remote addr=0x{remote['addr']:x} len={remote['length']}")
 
     def do(op, h):
-        if h == mpcomm.INVALID_TRANSFER_HANDLE: sys.exit(f"[init] {op} submit failed")
+        if h == mpcomm.INVALID_TRANSFER_HANDLE:
+            sys.exit(f"[init] {op} submit failed")
         rc = c.wait_transfer(h, 10000)
-        r = c.get_transfer_result(h); c.release_transfer(h)
-        if rc or r["error_code"]: sys.exit(f"[init] {op} rc={rc} err={r['error_code']}")
+        r = c.get_transfer_result(h)
+        c.release_transfer(h)
+        if rc or r["error_code"]:
+            sys.exit(f"[init] {op} rc={rc} err={r['error_code']}")
         print(f"[init] {op} OK {r['bytes_transferred']}B {r['elapsed_ms']:.3f}ms")
 
     do("put", c.put_async(send, tid, remote["addr"], BUF))
@@ -68,7 +79,9 @@ def run_initiator(host_id, tid, tip, tport):
          bytes((ctypes.c_ubyte * BUF).from_address(recv))
     print("[init] VERIFY OK" if ok else "[init] VERIFY FAIL")
 
-    c.unregister_memory(send); c.unregister_memory(recv); c.shutdown()
+    c.unregister_memory(send)
+    c.unregister_memory(recv)
+    c.shutdown()
     del sk, rk
     sys.exit(0 if ok else 2)
 

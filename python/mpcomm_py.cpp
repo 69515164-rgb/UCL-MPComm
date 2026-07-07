@@ -29,7 +29,7 @@ namespace mpcomm {
  * Provides Python-friendly interface with uintptr_t for memory addresses
  */
 class MPCommPy {
-public:
+ public:
     MPCommPy() = default;
     ~MPCommPy() = default;
 
@@ -552,7 +552,7 @@ public:
                                 max_sm_count, static_cast<H2DMode>(mode));
     }
 
-private:
+ private:
     MPComm comm_;
 };
 

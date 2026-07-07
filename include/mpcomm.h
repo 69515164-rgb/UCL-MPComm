@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef MPCOMM_MPCOMM_H_
-#define MPCOMM_MPCOMM_H_
+#ifndef TRMT_MPCOMM_INCLUDE_MPCOMM_H_
+#define TRMT_MPCOMM_INCLUDE_MPCOMM_H_
 
 #include <stdint.h>
 
@@ -152,7 +152,7 @@ struct TransferResult {
  *                                    requires LOG_LEVEL=3/debug).
  */
 class MPComm {
-public:
+ public:
     MPComm();
     ~MPComm();
 
@@ -495,11 +495,11 @@ public:
 
     // ==================== End HBM-DRAM Mapping & TMA API ====================
 
-private:
+ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace mpcomm
 
-#endif  // MPCOMM_MPCOMM_H_
+#endif  // TRMT_MPCOMM_INCLUDE_MPCOMM_H_

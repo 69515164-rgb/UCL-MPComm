@@ -63,7 +63,7 @@ inline int mpcomm_get_log_level() {
         if (strcmp(env, "2") == 0 || strcmp(env, "info") == 0 || strcmp(env, "INFO") == 0)
             return static_cast<int>(MPCOMM_LOG_LEVEL_INFO);
         if (strcmp(env, "3") == 0 || strcmp(env, "debug") == 0 || strcmp(env, "DEBUG") == 0)
-            return (int)MPCOMM_LOG_LEVEL_DEBUG;
+            return static_cast<int>(MPCOMM_LOG_LEVEL_DEBUG);
         return default_level;
     }();
     return level;

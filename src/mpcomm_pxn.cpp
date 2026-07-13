@@ -18,6 +18,7 @@
 #include <pthread.h>    // pthread_self
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -53,7 +54,7 @@ bool PxnManager::init(
     const char* env_buf_size = std::getenv(kPxnBufferSizeEnvVar);
     if (env_buf_size && env_buf_size[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long long val = strtoull(env_buf_size, &endptr, 10);
+        uint64_t val = strtoull(env_buf_size, &endptr, 10);
         if (endptr != env_buf_size && *endptr == '\0' && val > 0) {
             buffer_size_ = static_cast<size_t>(val);
             MPCOMM_LOG_INFO("MPComm PXN: Using buffer size from %s: %zu bytes\n",
@@ -255,9 +256,9 @@ bool PxnManager::allocateProxyBuffers() {
         pb.free_offset.store(0);
 
         MPCOMM_LOG_INFO("MPComm PXN: Allocated %zu MB proxy buffer on GPU %d "
-                        "(addr=0x%llx)\n",
+                        "(addr=0x%" PRIx64 ")\n",
                         buffer_size_ >> 20, dev_id,
-                        (unsigned long long)pb.buffer);
+                        static_cast<uint64_t>(pb.buffer));
     }
 
     // Enable P2P access between all GPU pairs that have NVLink
@@ -530,9 +531,9 @@ int PxnManager::registerProxyBuffers(
             return ret;
         }
         MPCOMM_LOG_INFO("MPComm PXN: Registered proxy buffer GPU %d "
-                        "(addr=0x%llx, size=%zu)\n",
+                        "(addr=0x%" PRIx64 ", size=%zu)\n",
                         pb.gpu_device_id,
-                        (unsigned long long)pb.buffer, pb.size);
+                        static_cast<uint64_t>(pb.buffer), pb.size);
     }
     return 0;
 }
@@ -667,9 +668,9 @@ void PxnManager::copyThreadLoop(PxnCopyThreadState* state) {
     }
 
     MPCOMM_LOG_INFO("MPComm PXN: Unified copy thread started with %zu GPUs, "
-                    "%zu streams/GPU (tid=%lu)\n",
+                    "%zu streams/GPU (tid=%" PRIu64 ")\n",
                     state->gpu_resources.size(), kPxnStreamsPerThread,
-                    static_cast<unsigned long>(pthread_self()));
+                    static_cast<uint64_t>(pthread_self()));
 
     while (state->running.load(std::memory_order_acquire)) {
         // Drain recycled flags back to the pool for reuse

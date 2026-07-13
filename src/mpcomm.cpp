@@ -47,6 +47,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -325,7 +326,7 @@ struct TransferContext {
     bool pxn_enabled;           // Whether this transfer uses PXN proxy forwarding
     int pxn_source_gpu;         // Source GPU device_id (valid when pxn_enabled)
     void* pxn_source_ctx;       // Actual CUDA context (CUcontext) that owns the source buffer
-    bool pxn_is_proxy_nic[kMaxNics]; // true if NIC requires NVLink proxy (precomputed)
+    bool pxn_is_proxy_nic[kMaxNics];  // true if NIC requires NVLink proxy (precomputed)
 
     // ---- Dynamic PXN fields (min_outstanding load balancing) ----
     // Each proxy pipeline corresponds to one proxy GPU + NIC pair.
@@ -609,10 +610,10 @@ class MPComm::Impl {
     int unmapDRAMfromGPU(void *host_addr);
 
     // TMA Transfer
-    int tmaGather(uintptr_t dram_dev_ptr, const long *indices,
+    int tmaGather(uintptr_t dram_dev_ptr, const int64_t *indices,
                   void *gpu_dst, int num_blocks, int block_size,
                   int max_sm_count, int mode);
-    int tmaScatter(void *gpu_src, const long *indices,
+    int tmaScatter(void *gpu_src, const int64_t *indices,
                    uintptr_t dram_dev_ptr, int num_blocks, int block_size,
                    int max_sm_count, int mode);
 
@@ -899,7 +900,7 @@ MPComm::Impl::Impl()
     const char* env_val = std::getenv(kMaxRdmaTransferSizeEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long long val = strtoull(env_val, &endptr, 10);
+        uint64_t val = strtoull(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0) {
             max_rdma_transfer_size_ = static_cast<size_t>(val);
             MPCOMM_LOG_INFO("MPComm: Using max RDMA transfer size from %s: %zu bytes\n",
@@ -915,7 +916,7 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kQpsPerConnectionEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long val = strtoul(env_val, &endptr, 10);
+        uint64_t val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 64) {
             qps_per_connection_ = static_cast<size_t>(val);
             MPCOMM_LOG_INFO("MPComm: Using QPs per connection from %s: %zu\n",
@@ -932,7 +933,7 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kGidIndexEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        long val = strtol(env_val, &endptr, 10);
+        int64_t val = strtol(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val >= -1 && val <= 255) {
             gid_index_ = static_cast<int>(val);
             MPCOMM_LOG_INFO("MPComm: Using GID index from %s: %d\n",
@@ -947,7 +948,7 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kPollBatchSizeEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long val = strtoul(env_val, &endptr, 10);
+        uint64_t val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 256) {
             poll_batch_size_ = static_cast<size_t>(val);
             MPCOMM_LOG_INFO("MPComm: Using poll batch size from %s: %zu\n",
@@ -962,7 +963,7 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kMaxSendWREnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long val = strtoul(env_val, &endptr, 10);
+        uint64_t val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 8192) {
             max_send_wr_ = static_cast<int>(val);
             MPCOMM_LOG_INFO("MPComm: Using max send WR from %s: %d\n",
@@ -977,7 +978,7 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kMaxOutstandingPerQPEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long val = strtoul(env_val, &endptr, 10);
+        uint64_t val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 8192) {
             max_outstanding_per_qp_ = static_cast<size_t>(val);
             MPCOMM_LOG_INFO("MPComm: Using max outstanding per QP from %s: %zu\n",
@@ -992,7 +993,7 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kMaxIdleSpinsEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long val = strtoul(env_val, &endptr, 10);
+        uint64_t val = strtoul(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0' && val > 0 && val <= 10000000) {
             max_idle_spins_ = static_cast<size_t>(val);
             MPCOMM_LOG_INFO("MPComm: Using max idle spins from %s: %zu\n",
@@ -1009,7 +1010,7 @@ MPComm::Impl::Impl()
     env_val = std::getenv(kTransferStatsIntervalEnvVar);
     if (env_val && env_val[0] != '\0') {
         char* endptr = nullptr;
-        unsigned long long val = strtoull(env_val, &endptr, 10);
+        uint64_t val = strtoull(env_val, &endptr, 10);
         if (endptr != env_val && *endptr == '\0') {
             transfer_stats_interval_ = static_cast<size_t>(val);
             MPCOMM_LOG_INFO("MPComm: Using transfer stats interval from %s: %zu\n",
@@ -1256,7 +1257,8 @@ int MPComm::Impl::init(const std::string &local_host_id,
         try {
             fs::create_directories(target_dir);
         } catch (const fs::filesystem_error& e) {
-            MPCOMM_LOG_WARN("MPComm: No version file generated since the target directory %s is not accessible.\n", target_dir.c_str());
+            MPCOMM_LOG_WARN("MPComm: No version file generated since the target directory %s is not accessible.\n",
+                            target_dir.c_str());
             return MPCOMM_SUCCESS;
         }
 
@@ -1279,7 +1281,8 @@ int MPComm::Impl::init(const std::string &local_host_id,
                     return MPCOMM_SUCCESS;
                 }
             } catch (const std::exception& e) {
-                MPCOMM_LOG_WARN("MPComm: Version file %s exists but cannot be updated. Will be rebuilt.\n", full_path.c_str());
+                MPCOMM_LOG_WARN("MPComm: Version file %s exists but cannot be updated. Will be rebuilt.\n",
+                                full_path.c_str());
             }
         }
 
@@ -3109,7 +3112,8 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
 
         if (target_remote_nics.empty()) {
             // No matching suffix found, skip this local NIC
-            MPCOMM_LOG_INFO("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC (checked %d and %d), skipping\n",
+            MPCOMM_LOG_INFO("MPComm: Local NIC%zu (%s, suffix=%d) has no matching remote NIC "
+                            "(checked %d and %d), skipping\n",
                    local_nic, local_name.c_str(), local_suffix, local_suffix, cross_numa_suffix);
             continue;
         }
@@ -4630,8 +4634,8 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
     (void)cpu_ids;  // Suppress unused parameter warning
 #endif
 
-    MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) started (tid=%lu)\n",
-           worker_id, numa_id, static_cast<unsigned long>(pthread_self()));
+    MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) started (tid=%" PRIu64 ")\n",
+           worker_id, numa_id, static_cast<uint64_t>(pthread_self()));
 
     const size_t kMaxIdleSpins = max_idle_spins_;
     const size_t max_outstanding_per_nic = max_outstanding_per_qp_ * qps_per_connection_;
@@ -6517,15 +6521,15 @@ int MPComm::Impl::unmapDRAMfromGPU(void *host_addr) {
 // External TMA kernel declarations (defined in mpcomm_tma_kernels.cu)
 #ifdef MPCOMM_ENABLE_CUDA_KERNELS
 extern void launch_tma_gather_kernel(
-    const char *src_base, const long *indices, char *dst_base,
+    const char *src_base, const int64_t *indices, char *dst_base,
     int block_size_bytes, int total_tasks, int max_sm_count, int mode);
 
 extern void launch_tma_scatter_kernel(
-    const char *src_base, const long *indices, char *dst_base,
+    const char *src_base, const int64_t *indices, char *dst_base,
     int block_size_bytes, int total_tasks, int max_sm_count, int mode);
 #endif
 
-int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
+int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const int64_t *indices,
                              void *gpu_dst, int num_blocks, int block_size,
                              int max_sm_count, int mode) {
 #ifdef MPCOMM_ENABLE_CUDA_KERNELS
@@ -6552,7 +6556,7 @@ int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
 #endif
 }
 
-int MPComm::Impl::tmaScatter(void *gpu_src, const long *indices,
+int MPComm::Impl::tmaScatter(void *gpu_src, const int64_t *indices,
                               uintptr_t dram_dev_ptr, int num_blocks,
                               int block_size, int max_sm_count, int mode) {
 #ifdef MPCOMM_ENABLE_CUDA_KERNELS
@@ -6591,14 +6595,14 @@ int MPComm::unmapDRAMfromGPU(void *host_addr) {
     return impl_->unmapDRAMfromGPU(host_addr);
 }
 
-int MPComm::tmaGather(uintptr_t dram_dev_ptr, const long *indices,
+int MPComm::tmaGather(uintptr_t dram_dev_ptr, const int64_t *indices,
                       void *gpu_dst, int num_blocks, int block_size,
                       int max_sm_count, H2DMode mode) {
     return impl_->tmaGather(dram_dev_ptr, indices, gpu_dst, num_blocks,
                             block_size, max_sm_count, static_cast<int>(mode));
 }
 
-int MPComm::tmaScatter(void *gpu_src, const long *indices,
+int MPComm::tmaScatter(void *gpu_src, const int64_t *indices,
                        uintptr_t dram_dev_ptr, int num_blocks,
                        int block_size, int max_sm_count, H2DMode mode) {
     return impl_->tmaScatter(gpu_src, indices, dram_dev_ptr, num_blocks,

@@ -461,7 +461,7 @@ class MPComm {
      * @return 0 on success, negative error code on failure
      */
     int tmaGather(uintptr_t dram_dev_ptr,
-                  const long *indices,
+                  const int64_t *indices,
                   void *gpu_dst,
                   int num_blocks,
                   int block_size,
@@ -486,7 +486,7 @@ class MPComm {
      * @return 0 on success, negative error code on failure
      */
     int tmaScatter(void *gpu_src,
-                   const long *indices,
+                   const int64_t *indices,
                    uintptr_t dram_dev_ptr,
                    int num_blocks,
                    int block_size,

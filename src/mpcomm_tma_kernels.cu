@@ -143,7 +143,7 @@ __device__ __forceinline__ void tma_store_wait() {
 // ==========================================================================
 __global__ void tma_gather_kernel(
     const char* __restrict__ src_base,
-    const long* __restrict__ indices,
+    const int64_t* __restrict__ indices,
     char* __restrict__ dst_base,
     int block_size_bytes,
     int total_tasks
@@ -199,7 +199,7 @@ __global__ void tma_gather_kernel(
 // ==========================================================================
 __global__ void tma_scatter_kernel(
     const char* __restrict__ src_base,
-    const long* __restrict__ indices,
+    const int64_t* __restrict__ indices,
     char* __restrict__ dst_base,
     int block_size_bytes,
     int total_tasks
@@ -258,7 +258,7 @@ __global__ void tma_scatter_kernel(
 // ==========================================================================
 __global__ void zerocopy_gather_int4_kernel(
     const int4* __restrict__ src_base,   // DRAM device pointer (int4-aligned)
-    const long* __restrict__ indices,    // Block indices to gather
+    const int64_t* __restrict__ indices,    // Block indices to gather
     int4* __restrict__ dst_base,         // GPU HBM destination (int4-aligned)
     int block_size_int4,                 // block_size_bytes / 16
     int total_int4_tasks                 // num_blocks * block_size_int4
@@ -282,7 +282,7 @@ __global__ void zerocopy_gather_int4_kernel(
 // ==========================================================================
 __global__ void zerocopy_scatter_int4_kernel(
     const int4* __restrict__ src_base,   // GPU HBM source (int4-aligned)
-    const long* __restrict__ indices,    // Block indices for scatter
+    const int64_t* __restrict__ indices,    // Block indices for scatter
     int4* __restrict__ dst_base,         // DRAM device pointer (int4-aligned)
     int block_size_int4,                 // block_size_bytes / 16
     int total_int4_tasks                 // num_blocks * block_size_int4
@@ -318,7 +318,7 @@ static int getDeviceSMCount() {
 
 void launch_tma_gather_kernel(
     const char* src_base,
-    const long* indices,
+    const int64_t* indices,
     char* dst_base,
     int block_size_bytes,
     int total_tasks,
@@ -393,7 +393,7 @@ void launch_tma_gather_kernel(
 
 void launch_tma_scatter_kernel(
     const char* src_base,
-    const long* indices,
+    const int64_t* indices,
     char* dst_base,
     int block_size_bytes,
     int total_tasks,

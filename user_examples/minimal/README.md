@@ -54,21 +54,21 @@
 
 ```bash
 # 指定 target 身份标识和 TCP 握手端口
-TARGET_IP=29.160.51.247 TCP_PORT=12345 ./run-target.sh
+TARGET_IP=<target_ip> TCP_PORT=12345 ./run-target.sh
 ```
 
 控制台输出示例：
 
 ```
-[target] ready, host_id=29.160.51.247:12345 tcp_port=12345 buf=0x7f.... Ctrl-C to exit.
+[target] ready, host_id=<target_ip>:12345 tcp_port=12345 buf=0x7f.... Ctrl-C to exit.
 ```
 
 ### 终端 B —— initiator
 
 ```bash
-LOCAL_IP=29.160.51.248 \
-TARGET_HOST_ID=29.160.51.247:12345 \
-TARGET_IP=29.160.51.247 TARGET_PORT=12345 \
+LOCAL_IP=<local_ip> \
+TARGET_HOST_ID=<target_ip>:12345 \
+TARGET_IP=<target_ip> TARGET_PORT=12345 \
 ./run-initiator.sh
 ```
 
@@ -87,23 +87,23 @@ TARGET_IP=29.160.51.247 TARGET_PORT=12345 \
 
 ```bash
 # 终端 A
-ROLE_IMPL=py TARGET_IP=29.160.51.247 TCP_PORT=12345 ./run-target.sh
+ROLE_IMPL=py TARGET_IP=<target_ip> TCP_PORT=12345 ./run-target.sh
 
 # 终端 B
 ROLE_IMPL=py \
-LOCAL_IP=29.160.51.248 \
-TARGET_HOST_ID=29.160.51.247:12345 \
-TARGET_IP=29.160.51.247 TARGET_PORT=12345 \
+LOCAL_IP=<local_ip> \
+TARGET_HOST_ID=<target_ip>:12345 \
+TARGET_IP=<target_ip> TARGET_PORT=12345 \
 ./run-initiator.sh
 ```
 
 或直接调用脚本：
 
 ```bash
-python3 hello_mpcomm.py target    29.160.51.247:12345 12345
+python3 hello_mpcomm.py target    <target_ip>:12345 12345
 
-python3 hello_mpcomm.py initiator 29.160.51.248:0 \
-    29.160.51.247:12345 29.160.51.247 12345
+python3 hello_mpcomm.py initiator <local_ip>:0 \
+    <target_ip>:12345 <target_ip> 12345
 ```
 
 ## 常用环境变量

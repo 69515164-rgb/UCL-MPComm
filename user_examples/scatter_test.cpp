@@ -20,10 +20,10 @@
 // No data correctness verification — purely performance-oriented.
 //
 // Target mode (run on remote host first):
-//   ./scatter_test --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G
+//   ./scatter_test --mode target --host-id <target_ip>:12345 --tcp-port 12345 --buffer-size 2G
 //
 //   # Multi-NUMA target:
-//   ./scatter_test --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G --num-numas 0,1
+//   ./scatter_test --mode target --host-id <target_ip>:12345 --tcp-port 12345 --buffer-size 2G --num-numas 0,1
 //
 // Initiator mode (default, run on local host):
 //   # Single target, DRAM scatter (default 1GB per target, 10 iterations):
@@ -58,11 +58,11 @@
 //
 // Both mode (a single process simultaneously acts as target for some peers
 // and as initiator toward other peers, sharing one MPComm instance):
-//   ./scatter_test --mode both --host-id 29.1.1.1:12345 --tcp-port 12345 \
+//   ./scatter_test --mode both --host-id <ipA>:12345 --tcp-port 12345 \
 //       --serve 1001:2G:0 \
 //       --serve 1002:2G:0 \
-//       --target B:29.1.1.2:12345:2001:0 \
-//       --target C:29.1.1.3:12345:2002:0
+//       --target B:<ipB>:12345:2001:0 \
+//       --target C:<ipC>:12345:2002:0
 //
 //   --serve  CHANNEL_ID:SIZE:NUMA
 //       Allocate a target buffer on NUMA and publish it under a composite tag
@@ -93,6 +93,7 @@
 #include <numaif.h>
 #include <sys/stat.h>
 
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -348,8 +349,8 @@ static void printUsage(const char *prog) {
     printf("                               Used by orchestrators as a global barrier.\n");
     printf("\nExamples:\n");
     printf("  # Target (remote host):\n");
-    printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 --buffer-size 2G\n", prog);
-    printf("  %s --mode target --host-id 29.160.42.103:12345 --tcp-port 12345 "
+    printf("  %s --mode target --host-id <target_ip>:12345 --tcp-port 12345 --buffer-size 2G\n", prog);
+    printf("  %s --mode target --host-id <target_ip>:12345 --tcp-port 12345 "
            "--buffer-size 2G --num-numas 0,1\n", prog);
     printf("\n  # Initiator (local host):\n");
     printf("  %s --target t1:<ip1>:12345 --target t2:<ip2>:12345\n", prog);
@@ -668,8 +669,8 @@ static void *allocHBM(size_t size, int gpu_device) {
     // Touch memory to ensure allocation is committed
     cuMemsetD8(dptr, 0xCD, size);
 
-    printf("  GPU %d: allocated %zu bytes at 0x%llx\n",
-           gpu_device, size, (unsigned long long)dptr);
+    printf("  GPU %d: allocated %zu bytes at 0x%" PRIx64 "\n",
+           gpu_device, size, static_cast<uint64_t>(dptr));
     return reinterpret_cast<void *>(dptr);
 }
 
@@ -1372,8 +1373,8 @@ static int runInitiatorWorkloadForTargets(MPComm &comm,
                    jp.c_str(), target.host_id.c_str(), remote_info.buffers.size());
             for (size_t b = 0; b < remote_info.buffers.size(); ++b) {
                 auto &buf = remote_info.buffers[b];
-                printf("%s    [%zu] addr=0x%lx, length=%lu, tag=%d\n",
-                       jp.c_str(), b, (unsigned long)buf.addr, (unsigned long)buf.length,
+                printf("%s    [%zu] addr=0x%" PRIx64 ", length=%" PRIu64 ", tag=%d\n",
+                       jp.c_str(), b, static_cast<uint64_t>(buf.addr), static_cast<uint64_t>(buf.length),
                        buf.numa_node);
             }
 
@@ -1425,9 +1426,9 @@ static int runInitiatorWorkloadForTargets(MPComm &comm,
                     }
                     if (num_initiator_numas > 1) {
                         printf("  Warning: No remote NUMA %d buffer for target %s, "
-                               "using buffer with tag %d at 0x%lx\n",
+                               "using buffer with tag %d at 0x%" PRIx64 "\n",
                                want_numa, target.host_id.c_str(),
-                               matched->numa_node, (unsigned long)matched->addr);
+                               matched->numa_node, static_cast<uint64_t>(matched->addr));
                     }
                 }
                 dram_remote_addrs[n].push_back(matched->addr);
@@ -1666,10 +1667,10 @@ static int runBothMode(const TestConfig &cfg) {
                 std::chrono::steady_clock::now() - wait_start).count();
             // Print a heartbeat every 30s so the driver-side log shows progress.
             if (elapsed > 0 && (elapsed % 30) == 0) {
-                static long last_print = -1;
+                static int64_t last_print = -1;
                 if (elapsed != last_print) {
-                    printf("[both] Still waiting for go-file (%lds)...\n",
-                           (long)elapsed);
+                    printf("[both] Still waiting for go-file (%" PRId64 "s)...\n",
+                           static_cast<int64_t>(elapsed));
                     fflush(stdout);
                     last_print = elapsed;
                 }

@@ -398,7 +398,8 @@ class MPCommPy {
      * @param remote_host_id  Remote host identifier (must be connected)
      * @param remote_tcp_addr Remote TCP address
      * @param remote_tcp_port Remote TCP port
-     * @return dict with buffer info: {'host_id': str, 'buffers': [{'addr': int, 'length': int, 'numa_node': int, 'rkeys': [int...]}]}
+     * @return dict with buffer info: {'host_id': str,
+     *         'buffers': [{'addr': int, 'length': int, 'numa_node': int, 'rkeys': [int...]}]}
      *         or empty dict on failure
      */
     py::dict queryRemoteBuffers(const std::string &remote_host_id,
@@ -467,7 +468,8 @@ class MPCommPy {
 
     /**
      * Get local published buffer info (for debugging/display)
-     * @return dict with all published buffers: {'buffers': [{'addr': int, 'length': int, 'numa_node': int, 'rkeys': [int...]}]}
+     * @return dict with all published buffers:
+     *         {'buffers': [{'addr': int, 'length': int, 'numa_node': int, 'rkeys': [int...]}]}
      *         or empty dict if not published
      */
     py::dict getPublishedBufferInfo() {
@@ -526,7 +528,7 @@ class MPCommPy {
                   uintptr_t gpu_dst_ptr, int num_blocks, int block_size,
                   int max_sm_count = 0, int mode = 0) {
         return comm_.tmaGather(dram_dev_ptr,
-                               reinterpret_cast<const long *>(indices_ptr),
+                               reinterpret_cast<const int64_t *>(indices_ptr),
                                reinterpret_cast<void *>(gpu_dst_ptr),
                                num_blocks, block_size, max_sm_count,
                                static_cast<H2DMode>(mode));
@@ -547,7 +549,7 @@ class MPCommPy {
                    uintptr_t dram_dev_ptr, int num_blocks, int block_size,
                    int max_sm_count = 0, int mode = 0) {
         return comm_.tmaScatter(reinterpret_cast<void *>(gpu_src_ptr),
-                                reinterpret_cast<const long *>(indices_ptr),
+                                reinterpret_cast<const int64_t *>(indices_ptr),
                                 dram_dev_ptr, num_blocks, block_size,
                                 max_sm_count, static_cast<H2DMode>(mode));
     }

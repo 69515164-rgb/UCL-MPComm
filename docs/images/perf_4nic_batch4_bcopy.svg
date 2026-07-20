@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="850" height="385" viewBox="0 0 850 385" font-family="Arial, sans-serif">
+  <rect x="0" y="0" width="850" height="385" fill="#ffffff"/>
+  
+  <text x="450" y="26" text-anchor="middle" font-size="15" fill="#222">4-NIC Batch=4 (bcopy): Block Size vs Bandwidth</text>
+
+  <!-- grid -->
+  <g stroke="#dddddd" stroke-width="1">
+    <line x1="70" y1="350" x2="830" y2="350"/>
+    <line x1="70" y1="299" x2="830" y2="299"/>
+    <line x1="70" y1="248" x2="830" y2="248"/>
+    <line x1="70" y1="198" x2="830" y2="198"/>
+    <line x1="70" y1="147" x2="830" y2="147"/>
+    <line x1="70" y1="96" x2="830" y2="96"/>
+    <line x1="70" y1="45" x2="830" y2="45"/>
+    <line x1="70.0" y1="45" x2="70.0" y2="350"/>
+    <line x1="139.1" y1="45" x2="139.1" y2="350"/>
+    <line x1="208.2" y1="45" x2="208.2" y2="350"/>
+    <line x1="277.3" y1="45" x2="277.3" y2="350"/>
+    <line x1="346.4" y1="45" x2="346.4" y2="350"/>
+    <line x1="415.5" y1="45" x2="415.5" y2="350"/>
+    <line x1="484.5" y1="45" x2="484.5" y2="350"/>
+    <line x1="553.6" y1="45" x2="553.6" y2="350"/>
+    <line x1="622.7" y1="45" x2="622.7" y2="350"/>
+    <line x1="691.8" y1="45" x2="691.8" y2="350"/>
+    <line x1="760.9" y1="45" x2="760.9" y2="350"/>
+    <line x1="830.0" y1="45" x2="830.0" y2="350"/>
+  </g>
+
+  <!-- axes -->
+  <line x1="70" y1="45" x2="70" y2="350" stroke="#333" stroke-width="1"/>
+  <line x1="70" y1="350" x2="830" y2="350" stroke="#333" stroke-width="1"/>
+
+  <!-- y ticks -->
+  <g font-size="15" fill="#333" text-anchor="end">
+    <text x="60" y="355">0</text>
+    <text x="60" y="304">15</text>
+    <text x="60" y="253">30</text>
+    <text x="60" y="203">45</text>
+    <text x="60" y="152">60</text>
+    <text x="60" y="101">75</text>
+    <text x="60" y="50">90</text>
+  </g>
+  <text x="22" y="197" font-size="16" fill="#333" transform="rotate(-90,22,197)" text-anchor="middle">Bandwidth (GB/s)</text>
+
+  <!-- x tick labels (rotated) -->
+  <g font-size="15" fill="#333" text-anchor="end">
+    <text x="70.0" y="362" transform="rotate(-30,70.0,362)">512KB</text>
+    <text x="139.1" y="362" transform="rotate(-30,139.1,362)">1MB</text>
+    <text x="208.2" y="362" transform="rotate(-30,208.2,362)">2MB</text>
+    <text x="277.3" y="362" transform="rotate(-30,277.3,362)">4MB</text>
+    <text x="346.4" y="362" transform="rotate(-30,346.4,362)">8MB</text>
+    <text x="415.5" y="362" transform="rotate(-30,415.5,362)">16MB</text>
+    <text x="484.5" y="362" transform="rotate(-30,484.5,362)">32MB</text>
+    <text x="553.6" y="362" transform="rotate(-30,553.6,362)">64MB</text>
+    <text x="622.7" y="362" transform="rotate(-30,622.7,362)">128MB</text>
+    <text x="691.8" y="362" transform="rotate(-30,691.8,362)">256MB</text>
+    <text x="760.9" y="362" transform="rotate(-30,760.9,362)">512MB</text>
+    <text x="830.0" y="362" transform="rotate(-30,830.0,362)">1GB</text>
+  </g>
+
+  <!-- MPComm PUT (orange solid) -->
+  <polyline fill="none" stroke="#ff5533" stroke-width="2" points="70.0,314.3 139.1,301.3 208.2,290.2 277.3,282.3 346.4,237.5 415.5,207.9 484.5,163.9 553.6,124.3 622.7,98.2 691.8,93.4 760.9,86.0 830.0,88.7"/>
+  <!-- MPComm GET (orange dashed) -->
+  <polyline fill="none" stroke="#ff5533" stroke-width="2" stroke-dasharray="6,4" points="70.0,318.0 139.1,306.9 208.2,297.0 277.3,290.1 346.4,256.1 415.5,225.4 484.5,194.2 553.6,158.6 622.7,143.0 691.8,139.3 760.9,139.6 830.0,101.7"/>
+  <!-- UCX PUT (blue solid) -->
+  <polyline fill="none" stroke="#2596ff" stroke-width="2" points="70.0,301.3 139.1,301.8 208.2,299.2 277.3,299.7 346.4,300.3 415.5,302.4 484.5,308.5 553.6,307.1 622.7,306.2 691.8,306.9 760.9,314.4 830.0,324.3"/>
+  <!-- UCX GET (blue dashed) -->
+  <polyline fill="none" stroke="#2596ff" stroke-width="2" stroke-dasharray="6,4" points="70.0,315.6 139.1,315.4 208.2,315.2 277.3,315.1 346.4,315.1 415.5,315.1 484.5,315.1 553.6,315.1 622.7,315.1 691.8,328.7 760.9,329.8 830.0,338.3"/>
+
+  <!-- orange circle markers (PUT + GET) -->
+  <g fill="#ff5533">
+    <circle cx="70.0" cy="314.3" r="3"/><circle cx="139.1" cy="301.3" r="3"/><circle cx="208.2" cy="290.2" r="3"/><circle cx="277.3" cy="282.3" r="3"/><circle cx="346.4" cy="237.5" r="3"/><circle cx="415.5" cy="207.9" r="3"/><circle cx="484.5" cy="163.9" r="3"/><circle cx="553.6" cy="124.3" r="3"/><circle cx="622.7" cy="98.2" r="3"/><circle cx="691.8" cy="93.4" r="3"/><circle cx="760.9" cy="86.0" r="3"/><circle cx="830.0" cy="88.7" r="3"/>
+    <circle cx="70.0" cy="318.0" r="3"/><circle cx="139.1" cy="306.9" r="3"/><circle cx="208.2" cy="297.0" r="3"/><circle cx="277.3" cy="290.1" r="3"/><circle cx="346.4" cy="256.1" r="3"/><circle cx="415.5" cy="225.4" r="3"/><circle cx="484.5" cy="194.2" r="3"/><circle cx="553.6" cy="158.6" r="3"/><circle cx="622.7" cy="143.0" r="3"/><circle cx="691.8" cy="139.3" r="3"/><circle cx="760.9" cy="139.6" r="3"/><circle cx="830.0" cy="101.7" r="3"/>
+    
+  </g>
+  <!-- blue square markers (PUT + GET) -->
+  <g fill="#2596ff">
+    <rect x="67.0" y="298.3" width="6" height="6"/><rect x="136.1" y="298.8" width="6" height="6"/><rect x="205.2" y="296.2" width="6" height="6"/><rect x="274.3" y="296.7" width="6" height="6"/><rect x="343.4" y="297.3" width="6" height="6"/><rect x="412.5" y="299.4" width="6" height="6"/><rect x="481.5" y="305.5" width="6" height="6"/><rect x="550.6" y="304.1" width="6" height="6"/><rect x="619.7" y="303.2" width="6" height="6"/><rect x="688.8" y="303.9" width="6" height="6"/><rect x="757.9" y="311.4" width="6" height="6"/><rect x="827.0" y="321.3" width="6" height="6"/>
+    <rect x="67.0" y="312.6" width="6" height="6"/><rect x="136.1" y="312.4" width="6" height="6"/><rect x="205.2" y="312.2" width="6" height="6"/><rect x="274.3" y="312.1" width="6" height="6"/><rect x="343.4" y="312.1" width="6" height="6"/><rect x="412.5" y="312.1" width="6" height="6"/><rect x="481.5" y="312.1" width="6" height="6"/><rect x="550.6" y="312.1" width="6" height="6"/><rect x="619.7" y="312.1" width="6" height="6"/><rect x="688.8" y="325.7" width="6" height="6"/><rect x="757.9" y="326.8" width="6" height="6"/><rect x="827.0" y="335.3" width="6" height="6"/>
+    
+  </g>
+
+  <!-- legend -->
+  <g>
+    <rect x="80" y="52" width="168" height="86" fill="#ffffff" stroke="#cccccc" stroke-width="1"/>
+    <line x1="90" y1="66" x2="118" y2="66" stroke="#ff5533" stroke-width="2"/><circle cx="104" cy="66" r="3" fill="#ff5533"/><text x="126" y="70" font-size="12" fill="#222">MPComm PUT</text>
+    <line x1="90" y1="86" x2="118" y2="86" stroke="#ff5533" stroke-width="2" stroke-dasharray="6,4"/><circle cx="104" cy="86" r="3" fill="#ff5533"/><text x="126" y="90" font-size="12" fill="#222">MPComm GET</text>
+    <line x1="90" y1="106" x2="118" y2="106" stroke="#2596ff" stroke-width="2"/><rect x="101" y="103" width="6" height="6" fill="#2596ff"/><text x="126" y="110" font-size="12" fill="#222">UCX PUT</text>
+    <line x1="90" y1="126" x2="118" y2="126" stroke="#2596ff" stroke-width="2" stroke-dasharray="6,4"/><rect x="101" y="123" width="6" height="6" fill="#2596ff"/><text x="126" y="130" font-size="12" fill="#222">UCX GET</text>
+  </g>
+</svg>

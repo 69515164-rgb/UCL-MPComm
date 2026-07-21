@@ -652,6 +652,53 @@ class MPComm::Impl {
                                       TransferDirection direction);
     int pollAllNicsForAsync(TransferContext& ctx);
     void workerThreadLoop(size_t worker_id, int numa_id, std::vector<int> cpu_ids);
+    // workerThreadLoop helpers (extracted to keep the loop body focused):
+    //   bindWorkerToNuma    - NUMA-only CPU affinity for the worker thread.
+    //   probeQuarantinedNics- worker 0 periodic NIC quarantine recovery probe.
+    void bindWorkerToNuma(size_t worker_id, int numa_id,
+                          const std::vector<int>& cpu_ids);
+    void probeQuarantinedNics(size_t num_nics);
+
+    // Fault-injection debugging state (driven by MPCOMM_FAULT_INJECT_* env vars).
+    // Only exercised on worker 0; simulates a port flap for recovery testing.
+    struct FaultInjectionState {
+        // Record of a faulted QP, kept so it can be recovered later.
+        struct FaultedQPInfo {
+            size_t nic_idx;
+            std::string qp_map_key;  // "host_id:local_nic:remote_nic"
+            size_t qp_index;
+            struct ibv_qp* qp;
+            RemoteEndpointInfo remote_info;
+        };
+        double delay = 0.0;          // MPCOMM_FAULT_INJECT_AFTER_SEC
+        size_t nic_idx = 0;          // MPCOMM_FAULT_INJECT_NIC
+        std::string mode = "single_qp";  // MPCOMM_FAULT_INJECT_MODE
+        double recover_delay = 0.0;  // MPCOMM_FAULT_INJECT_RECOVER_AFTER_SEC
+        bool triggered = false;
+        bool recovered = false;
+        std::chrono::steady_clock::time_point start_time;
+        std::chrono::steady_clock::time_point fault_time;
+        std::vector<FaultedQPInfo> faulted_qps;
+
+        void initFromEnv() {
+            const char* e = std::getenv("MPCOMM_FAULT_INJECT_AFTER_SEC");
+            delay = e ? std::atof(e) : 0.0;
+            const char* ne = std::getenv("MPCOMM_FAULT_INJECT_NIC");
+            nic_idx = ne ? static_cast<size_t>(std::atoi(ne)) : 0;
+            const char* me = std::getenv("MPCOMM_FAULT_INJECT_MODE");
+            mode = me ? me : "single_qp";
+            const char* re = std::getenv("MPCOMM_FAULT_INJECT_RECOVER_AFTER_SEC");
+            recover_delay = re ? std::atof(re) : 0.0;
+            start_time = std::chrono::steady_clock::now();
+            fault_time = start_time;
+        }
+    };
+    void maybeInjectFault(FaultInjectionState& fi, size_t num_nics);
+    void maybeRecoverFault(FaultInjectionState& fi);
+    // Frees PXN proxy-buffer space and recycles copy-done flags held by a
+    // context's copying_chunks / rdma_inflight when the transfer is finalized.
+    // No-op when built without CUDA.
+    void cleanupPxnContextState(TransferContext& ctx);
     int getNumaForAddr(uintptr_t addr) const;
     size_t selectWorkerForNuma(int numa_id);
 
@@ -4594,7 +4641,8 @@ void MPComm::Impl::releaseTransfer(TransferHandle handle) {
 └─────────────────────────────────────────┘
  */
 
-void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<int> cpu_ids) {
+void MPComm::Impl::bindWorkerToNuma(size_t worker_id, int numa_id,
+                                    const std::vector<int>& cpu_ids) {
     // NUMA-only affinity: bind this thread to ALL CPUs of the given NUMA node,
     // letting the kernel scheduler pick an idle core. This avoids multiple
     // mpcomm processes on the same host colliding on the same single core.
@@ -4631,8 +4679,181 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
         }
     }
 #else
+    (void)worker_id;
+    (void)numa_id;
     (void)cpu_ids;  // Suppress unused parameter warning
 #endif
+}
+
+// Fault injection: after fi.delay seconds, force QP(s) into ERROR state.
+// Simulates a NIC/port failure for recovery testing. Worker 0 only.
+void MPComm::Impl::maybeInjectFault(FaultInjectionState& fi, size_t num_nics) {
+    if (fi.delay <= 0.0 || fi.triggered) return;
+
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - fi.start_time).count();
+    if (elapsed < fi.delay) return;
+
+    fi.triggered = true;
+    fi.fault_time = now;
+    size_t fi_fault_count = 0;
+
+    // Determine which NICs to fault
+    size_t nic_start = 0, nic_end = num_nics;
+    if (fi.mode != "all_nic") {
+        nic_start = fi.nic_idx < num_nics ? fi.nic_idx : 0;
+        nic_end = nic_start + 1;
+    }
+
+    for (size_t nic = nic_start; nic < nic_end; ++nic) {
+        auto& nic_ctx = *nic_contexts_[nic];
+        std::lock_guard<std::mutex> lock(nic_ctx.qp_mutex);
+        for (auto& [key, qps] : nic_ctx.qp_map) {
+            for (size_t qi = 0; qi < qps.size(); ++qi) {
+                struct ibv_qp_attr attr = {};
+                attr.qp_state = IBV_QPS_ERR;
+                int rc = ibv_modify_qp(qps[qi], &attr, IBV_QP_STATE);
+                fi_fault_count++;
+
+                // Record for potential recovery
+                if (fi.recover_delay > 0.0 && rc == 0) {
+                    // Parse key "host_id:local_nic:remote_nic" to get remote_nic
+                    size_t last_colon = key.rfind(':');
+                    size_t second_colon = key.rfind(':', last_colon - 1);
+                    size_t remote_nic = std::stoul(key.substr(last_colon + 1));
+                    std::string host_id = key.substr(0, second_colon);
+
+                    RemoteEndpointInfo rinfo = {};
+                    {
+                        std::lock_guard<std::mutex> conn_lock(connections_mutex_);
+                        auto conn_it = connections_.find(host_id);
+                        if (conn_it != connections_.end() &&
+                            remote_nic < conn_it->second.nic_endpoints.size()) {
+                            rinfo = conn_it->second.nic_endpoints[remote_nic];
+                            // Each QP has its own remote QPN; nic_endpoints only stores
+                            // the first QP's info. For QP[0] this is correct.
+                            // For QP[>0] we need the actual remote QPN from the QP itself.
+                            // Query it before RESET clears it.
+                            struct ibv_qp_attr qattr = {};
+                            struct ibv_qp_init_attr qiattr = {};
+                            if (ibv_query_qp(qps[qi], &qattr, IBV_QP_DEST_QPN, &qiattr) == 0) {
+                                rinfo.qp_num = qattr.dest_qp_num;
+                            }
+                        }
+                    }
+                    fi.faulted_qps.push_back({nic, key, qi, qps[qi], rinfo});
+                }
+
+                if (rc != 0) {
+                    MPCOMM_LOG_ERROR("MPComm: [FAULT INJECT] Failed to fault QP[%zu] on NIC %zu (rc=%d)\n",
+                           qi, nic, rc);
+                }
+                if (fi.mode == "single_qp") break;
+            }
+            if (fi.mode == "single_qp") break;
+        }
+    }
+
+    MPCOMM_LOG_WARN("MPComm: [FAULT INJECT] mode=%s, faulted %zu QP(s) after %.1fs "
+           "(NIC range [%zu, %zu))%s\n",
+           fi.mode.c_str(), fi_fault_count, elapsed, nic_start, nic_end,
+           fi.recover_delay > 0.0 ? ", recovery scheduled" : "");
+}
+
+// Fault recovery: after fi.recover_delay seconds past the fault, restore QPs
+// through RESET->INIT->RTR->RTS. Worker 0 only.
+void MPComm::Impl::maybeRecoverFault(FaultInjectionState& fi) {
+    if (!fi.triggered || fi.recovered || fi.recover_delay <= 0.0) return;
+
+    auto now = std::chrono::steady_clock::now();
+    double since_fault = std::chrono::duration<double>(now - fi.fault_time).count();
+    if (since_fault < fi.recover_delay) return;
+
+    fi.recovered = true;
+    size_t recovered = 0, failed = 0;
+
+    for (auto& fqp : fi.faulted_qps) {
+        auto& nic_ctx = *nic_contexts_[fqp.nic_idx];
+
+        // RESET the QP first
+        struct ibv_qp_attr attr = {};
+        attr.qp_state = IBV_QPS_RESET;
+        if (ibv_modify_qp(fqp.qp, &attr, IBV_QP_STATE) != 0) {
+            MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed to RESET QP on NIC %zu\n", fqp.nic_idx);
+            failed++;
+            continue;
+        }
+
+        // INIT
+        if (modifyQPToInit(nic_ctx, fqp.qp) != 0) {
+            MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed INIT on NIC %zu\n", fqp.nic_idx);
+            failed++;
+            continue;
+        }
+
+        // RTR (needs remote endpoint info)
+        if (modifyQPToRTR(nic_ctx, fqp.qp, fqp.remote_info) != 0) {
+            MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed RTR on NIC %zu\n", fqp.nic_idx);
+            failed++;
+            continue;
+        }
+
+        // RTS
+        if (modifyQPToRTS(fqp.qp) != 0) {
+            MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed RTS on NIC %zu\n", fqp.nic_idx);
+            failed++;
+            continue;
+        }
+
+        recovered++;
+    }
+
+    MPCOMM_LOG_WARN("MPComm: [FAULT RECOVER] Recovered %zu/%zu QP(s) after %.1fs "
+           "(failed=%zu)\n",
+           recovered, fi.faulted_qps.size(), since_fault, failed);
+    fi.faulted_qps.clear();
+}
+
+void MPComm::Impl::cleanupPxnContextState(TransferContext& ctx) {
+#ifdef USE_CUDA
+    // Clean up PXN proxy copying state and drain inflight RDMA
+    if (!ctx.pxn_enabled) return;
+    for (auto& pp : ctx.pxn_proxy_pipelines) {
+        // Free proxy buffer space held by copying_chunks
+        // (these chunks were tryAlloc'd but not yet RDMA-posted,
+        //  so their space was never moved to rdma_inflight for freeing)
+        if (!pp.copying_chunks.empty()) {
+            auto* pb_cc = pxn_manager_.getProxyBuffer(pp.proxy_gpu_id);
+            if (pb_cc) {
+                for (auto& cc : pp.copying_chunks) {
+                    pb_cc->free(cc.length);
+                }
+            }
+        }
+        for (auto& cc : pp.copying_chunks) {
+            if (cc.copy_done_flag) {
+                pxn_manager_.recycleFlagToThread(cc.copy_done_flag);
+            }
+        }
+        pp.copying_chunks.clear();
+        // Drain remaining inflight RDMA and free proxy buffer
+        if (!pp.rdma_inflight.empty()) {
+            auto* pb = pxn_manager_.getProxyBuffer(pp.proxy_gpu_id);
+            if (pb) {
+                for (auto& inf : pp.rdma_inflight) {
+                    pb->free(inf.length);
+                }
+            }
+            pp.rdma_inflight.clear();
+        }
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<int> cpu_ids) {
+    bindWorkerToNuma(worker_id, numa_id, cpu_ids);
 
     MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) started (tid=%" PRIu64 ")\n",
            worker_id, numa_id, static_cast<uint64_t>(pthread_self()));
@@ -4968,152 +5189,15 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
     // MPCOMM_FAULT_INJECT_NIC: which NIC index to fault (default: 0)
     // MPCOMM_FAULT_INJECT_MODE: "single_qp" (default), "all_qp", "all_nic"
     // MPCOMM_FAULT_INJECT_RECOVER_AFTER_SEC: seconds after fault to recover QPs (0=no recovery)
-    //   Simulates a port flap: ERROR for N seconds, then RESET→INIT→RTR→RTS
-    const char* fi_env = std::getenv("MPCOMM_FAULT_INJECT_AFTER_SEC");
-    const double fi_delay = fi_env ? std::atof(fi_env) : 0.0;
-    const char* fi_nic_env = std::getenv("MPCOMM_FAULT_INJECT_NIC");
-    const size_t fi_nic_idx = fi_nic_env ? static_cast<size_t>(std::atoi(fi_nic_env)) : 0;
-    const char* fi_mode_env = std::getenv("MPCOMM_FAULT_INJECT_MODE");
-    const std::string fi_mode = fi_mode_env ? fi_mode_env : "single_qp";
-    const char* fi_recover_env = std::getenv("MPCOMM_FAULT_INJECT_RECOVER_AFTER_SEC");
-    const double fi_recover_delay = fi_recover_env ? std::atof(fi_recover_env) : 0.0;
-    bool fi_triggered = false;
-    bool fi_recovered = false;
-    auto fi_start_time = std::chrono::steady_clock::now();
-    auto fi_fault_time = fi_start_time;  // Will be set when fault fires
-
-    // Record of faulted QPs for recovery
-    struct FaultedQPInfo {
-        size_t nic_idx;
-        std::string qp_map_key;  // "host_id:local_nic:remote_nic"
-        size_t qp_index;
-        struct ibv_qp* qp;
-        RemoteEndpointInfo remote_info;
-    };
-    std::vector<FaultedQPInfo> fi_faulted_qps;
+    //   Simulates a port flap: ERROR for N seconds, then RESET->INIT->RTR->RTS
+    FaultInjectionState fi;
+    fi.initFromEnv();
 
     while (worker_running_.load(std::memory_order_relaxed)) {
-        // Fault injection: after delay, force QP(s) into ERROR state
-        if (fi_delay > 0.0 && !fi_triggered && worker_id == 0) {
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - fi_start_time).count();
-            if (elapsed >= fi_delay) {
-                fi_triggered = true;
-                fi_fault_time = now;
-                size_t fi_fault_count = 0;
-
-                // Determine which NICs to fault
-                size_t nic_start = 0, nic_end = num_nics;
-                if (fi_mode != "all_nic") {
-                    nic_start = fi_nic_idx < num_nics ? fi_nic_idx : 0;
-                    nic_end = nic_start + 1;
-                }
-
-                for (size_t nic = nic_start; nic < nic_end; ++nic) {
-                    auto& nic_ctx = *nic_contexts_[nic];
-                    std::lock_guard<std::mutex> lock(nic_ctx.qp_mutex);
-                    for (auto& [key, qps] : nic_ctx.qp_map) {
-                        for (size_t qi = 0; qi < qps.size(); ++qi) {
-                            struct ibv_qp_attr attr = {};
-                            attr.qp_state = IBV_QPS_ERR;
-                            int rc = ibv_modify_qp(qps[qi], &attr, IBV_QP_STATE);
-                            fi_fault_count++;
-
-                            // Record for potential recovery
-                            if (fi_recover_delay > 0.0 && rc == 0) {
-                                // Parse key "host_id:local_nic:remote_nic" to get remote_nic
-                                size_t last_colon = key.rfind(':');
-                                size_t second_colon = key.rfind(':', last_colon - 1);
-                                size_t remote_nic = std::stoul(key.substr(last_colon + 1));
-                                std::string host_id = key.substr(0, second_colon);
-
-                                RemoteEndpointInfo rinfo = {};
-                                {
-                                    std::lock_guard<std::mutex> conn_lock(connections_mutex_);
-                                    auto conn_it = connections_.find(host_id);
-                                    if (conn_it != connections_.end() &&
-                                        remote_nic < conn_it->second.nic_endpoints.size()) {
-                                        rinfo = conn_it->second.nic_endpoints[remote_nic];
-                                        // Each QP has its own remote QPN; nic_endpoints only stores
-                                        // the first QP's info. For QP[0] this is correct.
-                                        // For QP[>0] we need the actual remote QPN from the QP itself.
-                                        // Query it before RESET clears it.
-                                        struct ibv_qp_attr qattr = {};
-                                        struct ibv_qp_init_attr qiattr = {};
-                                        if (ibv_query_qp(qps[qi], &qattr, IBV_QP_DEST_QPN, &qiattr) == 0) {
-                                            rinfo.qp_num = qattr.dest_qp_num;
-                                        }
-                                    }
-                                }
-                                fi_faulted_qps.push_back({nic, key, qi, qps[qi], rinfo});
-                            }
-
-                            if (rc != 0) {
-                                MPCOMM_LOG_ERROR("MPComm: [FAULT INJECT] Failed to fault QP[%zu] on NIC %zu (rc=%d)\n",
-                                       qi, nic, rc);
-                            }
-                            if (fi_mode == "single_qp") break;
-                        }
-                        if (fi_mode == "single_qp") break;
-                    }
-                }
-
-                MPCOMM_LOG_WARN("MPComm: [FAULT INJECT] mode=%s, faulted %zu QP(s) after %.1fs "
-                       "(NIC range [%zu, %zu))%s\n",
-                       fi_mode.c_str(), fi_fault_count, elapsed, nic_start, nic_end,
-                       fi_recover_delay > 0.0 ? ", recovery scheduled" : "");
-            }
-        }
-
-        // Fault recovery: after recover_delay seconds past fault, restore QPs
-        if (fi_triggered && !fi_recovered && fi_recover_delay > 0.0 && worker_id == 0) {
-            auto now = std::chrono::steady_clock::now();
-            double since_fault = std::chrono::duration<double>(now - fi_fault_time).count();
-            if (since_fault >= fi_recover_delay) {
-                fi_recovered = true;
-                size_t recovered = 0, failed = 0;
-
-                for (auto& fqp : fi_faulted_qps) {
-                    auto& nic_ctx = *nic_contexts_[fqp.nic_idx];
-
-                    // RESET the QP first
-                    struct ibv_qp_attr attr = {};
-                    attr.qp_state = IBV_QPS_RESET;
-                    if (ibv_modify_qp(fqp.qp, &attr, IBV_QP_STATE) != 0) {
-                        MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed to RESET QP on NIC %zu\n", fqp.nic_idx);
-                        failed++;
-                        continue;
-                    }
-
-                    // INIT
-                    if (modifyQPToInit(nic_ctx, fqp.qp) != 0) {
-                        MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed INIT on NIC %zu\n", fqp.nic_idx);
-                        failed++;
-                        continue;
-                    }
-
-                    // RTR (needs remote endpoint info)
-                    if (modifyQPToRTR(nic_ctx, fqp.qp, fqp.remote_info) != 0) {
-                        MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed RTR on NIC %zu\n", fqp.nic_idx);
-                        failed++;
-                        continue;
-                    }
-
-                    // RTS
-                    if (modifyQPToRTS(fqp.qp) != 0) {
-                        MPCOMM_LOG_ERROR("MPComm: [FAULT RECOVER] Failed RTS on NIC %zu\n", fqp.nic_idx);
-                        failed++;
-                        continue;
-                    }
-
-                    recovered++;
-                }
-
-                MPCOMM_LOG_WARN("MPComm: [FAULT RECOVER] Recovered %zu/%zu QP(s) after %.1fs "
-                       "(failed=%zu)\n",
-                       recovered, fi_faulted_qps.size(), since_fault, failed);
-                fi_faulted_qps.clear();
-            }
+        // Fault injection / recovery (worker 0 only, debug builds via env vars)
+        if (worker_id == 0) {
+            maybeInjectFault(fi, num_nics);
+            maybeRecoverFault(fi);
         }
 
         // ---- Phase 1: Drain new handles from the queue into active set ----
@@ -5688,40 +5772,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
 
                 if (ctx.finished.load()) {
                     // Already finished (error case) — finalize stats and remove
-#ifdef USE_CUDA
-                    // Clean up PXN proxy copying state and drain inflight RDMA
-                    if (ctx.pxn_enabled) {
-                        for (auto& pp : ctx.pxn_proxy_pipelines) {
-                            // Free proxy buffer space held by copying_chunks
-                            // (these chunks were tryAlloc'd but not yet RDMA-posted,
-                            //  so their space was never moved to rdma_inflight for freeing)
-                            if (!pp.copying_chunks.empty()) {
-                                auto* pb_cc = pxn_manager_.getProxyBuffer(pp.proxy_gpu_id);
-                                if (pb_cc) {
-                                    for (auto& cc : pp.copying_chunks) {
-                                        pb_cc->free(cc.length);
-                                    }
-                                }
-                            }
-                            for (auto& cc : pp.copying_chunks) {
-                                if (cc.copy_done_flag) {
-                                    pxn_manager_.recycleFlagToThread(cc.copy_done_flag);
-                                }
-                            }
-                            pp.copying_chunks.clear();
-                            // Drain remaining inflight RDMA and free proxy buffer
-                            if (!pp.rdma_inflight.empty()) {
-                                auto* pb = pxn_manager_.getProxyBuffer(pp.proxy_gpu_id);
-                                if (pb) {
-                                    for (auto& inf : pp.rdma_inflight) {
-                                        pb->free(inf.length);
-                                    }
-                                }
-                                pp.rdma_inflight.clear();
-                            }
-                        }
-                    }
-#endif
+                    cleanupPxnContextState(ctx);
                     finalizeTransferStats(ctx);
                     active_contexts.erase(active_contexts.begin() + i);
                     any_removed = true;
@@ -5730,40 +5781,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
 
                 if (ctx.total_completed.load() >= total_chunks) {
                     // All chunks completed — mark finished
-#ifdef USE_CUDA
-                    // Clean up PXN proxy copying state and drain inflight RDMA
-                    if (ctx.pxn_enabled) {
-                        for (auto& pp : ctx.pxn_proxy_pipelines) {
-                            // Free proxy buffer space held by copying_chunks
-                            // (these chunks were tryAlloc'd but not yet RDMA-posted,
-                            //  so their space was never moved to rdma_inflight for freeing)
-                            if (!pp.copying_chunks.empty()) {
-                                auto* pb_cc = pxn_manager_.getProxyBuffer(pp.proxy_gpu_id);
-                                if (pb_cc) {
-                                    for (auto& cc : pp.copying_chunks) {
-                                        pb_cc->free(cc.length);
-                                    }
-                                }
-                            }
-                            for (auto& cc : pp.copying_chunks) {
-                                if (cc.copy_done_flag) {
-                                    pxn_manager_.recycleFlagToThread(cc.copy_done_flag);
-                                }
-                            }
-                            pp.copying_chunks.clear();
-                            // Drain remaining inflight RDMA and free proxy buffer
-                            if (!pp.rdma_inflight.empty()) {
-                                auto* pb = pxn_manager_.getProxyBuffer(pp.proxy_gpu_id);
-                                if (pb) {
-                                    for (auto& inf : pp.rdma_inflight) {
-                                        pb->free(inf.length);
-                                    }
-                                }
-                                pp.rdma_inflight.clear();
-                            }
-                        }
-                    }
-#endif
+                    cleanupPxnContextState(ctx);
                     ctx.error_code.store(MPCOMM_SUCCESS);
                     ctx.end_time = std::chrono::steady_clock::now();
                     finalizeTransferStats(ctx);
@@ -5791,101 +5809,106 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
         }
 
         // ---- Phase 5: NIC quarantine probe (worker_id==0 only) ----
-        // Periodically checks quarantined NICs via ibv_query_port.
-        // If the port is back to ACTIVE and all QPs can be rebuilt
-        // RESET->INIT->RTR->RTS, the NIC is re-admitted to the pool.
-        // Probe interval ~10ms (kProbeIntervalLoops iterations).
-        static const size_t kProbeIntervalLoops = []() -> size_t {
-            const char* e = std::getenv("MPCOMM_NIC_PROBE_INTERVAL");
-            return e ? static_cast<size_t>(std::atoi(e)) : 10000;
-        }();
-        static const double kQuarantineSec = []() -> double {
-            const char* e = std::getenv("MPCOMM_NIC_QUARANTINE_SEC");
-            return e ? std::atof(e) : 5.0;
-        }();
-
         if (worker_id == 0 && !nic_quarantine_.empty()) {
-            static size_t probe_counter = 0;
-            if (++probe_counter >= kProbeIntervalLoops) {
-                probe_counter = 0;
-                auto now = std::chrono::steady_clock::now();
-                for (size_t nic = 0; nic < num_nics; ++nic) {
-                    if (!nic_quarantine_[nic]) continue;
-                    auto& q = *nic_quarantine_[nic];
-                    if (!q.in_quarantine.load(std::memory_order_relaxed)) continue;
-                    double secs = std::chrono::duration<double>(
-                        now - q.quarantine_since).count();
-                    if (secs < kQuarantineSec) continue;  // still in quarantine period
-
-                    // Probe: check physical port state
-                    auto& nic_ctx = *nic_contexts_[nic];
-                    struct ibv_port_attr port_attr = {};
-                    if (ibv_query_port(nic_ctx.context, nic_ctx.port, &port_attr) != 0
-                        || port_attr.state != IBV_PORT_ACTIVE) {
-                        // Port still down — reset quarantine timer
-                        q.quarantine_since = now;
-                        MPCOMM_LOG_DEBUG("MPComm: [QUARANTINE] NIC %zu still down after %.1fs, "
-                               "re-quarantined\n", nic, secs);
-                        continue;
-                    }
-
-                    // Port is UP — try to rebuild all QPs for this NIC
-                    bool all_ok = true;
-                    {
-                        std::lock_guard<std::mutex> lock(nic_ctx.qp_mutex);
-                        for (auto& [key, qps] : nic_ctx.qp_map) {
-                            // Parse "host_id:local_nic:remote_nic"
-                            size_t last_colon = key.rfind(':');
-                            size_t second_colon = key.rfind(':', last_colon - 1);
-                            size_t remote_nic_idx = std::stoul(key.substr(last_colon + 1));
-                            std::string host_id = key.substr(0, second_colon);
-
-                            for (size_t qi = 0; qi < qps.size(); ++qi) {
-                                RemoteEndpointInfo rinfo = {};
-                                {
-                                    std::lock_guard<std::mutex> conn_lock(connections_mutex_);
-                                    auto it = connections_.find(host_id);
-                                    if (it != connections_.end() &&
-                                        remote_nic_idx < it->second.nic_endpoints.size()) {
-                                        rinfo = it->second.nic_endpoints[remote_nic_idx];
-                                        struct ibv_qp_attr qattr = {};
-                                        struct ibv_qp_init_attr qiattr = {};
-                                        if (ibv_query_qp(qps[qi], &qattr, IBV_QP_DEST_QPN, &qiattr) == 0) {
-                                            rinfo.qp_num = qattr.dest_qp_num;
-                                        }
-                                    }
-                                }
-                                // RESET -> INIT -> RTR -> RTS
-                                struct ibv_qp_attr rst = {};
-                                rst.qp_state = IBV_QPS_RESET;
-                                if (ibv_modify_qp(qps[qi], &rst, IBV_QP_STATE) != 0 ||
-                                    modifyQPToInit(nic_ctx, qps[qi]) != 0 ||
-                                    modifyQPToRTR(nic_ctx, qps[qi], rinfo) != 0 ||
-                                    modifyQPToRTS(qps[qi]) != 0) {
-                                    all_ok = false;
-                                    break;
-                                }
-                            }
-                            if (!all_ok) break;
-                        }
-                    }
-
-                    if (all_ok) {
-                        q.consecutive_errors.store(0, std::memory_order_relaxed);
-                        q.in_quarantine.store(false, std::memory_order_release);
-                        MPCOMM_LOG_WARN("MPComm: [QUARANTINE] NIC %zu recovered after %.1fs, "
-                               "re-admitted to pool\n", nic, secs);
-                    } else {
-                        q.quarantine_since = now;
-                        MPCOMM_LOG_WARN("MPComm: [QUARANTINE] NIC %zu port UP but QP rebuild "
-                               "failed, re-quarantined\n", nic);
-                    }
-                }
-            }
+            probeQuarantinedNics(num_nics);
         }
     }
 
     MPCOMM_LOG_INFO("MPComm: Worker %zu (NUMA %d) exiting\n", worker_id, numa_id);
+}
+
+// Periodically checks quarantined NICs via ibv_query_port.
+// If the port is back to ACTIVE and all QPs can be rebuilt
+// RESET->INIT->RTR->RTS, the NIC is re-admitted to the pool.
+// Probe interval ~10ms (kProbeIntervalLoops iterations).
+// Called only from worker 0.
+void MPComm::Impl::probeQuarantinedNics(size_t num_nics) {
+    static const size_t kProbeIntervalLoops = []() -> size_t {
+        const char* e = std::getenv("MPCOMM_NIC_PROBE_INTERVAL");
+        return e ? static_cast<size_t>(std::atoi(e)) : 10000;
+    }();
+    static const double kQuarantineSec = []() -> double {
+        const char* e = std::getenv("MPCOMM_NIC_QUARANTINE_SEC");
+        return e ? std::atof(e) : 5.0;
+    }();
+
+    static size_t probe_counter = 0;
+    if (++probe_counter < kProbeIntervalLoops) return;
+    probe_counter = 0;
+
+    auto now = std::chrono::steady_clock::now();
+    for (size_t nic = 0; nic < num_nics; ++nic) {
+        if (!nic_quarantine_[nic]) continue;
+        auto& q = *nic_quarantine_[nic];
+        if (!q.in_quarantine.load(std::memory_order_relaxed)) continue;
+        double secs = std::chrono::duration<double>(
+            now - q.quarantine_since).count();
+        if (secs < kQuarantineSec) continue;  // still in quarantine period
+
+        // Probe: check physical port state
+        auto& nic_ctx = *nic_contexts_[nic];
+        struct ibv_port_attr port_attr = {};
+        if (ibv_query_port(nic_ctx.context, nic_ctx.port, &port_attr) != 0
+            || port_attr.state != IBV_PORT_ACTIVE) {
+            // Port still down — reset quarantine timer
+            q.quarantine_since = now;
+            MPCOMM_LOG_DEBUG("MPComm: [QUARANTINE] NIC %zu still down after %.1fs, "
+                   "re-quarantined\n", nic, secs);
+            continue;
+        }
+
+        // Port is UP — try to rebuild all QPs for this NIC
+        bool all_ok = true;
+        {
+            std::lock_guard<std::mutex> lock(nic_ctx.qp_mutex);
+            for (auto& [key, qps] : nic_ctx.qp_map) {
+                // Parse "host_id:local_nic:remote_nic"
+                size_t last_colon = key.rfind(':');
+                size_t second_colon = key.rfind(':', last_colon - 1);
+                size_t remote_nic_idx = std::stoul(key.substr(last_colon + 1));
+                std::string host_id = key.substr(0, second_colon);
+
+                for (size_t qi = 0; qi < qps.size(); ++qi) {
+                    RemoteEndpointInfo rinfo = {};
+                    {
+                        std::lock_guard<std::mutex> conn_lock(connections_mutex_);
+                        auto it = connections_.find(host_id);
+                        if (it != connections_.end() &&
+                            remote_nic_idx < it->second.nic_endpoints.size()) {
+                            rinfo = it->second.nic_endpoints[remote_nic_idx];
+                            struct ibv_qp_attr qattr = {};
+                            struct ibv_qp_init_attr qiattr = {};
+                            if (ibv_query_qp(qps[qi], &qattr, IBV_QP_DEST_QPN, &qiattr) == 0) {
+                                rinfo.qp_num = qattr.dest_qp_num;
+                            }
+                        }
+                    }
+                    // RESET -> INIT -> RTR -> RTS
+                    struct ibv_qp_attr rst = {};
+                    rst.qp_state = IBV_QPS_RESET;
+                    if (ibv_modify_qp(qps[qi], &rst, IBV_QP_STATE) != 0 ||
+                        modifyQPToInit(nic_ctx, qps[qi]) != 0 ||
+                        modifyQPToRTR(nic_ctx, qps[qi], rinfo) != 0 ||
+                        modifyQPToRTS(qps[qi]) != 0) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if (!all_ok) break;
+            }
+        }
+
+        if (all_ok) {
+            q.consecutive_errors.store(0, std::memory_order_relaxed);
+            q.in_quarantine.store(false, std::memory_order_release);
+            MPCOMM_LOG_WARN("MPComm: [QUARANTINE] NIC %zu recovered after %.1fs, "
+                   "re-admitted to pool\n", nic, secs);
+        } else {
+            q.quarantine_since = now;
+            MPCOMM_LOG_WARN("MPComm: [QUARANTINE] NIC %zu port UP but QP rebuild "
+                   "failed, re-quarantined\n", nic);
+        }
+    }
 }
 
 // ============================================================================
@@ -5924,7 +5947,7 @@ void MPComm::Impl::initContextCache(TransferContext& ctx, NicConnCache& cache) {
                         // Direct NIC — use source buffer lkey
                         info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));
                     }
-                } else
+                } else  // NOLINT(readability/braces) - else body is the block below the #endif
 #endif
                 {
                     info.lkey = getLkey(local_nic, reinterpret_cast<void *>(ctx.local_addr));

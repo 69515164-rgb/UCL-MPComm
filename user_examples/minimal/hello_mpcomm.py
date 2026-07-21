@@ -18,9 +18,11 @@ def alloc(n):
     raw = (ctypes.c_ubyte * n)()
     return ctypes.addressof(raw), raw
 
+
 def check(rc, msg):
     if rc != 0:
         sys.exit(f"{msg} rc={rc}")
+
 
 def run_target(host_id, tcp_port):
     c = mpcomm.MPComm()
@@ -44,6 +46,7 @@ def run_target(host_id, tcp_port):
     c.unregister_memory(addr)
     c.shutdown()
     del keep
+
 
 def run_initiator(host_id, tid, tip, tport):
     c = mpcomm.MPComm()
@@ -85,6 +88,7 @@ def run_initiator(host_id, tid, tip, tport):
     del sk, rk
     sys.exit(0 if ok else 2)
 
+
 def main():
     a = sys.argv
     if len(a) == 4 and a[1] == "target":
@@ -95,6 +99,7 @@ def main():
         sys.exit(f"Usage:\n"
                  f"  {a[0]} target    <host_id> <tcp_port>\n"
                  f"  {a[0]} initiator <host_id> <target_host_id> <target_ip> <target_port>")
+
 
 if __name__ == "__main__":
     main()

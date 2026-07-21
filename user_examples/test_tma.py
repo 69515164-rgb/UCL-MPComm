@@ -69,22 +69,21 @@ def _alloc_aligned(num_bytes, alignment=1024):
     return t
 
 
-def _bind_numa_to_gpu(gpu_device_id=0):
+def _bind_numa_to_gpu(gpu_device_id=0):  # pylint: disable=unused-argument
     """Bind current process memory allocation to the NUMA node closest to the GPU.
 
     Reads /sys/bus/pci/devices/<gpu_bdf>/numa_node to find the GPU's NUMA node,
     then calls libnuma to set membind.  Falls back to NUMA 0 if detection fails.
     Returns the NUMA node actually bound to.
+
+    Note: gpu_device_id is currently accepted for API compatibility; NUMA
+    detection scans /sys directly rather than using the torch device id.
     """
     numa_node = 0  # default fallback
 
     try:
-        # Get GPU PCI bus ID  (e.g. "0000:8A:00.0")
-        pci_bus_id = " " * 32
-        # Use pynvml-free approach: read from /sys via cudaDeviceGetPCIBusId equivalent
-        props = torch.cuda.get_device_properties(gpu_device_id)
-        # Construct sysfs path from domain:bus:device.function
-        # torch doesn't expose raw BDF, so we scan /sys/bus/pci/devices/*/class for 0x030000 (display)
+        # torch doesn't expose raw BDF, so we scan /sys/bus/pci/devices/*/class
+        # for 0x030000 (display) to locate the GPU and read its numa_node.
         import glob
         gpu_numa = None
         for dev_path in sorted(glob.glob("/sys/bus/pci/devices/*/class")):
@@ -101,7 +100,8 @@ def _bind_numa_to_gpu(gpu_device_id=0):
                         break
         if gpu_numa is not None:
             numa_node = gpu_numa
-    except Exception:
+    except Exception:  # pylint: disable=broad-except
+        # NUMA detection is best-effort; fall back to the default node on any error.
         pass
 
     # Try to bind via libnuma
@@ -118,8 +118,8 @@ def _bind_numa_to_gpu(gpu_device_id=0):
             # MPOL_PREFERRED = 1, node mask
             mask = 1 << numa_node
             libc.set_mempolicy(1, ctypes.byref(ctypes.c_ulong(mask)), 64)
-        except Exception:
-            print(f"  NUMA: 绑定失败，使用 OS 默认策略")
+        except Exception:  # pylint: disable=broad-except
+            print("  NUMA: 绑定失败，使用 OS 默认策略")
 
     return numa_node
 
@@ -590,8 +590,8 @@ def main():
     args = parser.parse_args()
 
     # 解析 mode
-    MODE_MAP = {"auto": 0, "sm": 1, "tma": 2}
-    h2d_mode = MODE_MAP[args.mode]
+    mode_map = {"auto": 0, "sm": 1, "tma": 2}
+    h2d_mode = mode_map[args.mode]
 
     # 参数检查
     if args.block_size % 16 != 0:

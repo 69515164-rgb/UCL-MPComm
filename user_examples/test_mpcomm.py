@@ -51,7 +51,8 @@ Usage:
     python test_mpcomm.py --mode scatter --gpu 0 --targets target1:<target_ip>:12345
 
     # GPU performance test
-    python test_mpcomm.py --mode scatter --gpu 0 --test-mode performance --iterations 10 --targets target1:<target_ip>:12345
+    python test_mpcomm.py --mode scatter --gpu 0 --test-mode performance \
+        --iterations 10 --targets target1:<target_ip>:12345
 
     # Multi-NUMA buffers (single MPComm, multiple buffers on different NUMA nodes)
     python test_mpcomm.py --mode scatter --num-numas 0,1 --targets target1:<target_ip>:12345

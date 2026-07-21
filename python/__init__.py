@@ -13,7 +13,8 @@ _PACKAGE_DIR = _os.path.dirname(_os.path.abspath(__file__))
 try:
     from importlib.metadata import version as _get_version
     __version__ = _get_version("mpcomm")
-except Exception:
+except Exception:  # pylint: disable=broad-except
+    # Version lookup is best-effort; any failure falls back to "unknown".
     __version__ = "unknown"
 
 # ---- Python bindings -------------------------------------------------------

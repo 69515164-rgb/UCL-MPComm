@@ -74,5 +74,3 @@ User buffers are not registered but are instead routed through a multi-threaded 
 > MPComm reaches **up to +2030.2%** (1GB block GET: 73.28 vs 3.44 GB/s).
 
 ---
-
-Version: `1.4.0` (`R01C04`) · License: Apache-2.0

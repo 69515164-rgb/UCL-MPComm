@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./assets/ucl-mpcomm-logo.svg" width="820" alt="UCL-MPComm" />
+  <img src="./docs/images/ucl-mpcomm-logo.png" width="780" alt="UCL-MPComm" />
   <h2 align="center">
     UCL-MPComm
   </h2>

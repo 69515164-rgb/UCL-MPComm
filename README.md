@@ -31,7 +31,8 @@ performance levels that approach the physical limits of the hardware.
 <p align="center">
   <a href="#key-features">Key Features</a> |
   <a href="#getting-started">Getting Started</a> |
-  <a href="#performance">Performance</a>
+  <a href="#performance">Performance</a> |
+  <a href="#open-source-plan">Open Source Plan</a>
 </p>
 
 ---
@@ -113,5 +114,17 @@ verbs; non-zero-copy routes unregistered buffers through a multi-threaded
 staging pool, contrasted with UCX's copy-in mechanism.
 
 </details>
+
+---
+
+## Open Source Plan
+
+- [x] MPComm main framework
+- [x] NVLink forwarding
+- [x] H2D/D2H accelerating
+- [ ] Non-zero-copy convenience API
+- [ ] Centralized deployment mode
+- [ ] Intra-/internode unified QoS
+- [ ] Scatter/gather acceleration
 
 ---

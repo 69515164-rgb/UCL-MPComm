@@ -1,5 +1,13 @@
+Tencent is pleased to support the open source community by making UCL-MPcomm——高性能内存池通信库 available. 
 
-                                 Apache License
+Copyright (C) 2026 Tencent.  All rights reserved. 
+
+UCL-MPcomm——高性能内存池通信库 is licensed under the Apache-2.0.
+
+
+Terms of the Apache-2.0:
+--------------------------------------------------------------------
+Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
 
@@ -187,7 +195,7 @@
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
-   Copyright (C) 2026 Tencent. All rights reserved.
+   Copyright [yyyy] [name of copyright owner]
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.

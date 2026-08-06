@@ -2,6 +2,7 @@
 include CMakeLists.txt
 include pyproject.toml
 include VERSION
+include LICENSE
 
 # C++ source and headers
 recursive-include src *.cpp *.h
@@ -14,7 +15,7 @@ recursive-include python *.cpp *.py
 recursive-include cmake *.cmake.in
 
 # Documentation (for readme)
-include docs/MPComm_Introduction.md
+include README.md
 
 # Exclude build artifacts
 prune build

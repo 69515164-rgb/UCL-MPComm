@@ -128,3 +128,9 @@ staging pool, contrasted with UCX's copy-in mechanism.
 - [ ] Scatter/gather acceleration
 
 ---
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright (C) 2026 Tencent. All rights reserved.

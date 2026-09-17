@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="960" height="540" role="img">
+  <rect width="960" height="540" fill="#fafbfc"/>
+  <text x="480" y="42" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="22" font-weight="700" fill="#111">交换机自适应路由</text>
+  <text x="480" y="70" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="14" fill="#555">逐包看出队列深度，每次选最轻载路径</text>
+
+  <rect x="40" y="230" width="88" height="52" rx="8" fill="#2563eb"/>
+  <text x="84" y="261" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="16" font-weight="700" fill="#fff">入包</text>
+  <line x1="128" y1="256" x2="198" y2="256" stroke="#111" stroke-width="2.5"/>
+  <polygon points="198,249 214,256 198,263" fill="#111"/>
+
+  <rect x="214" y="118" width="430" height="300" rx="14" fill="#fff" stroke="#1e3a5f" stroke-width="2.5"/>
+  <text x="429" y="148" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="16" font-weight="700" fill="#1e3a5f">交换机：比较等价出口的队列深度</text>
+
+  <text x="236" y="192" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" fill="#333">出口1</text>
+  <rect x="286" y="176" width="240" height="22" rx="4" fill="#e5e7eb"/>
+  <rect x="286" y="176" width="200" height="22" rx="4" fill="#9ca3af"/>
+  <text x="536" y="192" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" fill="#444">深度=8  重</text>
+  <line x1="644" y1="187" x2="760" y2="160" stroke="#9ca3af" stroke-width="2" stroke-dasharray="6 5"/>
+  <rect x="760" y="142" width="160" height="36" rx="6" fill="#fff" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="840" y="165" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="14" fill="#6b7280">路径 A</text>
+
+  <text x="236" y="262" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" font-weight="700" fill="#166534">出口2</text>
+  <rect x="286" y="246" width="240" height="22" rx="4" fill="#dcfce7"/>
+  <rect x="286" y="246" width="50" height="22" rx="4" fill="#16a34a"/>
+  <text x="536" y="262" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" font-weight="700" fill="#166534">深度=2  最轻</text>
+  <line x1="644" y1="257" x2="760" y2="257" stroke="#16a34a" stroke-width="4"/>
+  <polygon points="760,250 776,257 760,264" fill="#16a34a"/>
+  <rect x="776" y="239" width="144" height="36" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text x="848" y="262" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="14" font-weight="700" fill="#166534">路径 B  本包</text>
+
+  <text x="236" y="332" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" fill="#9a3412">出口3</text>
+  <rect x="286" y="316" width="240" height="22" rx="4" fill="#ffedd5"/>
+  <rect x="286" y="316" width="125" height="22" rx="4" fill="#f97316"/>
+  <text x="536" y="332" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" fill="#9a3412">深度=5  中</text>
+  <line x1="644" y1="327" x2="760" y2="354" stroke="#fdba74" stroke-width="2" stroke-dasharray="6 5"/>
+  <rect x="760" y="336" width="160" height="36" rx="6" fill="#fff" stroke="#fdba74" stroke-width="1.5"/>
+  <text x="840" y="359" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="14" fill="#9a3412">路径 C</text>
+
+  <rect x="286" y="368" width="310" height="32" rx="6" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+  <text x="441" y="389" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" fill="#1e40af">min(8, 2, 5) = 2  →  从出口2转出</text>
+
+  <text x="480" y="458" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="14" fill="#111">规则：每个包到达时，在等价出口里选当前队列最短的那条；下一包重新比一次。</text>
+  <text x="480" y="486" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" fill="#666">不做流粘滞。高载口队列变长后，后续包会自动换到更空的口。</text>
+  <text x="480" y="520" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="12" fill="#888">条长短 = 出端口排队深度；实线绿路 = 本包选中，虚线 = 本包不走</text>
+</svg>

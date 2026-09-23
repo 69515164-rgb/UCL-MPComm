@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render SLO-gated inference network planning slides and pack a PPTX."""
+"""Executive planning deck: SLO-gated inference network vs TPN."""
 
 from __future__ import annotations
 
@@ -67,20 +67,15 @@ def draw_text(draw, xy, text, fnt, fill=INK, anchor="lt"):
     draw.text(xy, text, font=fnt, fill=fill, anchor=anchor)
 
 
-def shadow_rect(base, box, radius=18, pad=10):
+def shadow_rect(base, box, radius=18):
     x0, y0, x1, y1 = box
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     sd = ImageDraw.Draw(layer)
     sd.rounded_rectangle((x0 + 4, y0 + 6, x1 + 4, y1 + 8), radius=radius, fill=(20, 24, 30, 28))
     blur = layer.filter(ImageFilter.GaussianBlur(8))
-    base.alpha_composite(blur) if base.mode == "RGBA" else None
-    # work on RGB: paste via mask
-    if base.mode != "RGBA":
-        tmp = base.convert("RGBA")
-        tmp.alpha_composite(blur)
-        base.paste(tmp.convert("RGB"))
-        return
-    base.alpha_composite(blur)
+    tmp = base.convert("RGBA")
+    tmp.alpha_composite(blur)
+    base.paste(tmp.convert("RGB"))
 
 
 def card(img, box, fill=CARD, radius=18, outline=LINE, width=1, drop=True):
@@ -93,9 +88,8 @@ def card(img, box, fill=CARD, radius=18, outline=LINE, width=1, drop=True):
 def pill(draw, xy, text, bg, fg=(255, 255, 255), fnt=None, pad_x=16, pad_y=7):
     fnt = fnt or font(16)
     tw = text_w(draw, text, fnt)
-    th = 22
     x, y = xy
-    box = (x, y, x + tw + pad_x * 2, y + th + pad_y * 2)
+    box = (x, y, x + tw + pad_x * 2, y + 22 + pad_y * 2)
     draw.rounded_rectangle(box, radius=16, fill=bg)
     draw.text((x + pad_x, y + pad_y + 1), text, font=fnt, fill=fg)
     return box
@@ -104,8 +98,10 @@ def pill(draw, xy, text, bg, fg=(255, 255, 255), fnt=None, pad_x=16, pad_y=7):
 def header(img, kicker, title, claim=None):
     draw = ImageDraw.Draw(img)
     draw.rectangle((0, 0, W, 8), fill=TEAL)
-    draw_text(draw, (56, 28), kicker, font(18), TEAL)
-    draw_text(draw, (56, 58), title, font(40), INK)
+    draw_text(draw, (56, 26), kicker, font(18), TEAL)
+    # title may wrap once
+    tfont = font(36) if len(title) > 22 else font(40)
+    draw_text(draw, (56, 56), title, tfont, INK)
     if claim:
         draw_text(draw, (56, 114), claim, font(20), MUTED)
     draw.line([(56, 152), (W - 56, 152)], fill=LINE, width=1)
@@ -115,7 +111,18 @@ def footer(img, text):
     draw = ImageDraw.Draw(img)
     draw.line([(56, 1036), (W - 56, 1036)], fill=LINE, width=1)
     draw_text(draw, (56, 1050), text, font(15), MUTED)
-    draw_text(draw, (W - 56, 1050), "推理SLO门禁网络  ·  对标TPN", font(15), TEAL, anchor="rt")
+    draw_text(draw, (W - 56, 1050), "投资汇报  ·  推理网络规划", font(15), TEAL, anchor="rt")
+
+
+def so_bar(img, box, label, text, color=TEAL):
+    card(img, box, fill=SOFT, drop=False, outline=LINE)
+    d = ImageDraw.Draw(img)
+    pill(d, (box[0] + 24, box[1] + 18), label, color)
+    lines = wrap(d, text, font(22), box[2] - box[0] - 200)
+    y = box[1] + 22
+    for line in lines:
+        draw_text(d, (box[0] + 160, y), line, font(22), INK)
+        y += 34
 
 
 def arrow(draw, p1, p2, color=TEAL, width=3, head=12):
@@ -130,523 +137,462 @@ def arrow(draw, p1, p2, color=TEAL, width=3, head=12):
         )
 
 
-def center_label(draw, box, lines, fnt, fill=INK):
-    x0, y0, x1, y1 = box
-    total = len(lines) * (fnt.size + 6)
-    y = (y0 + y1 - total) / 2
-    for line in lines:
-        draw.text(((x0 + x1) / 2, y), line, font=fnt, fill=fill, anchor="mt")
-        y += fnt.size + 6
-
-
 # ---------------------------------------------------------------------------
-# Slides
+# Slides — one viewpoint each
 # ---------------------------------------------------------------------------
 
 def slide_01():
     img = new_canvas()
     draw = ImageDraw.Draw(img)
     draw.rectangle((0, 0, 18, H), fill=TEAL)
-    draw_text(draw, (72, 86), "网络规划  ·  AI推理主场景", font(20), TEAL)
-    draw_text(draw, (72, 140), "推理SLO门禁网络", font(72), INK)
-    draw_text(draw, (72, 230), "横向端网协同  ×  纵向算网协同", font(32), TEAL_D)
+    draw_text(draw, (72, 70), "给决策层的一页判断", font(20), TEAL)
+    draw_text(draw, (72, 118), "让网络对推理体验负责", font(64), INK)
+    draw_text(draw, (72, 214), "先评估，再接单；达不到指标，禁止调度。", font(30), TEAL_D)
     draw_text(
         draw,
-        (72, 292),
-        "业务调度之前结合SLO评估；判断达不成，则禁止调度。",
-        font(24),
+        (72, 274),
+        "投资买的不是更大的带宽数字，而是：谁有权决定这单接还是不接。",
+        font(22),
         MUTED,
     )
 
     items = [
-        (TEAL, "横向", "端网协同", "主机网卡与织物共治\n流分类 / 遥测 / 硬隔离"),
-        (NAVY, "纵向", "算网协同", "调度调用网络门禁\n放置 / 预算 / 亲和"),
-        (CORAL, "兜底", "Fail-closed", "预测超预算即拒收\n保已准入请求的P99"),
+        (TEAL, "判断", "体验已经按 Token 计价", "用户为快和稳付钱。\n网络若只报带宽，就是错配。"),
+        (NAVY, "主张", "达不成的单，不准进门", "有卡也不滥接。\n先保正在服务的用户。"),
+        (CORAL, "回报", "买决策权，不是买口号", "合格产能上升，\n空等和返工下降。"),
     ]
     x = 72
     for color, tag, title, body in items:
-        card(img, (x, 400, x + 560, 720), radius=22)
+        card(img, (x, 370, x + 560, 720), radius=22)
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle((x, 400, x + 14, 720), radius=8, fill=color)
-        pill(d, (x + 40, 430), tag, color)
-        draw_text(d, (x + 40, 500), title, font(36), INK)
-        y = 568
+        d.rounded_rectangle((x, 370, x + 14, 720), radius=8, fill=color)
+        pill(d, (x + 40, 400), tag, color)
+        draw_text(d, (x + 40, 470), title, font(28), INK)
+        y = 540
         for line in body.split("\n"):
             draw_text(d, (x + 40, y), line, font(20), MUTED)
-            y += 36
+            y += 40
         x += 590
 
-    card(img, (72, 760, 1848, 980), fill=SOFT, drop=False)
+    card(img, (72, 760, 1848, 990), fill=SOFT, drop=False)
     d = ImageDraw.Draw(img)
-    draw_text(d, (104, 792), "对标TPN的领先点", font(20), TEAL)
-    draw_text(
-        d,
-        (104, 836),
-        "TPN公开的是织物相对数（2层 / 带宽+2.5x / 规模+10x / 时延-1/3）。本方案把TTFT、TPS等业务指标写成可执行合同，",
-        font(20),
-        INK,
-    )
-    draw_text(
-        d,
-        (104, 876),
-        "把网络预算嵌进调度器：先评估，再放置；达不成就禁调。领先在闭环，不在口号。",
-        font(20),
-        INK,
-    )
-    pills = ["TTFT P99", "TPOT P99", "TPS", "Goodput"]
+    draw_text(d, (104, 792), "汇报逻辑", font(18), TEAL)
+    draw_text(d, (104, 836), "错配 → 对手只换了名字 → 我们的主张（禁调）→ 两根轴怎么支撑 → 四笔价值账 → 投什么、怎么验收", font(22), INK)
+    pills = ["主场景：AI推理", "指标：TTFT / TPS", "对标：阿里云TPN"]
     px = 104
     for p in pills:
-        box = pill(d, (px, 920), p, TEAL, fnt=font(16))
-        px = box[2] + 16
-    footer(img, "01  /  封面")
+        box = pill(d, (px, 910), p, TEAL)
+        px = box[2] + 14
+    footer(img, "01  /  开场判断")
     return img
 
 
 def slide_02():
     img = new_canvas()
-    header(img, "01  对标判断", "领先点不在带宽数字，在调度闭环",
-           "TPN把优化目标改成了Token，但公开材料停在L0织物；业务分位在PAI能看，还不能挡。")
-    cols = [
-        (TEAL, "TPN 公开能力", "L0  织物相对数", [
-            "2层网络",
-            "访问带宽 +2.5 倍",
-            "规模 +10 倍",
-            "时延降低 1/3",
-            "命题：每Token性能与性价比",
-        ], "无公开SLO、基线、测试方法"),
-        (GOLD, "PAI 已落地", "L2  服务层观测", [
-            "控制台 TTFT / TPOT / TPS",
-            "压测报告可出分位",
-            "Prometheus 可导出告警",
-            "前缀路由间接降TTFT",
-            "扩缩容仍看QPS/GPU",
-        ], "能看，默认不禁调"),
-        (CORAL, "公开缺口", "闭环还没接上", [
-            "没有Token合同给网络",
-            "没有 T_net 预算表",
-            "调度不调用网络门禁",
-            "多租隔离未与P99绑定",
-            "无 Goodput=SLO内Token",
-        ], "带宽翻倍，用户仍可能慢"),
+    header(
+        img,
+        "观点 1  ·  为什么现在投",
+        "推理已经按 Token 赚钱，网络还按带宽汇报",
+        "这是错配。错配的投资，用户无感，利润讲不清。",
+    )
+    left = [
+        ("业务真正问的", TEAL, [
+            "快不快：用户多久看到第一个字",
+            "稳不稳：会不会越说越卡",
+            "贵不贵：每个合格结果花多少钱",
+        ]),
     ]
-    x = 56
-    draw = ImageDraw.Draw(img)
-    for color, title, sub, bullets, foot in cols:
-        card(img, (x, 180, x + 580, 900), radius=20)
-        d = ImageDraw.Draw(img)
-        d.rectangle((x, 180, x + 580, 188), fill=color)
-        draw_text(d, (x + 36, 214), title, font(28), INK)
-        draw_text(d, (x + 36, 262), sub, font(18), color)
-        y = 320
-        for b in bullets:
-            d.ellipse((x + 40, y + 8, x + 52, y + 20), fill=color)
-            draw_text(d, (x + 68, y), b, font(20), INK)
-            y += 52
-        d.rounded_rectangle((x + 28, 800, x + 552, 872), radius=12, fill=SOFT)
-        lines = wrap(d, foot, font(18), 500)
-        ly = 818 if len(lines) == 1 else 808
-        for line in lines:
-            draw_text(d, (x + 48, ly), line, font(18), MUTED)
-            ly += 28
-        x += 604
-    footer(img, "02  /  对标判断")
+    right = [
+        ("网络常常答的", CORAL, [
+            "带宽又翻了一倍",
+            "集群又能多接多少卡",
+            "空载时延又降了一截",
+        ]),
+    ]
+    card(img, (56, 180, 920, 780), radius=20)
+    d = ImageDraw.Draw(img)
+    pill(d, (92, 212), "业务真正问的", TEAL)
+    qs = [
+        ("快不快", "用户多久看到第一个字（TTFT）"),
+        ("稳不稳", "会不会越说越卡（TPS/流畅）"),
+        ("贵不贵", "每个合格结果花多少钱"),
+    ]
+    y = 300
+    for t, b in qs:
+        d.rounded_rectangle((92, y, 880, y + 120), radius=14, fill=SOFT)
+        draw_text(d, (120, y + 24), t, font(26), TEAL)
+        draw_text(d, (120, y + 68), b, font(20), INK)
+        y += 140
+
+    card(img, (980, 180, 1864, 780), radius=20)
+    d = ImageDraw.Draw(img)
+    pill(d, (1016, 212), "网络常常答的", CORAL)
+    qs = [
+        ("带宽", "链路更粗了，账单更大了"),
+        ("规模", "能堆更多卡，不代表单更稳"),
+        ("空载时延", "没人的时候很快，忙起来另说"),
+    ]
+    y = 300
+    for t, b in qs:
+        d.rounded_rectangle((1016, y, 1828, y + 120), radius=14, fill=SOFT)
+        draw_text(d, (1044, y + 24), t, font(26), CORAL)
+        draw_text(d, (1044, y + 68), b, font(20), INK)
+        y += 140
+
+    so_bar(
+        img,
+        (56, 812, 1864, 1008),
+        "所以",
+        "谁掌握 Token 体验，谁掌握推理利润。网络若不改汇报口径，投资就会买错东西。",
+    )
+    footer(img, "02  /  观点一")
     return img
 
 
 def slide_03():
     img = new_canvas()
-    header(img, "02  总体架构", "一张网，两根轴",
-           "横向把端和网收成一条控制面；纵向把算力调度和网络门禁收成一次决策。")
-
-    # cross
-    cx, cy = 960, 620
-    draw = ImageDraw.Draw(img)
-    draw.line([(220, cy), (1700, cy)], fill=TEAL, width=4)
-    draw.line([(cx, 210), (cx, 980)], fill=NAVY, width=4)
-
-    # axis labels
-    draw_text(draw, (cx, 188), "纵向  ·  算网协同", font(22), NAVY, anchor="mm")
-    draw_text(draw, (1720, cy), "横向  ·  端网协同", font(22), TEAL, anchor="lm")
-
-    # center hub
-    card(img, (cx - 170, cy - 70, cx + 170, cy + 70), fill=TEAL, outline=TEAL, drop=True)
-    d = ImageDraw.Draw(img)
-    draw_text(d, (cx, cy - 16), "SLO 门禁", font(28), (255, 255, 255), anchor="mm")
-    draw_text(d, (cx, cy + 22), "评估 · 放置 · 禁调", font(16), (210, 232, 230), anchor="mm")
-
-    quads = [
-        (240, 210, 720, 520, NAVY, "上  业务与调度", [
-            "SLO合同：TTFT / TPS / TPOT",
-            "调度器先问门禁再放置",
-            "超预算：换位或禁止调度",
-        ]),
-        (1200, 210, 1680, 520, NAVY, "上  网络控制面", [
-            "切片带宽与队列水位",
-            "路径/亲和/故障域视图",
-            "预算剩余实时回传",
-        ]),
-        (240, 720, 720, 1000, TEAL, "下  端（主机/网卡）", [
-            "KV / Decode / 存储 / BE 分流",
-            "NIC QoS 保已准入流",
-            "INT / ECN 上报预测器",
-        ]),
-        (1200, 720, 1680, 1000, TEAL, "下  网（交换机/织物）", [
-            "出队列隔离，多租不互伤",
-            "同ToR / 同平面优先",
-            "故障时拒新保旧",
-        ]),
+    header(
+        img,
+        "观点 2  ·  对手证明了什么",
+        "TPN 说对了方向，还没有交出合同",
+        "尊重对手的命名。投资要问：名字换了之后，谁对体验负责？",
+    )
+    cols = [
+        (OK, "他们做对的", [
+            "承认第一目标不再是训练不掉速",
+            "把叙事改成每 Token 的性能和成本",
+            "证明行业共识已经转向推理",
+        ], "方向对，值得对标"),
+        (GOLD, "他们公开交出的", [
+            "两层网络",
+            "带宽 +2.5 倍、规模 +10 倍",
+            "时延降低约 1/3",
+        ], "织物相对数，没有业务合同"),
+        (CORAL, "他们没交出的", [
+            "体验不达标时，能不能拒单",
+            "多租互抢时，谁的体验优先",
+            "这组数字对应哪一档用户体感",
+        ], "决策权还在调度，网络仍是配角"),
     ]
-    for x0, y0, x1, y1, color, title, bullets in quads:
-        card(img, (x0, y0, x1, y1), radius=18)
+    x = 56
+    for color, title, bullets, foot in cols:
+        card(img, (x, 180, x + 580, 780), radius=20)
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle((x0, y0, x0 + 10, y1), radius=6, fill=color)
-        draw_text(d, (x0 + 32, y0 + 22), title, font(20), color)
-        y = y0 + 70
+        d.rectangle((x, 180, x + 580, 188), fill=color)
+        draw_text(d, (x + 36, 220), title, font(28), INK)
+        y = 300
         for b in bullets:
-            draw_text(d, (x0 + 32, y), b, font(18), INK)
-            y += 36
-
-    footer(img, "03  /  双轴架构")
+            d.ellipse((x + 44, y + 10, x + 56, y + 22), fill=color)
+            lines = wrap(d, b, font(20), 480)
+            for i, line in enumerate(lines):
+                draw_text(d, (x + 72, y + i * 32), line, font(20), INK)
+            y += 32 * len(lines) + 28
+        d.rounded_rectangle((x + 28, 660, x + 552, 748), radius=12, fill=SOFT)
+        lines = wrap(d, foot, font(18), 500)
+        ly = 684 if len(lines) == 1 else 672
+        for line in lines:
+            draw_text(d, (x + 48, ly), line, font(18), MUTED)
+            ly += 28
+        x += 604
+    so_bar(
+        img,
+        (56, 812, 1864, 1008),
+        "判断",
+        "TPN 是正确的行业信号，不是可签的体验合同。领先点必须落在“有权不接单”，而不是再报一版相对数。",
+    )
+    footer(img, "03  /  观点二")
     return img
 
 
 def slide_04():
     img = new_canvas()
-    header(img, "03  SLO合同", "先签合同，再把预算拆到网络",
-           "网络只能兜 T_net。算力段、命中率、批大小买不回来，所以合同必须可分解。")
-
-    metrics = [
-        (TEAL, "TTFT P99", "体验", "首Token到达", "Queue + Prefill + KV搬运"),
-        (NAVY, "TPOT P99", "流畅", "相邻Token间隔", "Decode + 批等待 + MoE"),
-        (GOLD, "TPS", "产能", "每秒有效Token", "min(算力, 网络, KV槽)"),
-        (OK, "Goodput", "合格产能", "SLO内Token/墙钟", "只计同时满足分位的量"),
+    header(
+        img,
+        "观点 3  ·  为什么带宽故事不够",
+        "带宽翻倍，用户仍可能觉得慢",
+        "一次推理不是一条空管子。投资如果只买管子，买不到体验。",
+    )
+    stages = [
+        (NAVY, "1  排队", "前面的人没走完\n再快的路也等"),
+        (TEAL, "2  计算", "模型在算\n网络再强也替不了"),
+        (GOLD, "3  搬运", "缓存要从别处搬来\n这才是网络的责任"),
     ]
     x = 56
-    for color, name, kind, meaning, decomp in metrics:
-        card(img, (x, 180, x + 440, 430), radius=18)
-        d = ImageDraw.Draw(img)
-        pill(d, (x + 24, 204), kind, color)
-        draw_text(d, (x + 24, 268), name, font(28), INK)
-        draw_text(d, (x + 24, 320), meaning, font(18), MUTED)
-        draw_text(d, (x + 24, 364), decomp, font(17), INK)
-        x += 464
-
-    card(img, (56, 460, 1864, 1008), radius=20)
     d = ImageDraw.Draw(img)
-    draw_text(d, (92, 492), "可执行分解（不用网络空载RTT代替业务分位）", font(22), TEAL)
+    for i, (color, title, body) in enumerate(stages):
+        card(img, (x, 184, x + 520, 520), radius=20)
+        dd = ImageDraw.Draw(img)
+        dd.rectangle((x, 184, x + 520, 192), fill=color)
+        draw_text(dd, (x + 36, 220), title, font(30), INK)
+        y = 320
+        for line in body.split("\n"):
+            draw_text(dd, (x + 36, y), line, font(22), MUTED)
+            y += 44
+        if i < 2:
+            arrow(dd, (x + 528, 350), (x + 568, 350), TEAL, 5, 16)
+        x += 604
 
-    formulas = [
-        "TTFT = T_queue + T_prefill(I, 1-H) + T_kv_load + T_kv_xfer",
-        "TPS  = min(TPS_compute, TPS_net, TPS_kvslot)",
-        "Budget_net_TTFT = SLO_ttft - T_queue_slo - T_prefill_est",
-        "ADMIT  iff  TTFT_hat_P99 <= SLO  and  TPS_hat >= SLO  and  T_net <= Budget_net",
-    ]
-    y = 550
-    for fml in formulas:
-        d.rounded_rectangle((92, y, 1780, y + 70), radius=12, fill=SOFT)
-        draw_text(d, (120, y + 18), fml, font(22), INK)
-        y += 86
+    card(img, (56, 556, 1864, 780), radius=18)
+    d = ImageDraw.Draw(img)
+    draw_text(d, (92, 588), "给投资人的分解", font(20), TEAL)
+    draw_text(d, (92, 640), "用户体验  =  排队  +  计算  +  搬运", font(28), INK)
+    draw_text(d, (92, 700), "缓存经常命中，网络不该是瓶颈；一旦没命中，搬运快慢就是体验本身。不拆开，就会把计算的问题误投成网络。", font(20), MUTED)
 
-    draw_text(d, (92, 920), "H = 前缀命中率。命中足够高时，网络不应再是一阶项；未命中时，T_kv_xfer 必须有毫秒预算。", font(18), MUTED)
-    footer(img, "04  /  SLO合同")
+    so_bar(
+        img,
+        (56, 812, 1864, 1008),
+        "所以",
+        "我们不投“全网再快一截”。我们投：能事先判断这单会不会在搬运上翻车，翻车就不接。",
+    )
+    footer(img, "04  /  观点三")
     return img
 
 
 def slide_05():
     img = new_canvas()
-    header(img, "04  核心机制", "调度之前先评估，达不成禁止调度",
-           "门禁在业务调度之前，不在看板之后。Fail-closed：预测超预算就拒，不靠平均带宽掩盖尾部。")
+    header(
+        img,
+        "主张  ·  核心机制只讲这一件",
+        "达不成的单，不准进门",
+        "兜底不是保证每一次都快。兜底是：预测达不到，就禁止调度。",
+    )
+    # restaurant analogy strip
+    card(img, (56, 176, 1864, 300), fill=SOFT, drop=False)
+    d = ImageDraw.Draw(img)
+    draw_text(d, (88, 198), "一个能听懂的类比", font(18), TEAL)
+    draw_text(d, (88, 238), "餐厅座位空着，也不该再接做不完的菜。滥接的结果是：所有客人一起变慢，口碑和翻台一起坏。", font(22), INK)
 
-    steps = [
-        ("1", "到达", "请求 / 新副本 / 新租户"),
-        ("2", "画像", "模型 · I/O · 并发 · 命中率"),
-        ("3", "遥测", "队列 · 切片剩余 · 路径"),
-        ("4", "预测", "TTFT / TPS / T_net P99"),
-    ]
-    x = 56
-    draw = ImageDraw.Draw(img)
-    for i, (n, title, body) in enumerate(steps):
-        card(img, (x, 184, x + 390, 360), radius=16)
-        d = ImageDraw.Draw(img)
-        d.ellipse((x + 24, 208, x + 64, 248), fill=TEAL)
-        draw_text(d, (x + 44, 228), n, font(20), (255, 255, 255), anchor="mm")
-        draw_text(d, (x + 80, 214), title, font(26), INK)
-        draw_text(d, (x + 28, 286), body, font(18), MUTED)
-        if i < 3:
-            arrow(d, (x + 398, 272), (x + 430, 272), TEAL, 4, 14)
-        x += 464
-
-    # three decisions
     decisions = [
-        (OK, "ADMIT  放行", "T_net 与算力预算都够", [
-            "按亲和位放置",
-            "切片记账 +1",
-            "进入硬隔离队列",
-        ]),
-        (GOLD, "REPLACE  换位", "本位置超预算，邻域够", [
-            "优先同ToR / 同平面",
-            "KV与Decode重亲和",
-            "换完再评一次",
-        ]),
-        (CORAL, "REJECT  禁止调度", "任何位置都达不成SLO", [
-            "不进入业务调度",
-            "返回容量不足/换SLO档",
-            "保已准入请求的P99",
-        ]),
+        (OK, "接", "这单在红线内", "放进正在服务的队列\n网络给它让路"),
+        (GOLD, "换", "这里不行，旁边行", "换到更近的位置再评\n能近就不要远搬"),
+        (CORAL, "拒", "哪里都达不到", "禁止调度\n保住已经在吃的客人"),
     ]
     x = 56
-    for color, title, sub, bullets in decisions:
-        card(img, (x, 400, x + 580, 860), radius=20, outline=color, width=2)
+    for color, title, sub, body in decisions:
+        card(img, (x, 328, x + 580, 780), radius=20, outline=color, width=2)
         d = ImageDraw.Draw(img)
-        d.rectangle((x, 400, x + 580, 408), fill=color)
-        draw_text(d, (x + 32, 432), title, font(28), color)
-        draw_text(d, (x + 32, 486), sub, font(18), MUTED)
-        y = 540
-        for b in bullets:
-            d.ellipse((x + 40, y + 8, x + 52, y + 20), fill=color)
-            draw_text(d, (x + 68, y), b, font(20), INK)
-            y += 56
+        d.rectangle((x, 328, x + 580, 336), fill=color)
+        draw_text(d, (x + 36, 368), title, font(40), color)
+        draw_text(d, (x + 36, 440), sub, font(22), MUTED)
+        y = 520
+        for line in body.split("\n"):
+            draw_text(d, (x + 36, y), line, font(22), INK)
+            y += 44
         x += 604
 
-    card(img, (56, 884, 1864, 1008), fill=SOFT, drop=False)
-    d = ImageDraw.Draw(img)
-    draw_text(d, (88, 910), "和TPN的本质差别", font(18), TEAL)
-    draw_text(d, (88, 950), "TPN增强织物后，调度仍可把请求打上去；本方案调度器必须拿到 Admit 结果。没有放行令牌，业务层不得放置。", font(20), INK)
-    footer(img, "05  /  调度前门禁")
+    so_bar(
+        img,
+        (56, 812, 1864, 1008),
+        "投资含义",
+        "我们买的是拒单权。没有这把刀，带宽投得再多，忙的时候仍然大家一起慢。",
+    )
+    footer(img, "05  /  主张")
     return img
 
 
 def slide_06():
     img = new_canvas()
-    header(img, "05  横向  ·  端网协同", "主机和织物共治同一条Token路径",
-           "端负责分类与上报，网负责隔离与路径；预测器吃两端遥测，而不是只看空载RTT。")
-
+    header(
+        img,
+        "支撑 1  ·  横向端网协同",
+        "端和网必须对同一条用户路径负责",
+        "不是两拨人各报各的数。用户慢了，两端要能一起说清楚、一起收口。",
+    )
     feats = [
-        (TEAL, "01", "四类流硬分", "KV搬运  ·  Decode同步  ·  存储回源  ·  Best-effort",
-         "不同队列、不同预算。训练AllReduce和BE打不满已准入的KV/Decode。",
-         "端：DSCP/TC打标    网：PQ/切片入队"),
-        (TEAL, "02", "端侧保已准入", "NIC QoS / 限速 / 喷洒窗口",
-         "新流可降，已放行流的T_net P99优先。PCIe无GPU QoS时，在网卡做。",
-         "端：已准入QP保速    网：超水位反压新流"),
-        (NAVY, "03", "网侧硬隔离", "切片 + 出队列 + 同平面优先",
-         "多租注入后，已准入TTFT P99漂移受合同约束，而不是“尽量公平”。",
-         "端：按切片选路    网：出队列互不抢缓冲"),
-        (NAVY, "04", "遥测回灌", "队列深度 / ECN / 重传 → 预测器",
-         "门禁用的是实时水位，不是规划表。超水位先收口喷洒和KV并发。",
-         "端：INT/ECN上报    网：队列水位进预测器"),
+        (TEAL, "分清谁优先", "正在对话的人，优先于后台搬运和占便宜的流量。", "价值：忙的时候体验不塌"),
+        (NAVY, "路上不互抢", "多租共用集群，但不能互相拖慢已经接进来的单。", "价值：提高复用，不牺牲口碑"),
+        (GOLD, "堵了先限新的", "路一开始堵，先停新单，不去挤正在服务的人。", "价值：故障时亏小、不亏口碑"),
+        (CORAL, "两边看同一张表", "入口和路上报的是同一套体验红线，不是各说各话。", "价值：出问题能问责，能停投"),
     ]
-    positions = [(56, 180), (988, 180), (56, 590), (988, 590)]
-    for (x, y), (color, n, title, sub, body, bar) in zip(positions, feats):
-        card(img, (x, y, x + 876, y + 380), radius=20)
+    x, y0 = 56, 180
+    for i, (color, title, body, val) in enumerate(feats):
+        if i == 2:
+            x, y0 = 56, 560
+        card(img, (x, y0, x + 876, y0 + 340), radius=20)
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle((x + 28, y + 28, x + 88, y + 88), radius=14, fill=color)
-        draw_text(d, (x + 58, y + 58), n, font(22), (255, 255, 255), anchor="mm")
-        draw_text(d, (x + 112, y + 36), title, font(28), INK)
-        draw_text(d, (x + 112, y + 84), sub, font(18), color)
-        lines = wrap(d, body, font(20), 780)
-        ly = y + 150
+        d.rounded_rectangle((x + 28, y0 + 28, x + 16 + 28, y0 + 312), radius=8, fill=color)
+        draw_text(d, (x + 72, y0 + 36), title, font(28), INK)
+        lines = wrap(d, body, font(22), 740)
+        ly = y0 + 110
         for line in lines:
-            draw_text(d, (x + 40, ly), line, font(20), MUTED)
+            draw_text(d, (x + 72, ly), line, font(22), MUTED)
             ly += 36
-        d.rounded_rectangle((x + 28, y + 292, x + 848, y + 352), radius=12, fill=SOFT)
-        draw_text(d, (x + 52, y + 310), bar, font(18), INK)
-    footer(img, "06  /  横向端网协同")
+        d.rounded_rectangle((x + 72, y0 + 240, x + 840, y0 + 308), radius=12, fill=SOFT)
+        draw_text(d, (x + 96, y0 + 260), val, font(20), color)
+        x += 904
+    footer(img, "06  /  横向")
     return img
 
 
 def slide_07():
     img = new_canvas()
-    header(img, "06  纵向  ·  算网协同", "调度器把网络门禁当成硬依赖",
-           "GPU有空位不等于能调度。算力、缓存、网络预算三次都过，才放置。")
-
-    # flow bar
-    nodes = ["SLO档", "算力槽", "KV亲和", "网络预算", "放置"]
-    x = 80
-    draw = ImageDraw.Draw(img)
-    for i, name in enumerate(nodes):
-        box = (x, 184, x + 260, 280)
+    header(
+        img,
+        "支撑 2  ·  纵向算网协同",
+        "有卡，不等于能接单",
+        "算力空着也在烧钱。调度先问：这单会不会把体验红线打穿。",
+    )
+    chain = ["看档位", "看卡", "看数据在不在旁边", "看路还堵不堵", "才接单"]
+    x = 56
+    for i, name in enumerate(chain):
         fill = TEAL if i == 4 else CARD
         fg = (255, 255, 255) if i == 4 else INK
-        card(img, box, fill=fill, outline=TEAL if i == 4 else LINE, drop=True)
+        card(img, (x, 184, x + 300, 300), fill=fill, outline=TEAL if i == 4 else LINE)
         d = ImageDraw.Draw(img)
-        draw_text(d, ((box[0] + box[2]) / 2, 232), name, font(24), fg, anchor="mm")
+        draw_text(d, (x + 150, 242), name, font(22), fg, anchor="mm")
         if i < 4:
-            arrow(d, (x + 268, 232), (x + 300, 232), TEAL, 4, 12)
-        x += 360
+            arrow(d, (x + 308, 242), (x + 348, 242), TEAL, 4, 12)
+        x += 372
 
-    feats = [
-        ("Admit API", "调度每次放置都调用。返回 ADMIT / REPLACE / REJECT，没有令牌不得下发。"),
-        ("计算-KV亲和", "远端KV会撑爆TTFT预算时，禁止跨域放置，先同ToR，再同平面。"),
-        ("PD配比受预算约束", "Prefill/Decode 扩容看 T_kv_xfer P99，不只看卡数配比。"),
-        ("弹性也走门禁", "副本增加先问切片剩余。GPU利用率够、网络预算不够，仍禁扩。"),
-        ("多档SLO", "交互档 / 批量档分合同。批量不得占交互切片。拒收优于混排降质。"),
-        ("失败语义", "故障域收缩时拒新保旧，Goodput优先于平均TPS。"),
+    cards = [
+        ("调度先问网络", "卡有空位，只是必要条件。问不清会不会超时，就不能下发。"),
+        ("数据靠近计算", "能在旁边取到缓存，就不要跨很远去搬。搬得动，才叫能接。"),
+        ("扩容也要过门", "多加几张卡，路不够，照样拒。避免越扩越慢。"),
     ]
-    x, y = 56, 330
-    for i, (title, body) in enumerate(feats):
-        if i == 3:
-            x, y = 56, 680
-        card(img, (x, y, x + 580, y + 300), radius=18)
+    x = 56
+    for title, body in cards:
+        card(img, (x, 340, x + 580, 760), radius=20)
         d = ImageDraw.Draw(img)
-        draw_text(d, (x + 28, y + 28), title, font(24), TEAL)
-        lines = wrap(d, body, font(18), 520)
-        ly = y + 90
+        draw_text(d, (x + 36, 380), title, font(28), TEAL)
+        lines = wrap(d, body, font(22), 500)
+        ly = 470
         for line in lines:
-            draw_text(d, (x + 28, ly), line, font(18), INK)
-            ly += 32
+            draw_text(d, (x + 36, ly), line, font(22), INK)
+            ly += 40
         x += 604
-    footer(img, "07  /  纵向算网协同")
+
+    so_bar(
+        img,
+        (56, 792, 1864, 1008),
+        "价值",
+        "少做“卡在空转、人在等待”的无效产能。投资从买卡，变成买接得住的单。",
+    )
+    footer(img, "07  /  纵向")
     return img
 
 
 def slide_08():
     img = new_canvas()
-    header(img, "07  业务指标兜底", "兜底=三道闸，不是事后解释",
-           "网络不承诺替算力出Token；网络承诺：不把达不成的活放进去，放进去的活不被邻居打穿。")
-
-    gates = [
-        (CORAL, "闸1  准入", "预测失败 → 禁止调度", [
-            "请求、扩容、新租户都过门禁",
-            "输出拒绝原因：算力 / KV / 网络",
-            "可改SLO档，不可 silently 降质",
-            "验收：超预算请求不得进入运行队列",
-        ], "挡在调度前"),
-        (TEAL, "闸2  隔离", "已准入 P99 受保护", [
-            "KV/Decode 与 BE/训练分队列",
-            "多租注入后漂移写入合同",
-            "超水位先限新流，不伤老流",
-            "验收：打满BE后TTFT P99漂移可控",
-        ], "挡在数据面"),
-        (NAVY, "闸3  故障", "拒新保旧，Fail-closed", [
-            "链路/ToR异常：收缩预算",
-            "新请求REJECT，在途走完",
-            "恢复后再开门，不做平均抹平",
-            "验收：故障窗口Goodput优于平均TPS",
-        ], "挡在控制面"),
+    header(
+        img,
+        "价值  ·  投资买到什么",
+        "四笔账，比再快一截带宽更好讲",
+        "说服投资，靠的是体验、合格产能、成本和风险，不是协议名词。",
+    )
+    vals = [
+        (TEAL, "体验", "接进来的用户，不被挤慢", "首字和流畅有红线。\n达不到的单不进门。"),
+        (NAVY, "产能", "数合格的 Token，不数虚高吞吐", "只统计红线内的产出。\n忙时宁少接，不少合格。"),
+        (GOLD, "成本", "少买空等的卡", "卡在等数据，电表照走。\n拒单比空等便宜。"),
+        (CORAL, "风险", "验收失败可以停", "三条测法事先写死。\n讲不清价值，就不要加码。"),
     ]
     x = 56
-    for color, title, sub, bullets, tag in gates:
-        card(img, (x, 180, x + 580, 820), radius=20)
+    for color, title, sub, body in vals:
+        card(img, (x, 180, x + 440, 760), radius=20)
         d = ImageDraw.Draw(img)
-        d.rectangle((x, 180, x + 580, 188), fill=color)
-        pill(d, (x + 32, 220), tag, color)
-        draw_text(d, (x + 32, 290), title, font(30), INK)
-        draw_text(d, (x + 32, 350), sub, font(20), color)
-        y = 430
-        for b in bullets:
-            d.ellipse((x + 40, y + 8, x + 52, y + 20), fill=color)
-            lines = wrap(d, b, font(20), 480)
-            for j, line in enumerate(lines):
-                draw_text(d, (x + 68, y + j * 30), line, font(20), INK)
-            y += 30 * len(lines) + 28
-        x += 604
+        d.rectangle((x, 180, x + 440, 188), fill=color)
+        draw_text(d, (x + 28, 220), title, font(32), color)
+        lines = wrap(d, sub, font(22), 380)
+        ly = 300
+        for line in lines:
+            draw_text(d, (x + 28, ly), line, font(22), INK)
+            ly += 36
+        d.rounded_rectangle((x + 24, 500, x + 416, 720), radius=14, fill=SOFT)
+        ly = 530
+        for line in body.split("\n"):
+            draw_text(d, (x + 44, ly), line, font(20), MUTED)
+            ly += 44
+        x += 464
 
-    card(img, (56, 848, 1864, 1008), fill=SOFT, drop=False)
-    d = ImageDraw.Draw(img)
-    draw_text(d, (88, 876), "一句话", font(18), TEAL)
-    draw_text(d, (88, 920), "兜底不是“网络保证TPOT=20ms”。兜底是：达不成的不进门；进门的T_net P99有预算、有隔离、有故障语义。", font(22), INK)
-    footer(img, "08  /  三道闸")
+    so_bar(
+        img,
+        (56, 792, 1864, 1008),
+        "一句话",
+        "这轮投资的回报，是少接烂单、多出合格结果、少养空转的卡。",
+    )
+    footer(img, "08  /  价值账")
     return img
 
 
 def slide_09():
     img = new_canvas()
-    header(img, "08  对比与验收", "用可证伪的表，对标TPN公开能力",
-           "不发明TPN的SLA。只对比它已经公开的东西，和本方案必须交出来的东西。")
-
+    header(
+        img,
+        "对标  ·  给投资人看的差",
+        "他们增强路，我们决定谁可以上路",
+        "不发明对手的承诺。只对比：公开材料里有什么，我们必须交出什么。",
+    )
     rows = [
-        ("优化目标", "每Token性能与性价比（命题）", "可执行Token SLO合同"),
-        ("量化形态", "2层 / +2.5x / +10x / 时延-1/3", "TTFT/TPS P99 + T_net预算"),
-        ("与调度关系", "织物增强，调度自行放置", "调度前评估，可禁止调度"),
-        ("测量闭环", "无公开归因到Token分位", "引擎stage对齐网络切片"),
-        ("多租语义", "未与业务P99绑定", "隔离闸 + 漂移合同"),
-        ("失败语义", "规模与自愈（HPN侧）", "拒新保旧，Goodput优先"),
+        ("目标", "把故事改成 Token", "把 Token 体验写成可执行红线"),
+        ("数字", "路更宽、更大、空载更快", "忙的时候，达标单能不能保住"),
+        ("权力", "调度自己决定接不接", "网络有权说：这单不准进"),
+        ("忙时", "大家一起挤", "新单让路，老单受保护"),
+        ("失败", "事后解释为什么慢", "事先拒单，验收可以停投"),
+        ("问责", "数字对不上体验，难追责", "红线、拒单、测法三条对齐"),
     ]
-    # table header
     card(img, (56, 176, 1864, 248), fill=TEAL, outline=TEAL, drop=False)
     d = ImageDraw.Draw(img)
-    draw_text(d, (80, 212), "维度", font(20), (255, 255, 255), anchor="lm")
+    draw_text(d, (90, 212), "看什么", font(20), (255, 255, 255), anchor="lm")
     draw_text(d, (420, 212), "TPN 公开材料", font(20), (255, 255, 255), anchor="lm")
-    draw_text(d, (1120, 212), "本方案必须交付", font(20), (255, 255, 255), anchor="lm")
-
+    draw_text(d, (1120, 212), "本方案必须交给投资人", font(20), (255, 255, 255), anchor="lm")
     y = 256
     for i, (a, b, c) in enumerate(rows):
         fill = CARD if i % 2 == 0 else SOFT
-        card(img, (56, y, 1864, y + 72), fill=fill, outline=LINE, drop=False)
+        card(img, (56, y, 1864, y + 78), fill=fill, outline=LINE, drop=False)
         d = ImageDraw.Draw(img)
-        draw_text(d, (80, y + 36), a, font(18), TEAL, anchor="lm")
-        draw_text(d, (420, y + 36), b, font(18), INK, anchor="lm")
-        draw_text(d, (1120, y + 36), c, font(18), INK, anchor="lm")
-        y += 72
+        draw_text(d, (90, y + 39), a, font(20), TEAL, anchor="lm")
+        draw_text(d, (420, y + 39), b, font(20), INK, anchor="lm")
+        draw_text(d, (1120, y + 39), c, font(20), INK, anchor="lm")
+        y += 78
 
-    # acceptance
-    acc = [
-        ("验收1  隔离", "多租打满BE后，已准入TTFT P99漂移受合同约束。",
-         "测法：固定画像，注入训练/BE流，看受害租户分位。"),
-        ("验收2  门禁", "超预算请求必须拒绝；误伤率与漏放率可测。",
-         "测法：构造临界负载，统计该拒未拒 / 该放未放。"),
-        ("验收3  产能", "Goodput（SLO内Token）优于同规格best-effort。",
-         "测法：同样卡数与流量，比合格Token/墙钟，不比平均TPS。"),
-    ]
-    x = 56
-    for tag, text, how in acc:
-        card(img, (x, 720, x + 580, 1008), radius=16)
-        d = ImageDraw.Draw(img)
-        pill(d, (x + 24, 748), tag, TEAL)
-        lines = wrap(d, text, font(20), 500)
-        ly = 812
-        for line in lines:
-            draw_text(d, (x + 28, ly), line, font(20), INK)
-            ly += 32
-        d.rounded_rectangle((x + 24, 912, x + 556, 980), radius=10, fill=SOFT)
-        hlines = wrap(d, how, font(16), 500)
-        hy = 926
-        for line in hlines:
-            draw_text(d, (x + 40, hy), line, font(16), MUTED)
-            hy += 24
-        x += 604
-    footer(img, "09  /  对比与验收")
+    so_bar(
+        img,
+        (56, 812, 1864, 1008),
+        "结论",
+        "相对 TPN 的领先，不在再报一版 +2.5 倍。在于：忙的时候我们有权不接，并且接进来的体验讲得清。",
+    )
+    footer(img, "09  /  对标")
     return img
 
 
 def slide_10():
     img = new_canvas()
-    header(img, "09  关键特征一览", "规划要能落地，特征必须可检查",
-           "评审时只问六件事：有没有合同、门禁、隔离、亲和、遥测、验收。")
-
-    feats = [
-        ("F1  SLO合同", "TTFT / TPOT / TPS / Goodput 分位可写进档位",
-         "检查：有没有书面档位和基线画像"),
-        ("F2  调度前门禁", "ADMIT / REPLACE / REJECT，无令牌不得放置",
-         "检查：调度路径上有没有硬依赖API"),
-        ("F3  预算分解", "T_net 从TTFT里拆出毫秒账，不拿空载RTT充数",
-         "检查：引擎stage能否对上网络切片"),
-        ("F4  端网共治", "四类流 + NIC QoS + 切片队列 + 遥测回灌",
-         "检查：KV/Decode是否与BE分队列"),
-        ("F5  算网共治", "Admit API、KV亲和、PD/弹性都受预算约束",
-         "检查：GPU有空位但超预算时会不会禁扩"),
-        ("F6  三道闸兜底", "准入挡调度，隔离挡数据面，故障拒新保旧",
-         "检查：故障时是拒新，还是继续灌流"),
+    header(
+        img,
+        "收口  ·  请投资人拍的三件事",
+        "先买决策权，再买规模",
+        "规模可以后加。没有拒单权和验收，先扩就是先买风险。",
+    )
+    asks = [
+        (TEAL, "拍 1", "立红线", "为交互推理写下：首字多慢算失败、每秒多少合格结果算达标。", "没有红线，后面都是口号。"),
+        (NAVY, "拍 2", "把门禁嵌进调度", "调度上线前必须经过评估：接 / 换 / 拒。没有令牌，不准接单。", "这是相对 TPN 的真正差别。"),
+        (CORAL, "拍 3", "用三条测法卡投资", "忙时老用户会不会被挤慢；该拒的拒了没有；合格产能有没有比乱接更高。", "测不过，停加码。"),
     ]
-    x, y = 56, 180
-    for i, (title, body, chk) in enumerate(feats):
-        if i == 3:
-            x, y = 56, 560
-        card(img, (x, y, x + 580, y + 340), radius=18)
+    x = 56
+    for color, n, title, body, foot in asks:
+        card(img, (x, 180, x + 580, 780), radius=20)
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle((x + 24, y + 24, x + 88, y + 88), radius=14, fill=TEAL)
-        draw_text(d, (x + 56, y + 56), f"{i+1:02d}", font(20), (255, 255, 255), anchor="mm")
-        draw_text(d, (x + 108, y + 40), title, font(24), INK)
-        lines = wrap(d, body, font(20), 500)
-        ly = y + 120
+        pill(d, (x + 32, 212), n, color)
+        draw_text(d, (x + 32, 290), title, font(32), INK)
+        lines = wrap(d, body, font(22), 500)
+        ly = 380
         for line in lines:
-            draw_text(d, (x + 32, ly), line, font(20), MUTED)
-            ly += 36
-        d.rounded_rectangle((x + 24, y + 250, x + 556, y + 312), radius=12, fill=SOFT)
-        draw_text(d, (x + 40, y + 270), chk, font(17), INK)
+            draw_text(d, (x + 32, ly), line, font(22), MUTED)
+            ly += 38
+        d.rounded_rectangle((x + 28, 640, x + 552, 744), radius=12, fill=SOFT)
+        lines = wrap(d, foot, font(20), 500)
+        ly = 668 if len(lines) == 1 else 656
+        for line in lines:
+            draw_text(d, (x + 48, ly), line, font(20), color)
+            ly += 30
         x += 604
 
-    footer(img, "10  /  关键特征")
+    so_bar(
+        img,
+        (56, 812, 1864, 1008),
+        "请决策",
+        "批准的是一条原则：达不到体验红线的推理单，禁止调度。原则过了，再谈扩多少。",
+    )
+    footer(img, "10  /  决策")
     return img
 
 

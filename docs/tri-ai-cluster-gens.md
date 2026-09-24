@@ -1,54 +1,62 @@
-# 字节 / 阿里 / 腾讯：近三代 AI 集群建设和规划
+# 字节 / 阿里 / 腾讯：AI 集群三代际（上一代 — 当前在网 — 下一代规划）
 
-一页对照，只收录公开论文、官网、大会口径，不发明未披露数字。配图见 `tri-ai-cluster-gens.pptx`。
+代际按时间切片定义，不按版本号堆叠：上一代指 2023–24 已建成、现在逐步让位的集群；当前指 2025–26 已量产或已上线、承载主力业务的一代；下一代指厂商已公开、但尚未量产落地的规划。只收录公开论文、官网、大会口径，下一代列均为厂商目标值。配图见 `tri-ai-cluster-gens.pptx`。
 
-共同走向：场景从训练专网走到训推一体与 PD；组网从三层多轨走向少层 / 超节点；协议从 RoCE 集合通信扩到 Scale-up 与 Token 面。
+## 三家共同的代际规律
 
-## 字节跳动
-
-路标：MegaScale（NSDI'24）→ AI Rack 2.0 / xLLM（2025）→ Rack 3.0 + EthLink + Volcano HPN 6.0（2026）
-
-最新架构：Scale-up 用 EthLink（Load/Store + RDMA），铜互联双柜 576 XPU，NPO 8 计算柜 + 2 交换柜到 1024 XPU；Scale-out 是 HPN 6.0 三层 Clos，102.4T / 128×800G，单 POD 65k，集群可线性扩到百万级。
-
-| 维度 | 一代 MegaScale | 二代 Rack 2.0 / xLLM | 三代 Rack 3.0 + HPN 6.0 |
+| 维度 | 上一代 2023–24 | 当前在网 2025–26 | 下一代规划 2027+ |
 | --- | --- | --- | --- |
-| 场景 | 预训练万卡 | 训练 + xLLM PD 分离 | 训推一体 / 混速多代 |
-| 组网 | 三层 Clos 1:1，8×200G 多轨，ToR 400G→2×200G AOC，64 主机/ToR 组 | 双柜 256 XPU 超节点 + RDMA scale-out | 576 铜 / NPO 1024；三层 Clos，POD 65k → 百万 |
-| 协议 | RoCEv2，400G | RDMA + NVLink 域 | EthLink（Ld/St+RDMA）；200/400/800G RDMA 混速 |
-| 关键技术 | Tomahawk4 25.6T；12288 卡 175B，MFU 55.2% | PD 吞吐最高 5×（DeepSeek R1，限定 SLO）；超节点 256 XPU / 240kW | 102.4T；SyncMesh 微秒切换；算子级 + 任务级 QoS；多平面 Fast Failover |
+| 场景 | 训练专网，KPI 是 AllReduce 不掉速 | 训推一体 + PD 进入网络设计目标，潮汐复用 | 按 Prefill / Decode 分核，算每 Token 成本 |
+| 组网 | 三层 Clos + 多轨，机内 8 卡即 Scale-up | 百卡级超节点 + 十万卡 Scale-out 并行 | 超节点上千卡，层级压平，全光 NPO / OCS |
+| 协议 | RoCEv2 + 交换机侧被动拥塞控制 | 拥塞控制上移网卡，以太 Scale-up 内存语义 | Scale-up 与 Scale-out 融合，GPU 直控通信 |
 
-来源：MegaScale NSDI'24；火山引擎 HPN 6.0 / 102.4T 交换机文章；EthLink 白皮书发布；OCP 高晓军 AI Rack 2.0/3.0；veMLP xLLM PD 文档。
+三家把"训推一体"都做在了当前一代，真正的分歧在下一代：字节押整机柜与铜 / 光双路线，阿里押 Scale-up 与 Scale-out 融合成一张以太网，腾讯押光 Shuffle 压平层级加 OCS 做超节点故障隔离。
 
-## 阿里云
+## 字节跳动：整机柜 + 铜光双路线
 
-路标：灵骏早期万卡 ETH RDMA（2022–23）→ HPN 7.0（SIGCOMM'24）→ HPN 8.0 + UPN512 + TPN（WAIC / 云栖）
+- 上一代 MegaScale 集群（NSDI'24 披露）：把万卡训练跑稳，多轨 + 无收敛，先保 MFU。
+- 当前 AI Rack 2.0 量产 + HPN 6.0 上线：把训练和推理装进同一张网，并把 Scale-up 以太化。
+- 下一代 AI Rack 3.0（OCP 概念设计，研发中）：算力密度撞上供电散热，用整机柜和光互连换规模。
 
-最新架构：三层叠在一起——UPN512 单层光 CLOS 接 512 xPU（LPO/NPO）；HPN 8.0 多平面 CLOS 做训推一体 Scale-out，单集群最高 13 万卡异构混布、可扩百万卡、支持 PD；TPN 两层 Token 面，公开相对指标为接入带宽 +2.5×、规模 +10×、时延 −1/3。
-
-| 维度 | 一代 灵骏早期 | 二代 HPN 7.0 | 三代 HPN8 + UPN + TPN |
+| 维度 | 上一代 | 当前在网 | 下一代规划 |
 | --- | --- | --- | --- |
-| 场景 | 训练万卡 | 训练专网，存算分离 | 训推一体 / PD / Token 推理 |
-| 组网 | ETH RDMA 双平面，前后端分离 | 双 ToR 双平面；1024 GPU 一跳；两层约 15k | 多平面 CLOS 13 万 → 百万；UPN 单层 512 xPU |
-| 协议 | RoCE + HPCC | 400G RoCE，自研 51.2T | 400G/800G；IPv6 Native；TPN 两层 Token 面 |
-| 关键技术 | 计算 / 存储流量分网 | AllReduce +59.3%，JCT +14.9%，排队 −91.8%；生产 8+ 月 | TPN +2.5× / +10× / −1/3；LPO/NPO 可用 +3×、成本 −30%；分钟自愈，平均可用 99.7% |
+| 场景 | 大模型预训练为主；12288 卡训 175B，MFU 55.2% | 训推一体融合网；PD 由 xLLM 承接；强化学习沙箱 | 兆瓦级超节点承载更大 TP / EP；多代异构长期共存 |
+| 组网 | 三层 Clos 1:1，8×200G 多轨，Scale-up 仅机内 8 卡 | 双柜 256 XPU 超节点量产（240kW，Cable Tray 铜互连）；HPN 6.0 三层 Clos，单 POD 65k，可线性扩至百万 | 双柜 576 XPU，224G SerDes，460TB/s；NPO 光互连 8 计算柜 + 2 网络柜 = 1024 XPU |
+| 协议 | 更早一代火鸿 AI-HPC 用 IB Fat-Tree（1 万 A100，QM8700 200Gbps），后转 RoCEv2；veCCL + BCC | EthLink 以太 Scale-up（Load/Store + RDMA）；200/400/800G RDMA 混速；SyncMesh 路由；Lambda OS（SONiC） | 800G → 1.6T；单层大 Radix 光互连；以太 Scale-up 标准化 |
+| 关键技术 | Tomahawk4 25.6T；多轨亲和调度 | SGLB 全局负载均衡，带宽利用率 +40%；算子级 + 任务级双粒度 QoS；微秒级故障收敛；亿万分之一丢包可感知 | 单柜 500kW、800V HVDC、100% 整机柜液冷；铜互连与 NPO 光互连并行推进 |
 
-口径并列：发布会另有「单集群 10 万卡 / GPU 互联 6.4T / 存储 800G」；WAIC 吴结生为「单集群最高 13 万卡、可扩百万」。两者都是公开口径，不合成一个数。
+来源：MegaScale NSDI'24；火鸿 AI-HPC 文章；火山引擎 102.4T 交换机 / HPN 6.0；EthLink 白皮书；OCP 高晓军 AI Rack 2.0/3.0；veMLP xLLM PD 文档。
 
-来源：HPN 7.0 SIGCOMM'24；席永青 HPN+UPN；吴结生 WAIC 灵骏；云栖 TPN；UPN512 架构解读。
+## 阿里云：训推一体最早落地
 
-## 腾讯云
+- 上一代 HPN 7.0（2023 年 9 月规模上线，SIGCOMM'24）：先把哈希极化和单 ToR 故障消掉，用规模换效率。
+- 当前 HPN 7.0 训推一体 EPOD → HPN 8.0：同一张网做潮汐复用，训练让位推理，PD 拆开跑。
+- 下一代 真武 V900 + UPN512 + TPN：不再区分两张网，Scale-up 和 Scale-out 合并。
 
-路标：星脉 1.0（2023）→ 星脉 2.0 / Astral（2024–25）→ 星脉 3.0（2026）
-
-最新架构：星脉 3.0 用光 Shuffle 做扁平二级单轨，适配 MoE All-to-All；通信库按阶段拆核——训练 / Prefill 走高带宽 A2A，Decode 走低时延 A2A；TRMT 对 DeepEP 的公开数字是 RoCEv2 +100%、IB +30%。GitHub 写明 3.0 仍在研发，目标是 Scale-out + Scale-up 双引擎。
-
-| 维度 | 一代 星脉 1.0 | 二代 星脉 2.0 / Astral | 三代 星脉 3.0 |
+| 维度 | 上一代 | 当前在网 | 下一代规划 |
 | --- | --- | --- | --- |
-| 场景 | 混元训练 | 训练扩到十万卡 | MoE 训推一体；Prefill / Decode 分核 |
-| 组网 | Fat-Tree 多轨，1.6T（8×2×100G）；典型 2K / 最大 32K | 同轨聚合、三层等带宽；主机 3.2T；Block 1024 / Pod 64k / 集群约 512k | 光 Shuffle，扁平二级单轨 |
-| 协议 | ETH RDMA；TiTa；TCCL | TiTa 2.0 网卡主动拥塞控制；TCCL 2.0 NVLink+NET | TRMT + RoCEv2；Prefill 高带宽核 / Decode 低时延核 |
-| 关键技术 | GPU 利用 +40%；通信时延 −40% | 训练 +20%；通信 +60%；Hunyuan-MoE 8K 效率损约 0.6% | RoCE A2A +100%；IB +30%；双引擎规划中 |
+| 场景 | 训练专网，存算分离；端到端 +14.9% | HPN 7.0 训推一体 EPOD 已大规模部署，集团推理场景通信性能 +100%，训推潮汐复用 + PD 分离；HPN 8.0 单集群最高 13 万卡异构混布 | 十万亿参数 MoE；Agent 高并发；TPN 盯每 Token 成本 |
+| 组网 | 双上联 + 多轨 + 双平面；单层千卡、两层万卡（15k）；51.2T + 400G | 多平面 CLOS + IPv6 Native；跨 AZ / 跨 Region RDMA；真武 M890 超节点 64 卡实例（GP9A 已对外，跑通超 2 万亿参数模型） | UPN512 单层全光 CLOS 接 512 xPU；真武 V900 + ICN Switch 千卡全带宽超节点（2027 Q1 量产）；Scale-up 与 Scale-out 融合为一张以太网 |
+| 协议 | RoCEv2 + 自研 HPCC 流控；ACCL 通信库 | Solar-RDMA（业界首个 UEC-ready 400G 网卡多路径，拥塞场景 +18%）；ACCL + C4D；端到端 QoS | 原生内存语义 + 内存统一编址（ICN）；自研可扩展 NPO 光模块；TPN Token 面 |
+| 关键技术 | 消除哈希极化，ToR 下行队列 −91.8% | 分钟级故障自恢复、平均可用 99.7%；CPFS 全栈重构，单文件系统百 PiB、百 TB/s、亿级 IOPS | 光互连成本 −30%、可靠性 +3×；TPN 接入带宽 +2.5×、规模 +10×、时延 −1/3；50 万卡广域超节点，1GW、200Pbps、6μs（目标值） |
 
-口径并列：星脉 1.0 按开发者文章 1.6T / 2K / 32K，不与 2023 HCC 新闻「3.2T / 10 万卡」混用。后者对应后续 HCC / 星脉 2.0 量级。
+口径说明：HPN 8.0 另有发布会口径「单集群 10 万卡 / GPU 互联 6.4T / 存储 800G」，WAIC 口径为「最高 13 万卡、可扩百万」。两者都是公开表述，不合成一个数。
 
-来源：腾讯云星脉 1.0 开发者文；星脉 2.0 发布；Astral SIGCOMM'25；《电信科学》星脉 3.0；Tencent/hpn；TRMT / DeepEP 报道。
+来源：HPN 7.0 SIGCOMM'24；阿里云 2024 年 AI 智算网络全栈成果（EPOD / Solar-RDMA / ACCL+C4D）；吴结生 WAIC 灵骏；席永青 HPN+UPN；UPN512 架构解读；2026 云栖真武 V900 与 50 万卡计划；云栖 TPN。
+
+## 腾讯云：端网协同 + 压平层级
+
+- 上一代 星脉 1.0：首创多轨道大规模组网，把大流量按网卡序号分面并行。
+- 当前 星脉 2.0 / Astral（生产运行 18 个月以上）：端网协同，拥塞在发生前治，慢节点分钟级揪出。
+- 下一代 星脉 3.0（研发设计中）：层级压平，把 MoE 的 All-to-All 当一等公民设计。
+
+| 维度 | 上一代 | 当前在网 | 下一代规划 |
+| --- | --- | --- | --- |
+| 场景 | 混元训练；GPU 利用 +40%，通信时延 −40% | 工程上支持 10 万卡，训练推理一体化、降推理成本；后训练与强化学习让训练后期带推理特征 | MoE 训推一体；Prefill / Decode 分核；降低 TP/EP/CP 通信占比 |
+| 组网 | Fat-Tree 多轨道；单机 1.6T → 3.2T 接入；典型 2K / 最大 32K | 同轨聚合、三层等带宽（Astral：Block 1K、Pod 64K、集群约 512K，Hunyuan-MoE 8K 效率损约 0.6%）；51.2T + 400G 硅光 | 二层组网撑数十万卡；光 Shuffle 扁平二级单轨；Scale-up 超节点（128 卡对比 8 卡机，单卡推理 +40%）+ OCS 动态重构做故障隔离 |
+| 协议 | RoCEv2 + PFC / DCQCN；TiTa 1.0 部署在交换机、被动拥塞控制；TCCL 路径预规划 | TiTa 2.0 下沉网卡、主动拥塞控制；TCCL 2.0 NVLink+NET 异构并行 + Auto-Tune；GOR 全局优化路由 | TRMT：GPU 直控 RDMA、绕开 CPU 控制面；联合阿里云在 ODCC 立项 3.2T NPO 标准 |
+| 关键技术 | 多轨流量亲和，集群通信效率 80%+ | 通信效率 +60%、训练效率 +20%；灵境仿真把慢节点定位从天级降到分钟级 | DeepEP 上 RoCEv2 +100% / IB +30%；LPO 时延 −99%、成本 −25%、距离百米级；NPO 密度 +10× |
+
+口径说明：星脉 1.0 的接入带宽在不同公开材料中有 1.6T（2023 年开发者文，典型 2K / 最大 32K）与 3.2T（腾讯回顾文与 HCC 新闻）两种表述，按各自出处分别标注，不混用。
+
+来源：腾讯云星脉 1.0 开发者文；星脉 2.0 发布与腾讯 AI Infra 回顾；Astral SIGCOMM'25；Tencent/hpn 仓库；《电信科学》星脉 3.0；付思东光互联演进；邹贤能 NPO / OCS 访谈；TRMT 与 DeepEP 报道。

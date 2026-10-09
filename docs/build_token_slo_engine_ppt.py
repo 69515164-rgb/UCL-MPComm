@@ -201,9 +201,9 @@ def slide_engine(prs):
     gy = dy
     gh = (dh - 0.16) / 3
     groups = (
-        (ACCENT, "约束与现状", ("TTFT 目标", "当前批 token 预算", "激活显存余量")),
+        (ACCENT, "约束与现状", ("TTFT 目标", "当前批 token 预算", "prefill 实测吞吐")),
         (TEAL, "队列与本请求", ("本请求的 prompt token 数", "队头已经等待的时间", "排在前面的 token 数")),
-        (GOLD, "下游只读", ("KV 有效带宽与在途条数", "decode 空槽数")),
+        (GOLD, "资源与下游", ("激活显存余量", "KV 有效带宽与在途条数", "decode 空槽数")),
     )
     for rail, title, items in groups:
         input_group(slide, dx, gy, lw, gh, rail, title, items)
@@ -318,13 +318,15 @@ def slide_law(prs):
     textbox(
         slide,
         0.32,
-        1.24,
+        1.20,
         12.7,
-        0.92,
+        1.36,
         "预测 TTFT = 队列等待 + 本批计算 + 露出的搬运 + 接纳等待\n"
-        "本批计算 = 下一批 token 数 / prefill 吞吐　　队列等待 = 队头已等 + 前面各批剩余时间\n"
+        "误差 = TTFT 目标 - 预测 TTFT\n"
+        "本批计算 = 下一批 token 数 / prefill 吞吐\n"
+        "队列等待 = 队头已等 + 前面各批剩余时间\n"
         "露出的搬运 = max(0, 同时完成条数 × 单条 KV 字节 × 8 / 有效带宽 - 可重叠时间)\n"
-        "误差 = TTFT 目标 - 预测 TTFT　　单条 KV 字节 = 2 × 层数 × KV 头数 × 头维 × token 数 × 每元素字节",
+        "单条 KV 字节 = 2 × 层数 × KV 头数 × 头维 × token 数 × 每元素字节",
         13,
         False,
         INK,
@@ -340,14 +342,14 @@ def slide_law(prs):
         ("高于目标，超出死区", "队列等待", "保持", "拒绝。预算不再下降", (255, 228, 224), CORAL, True),
         ("高于目标，超出死区", "decode 接纳", "保持", "推迟到出现空槽", GOLD_BG, GOLD, True),
     )
-    table_shape = slide.shapes.add_table(len(rows), 4, Inches(0.28), Inches(2.24), Inches(12.77), Inches(4.20))
+    table_shape = slide.shapes.add_table(len(rows), 4, Inches(0.28), Inches(2.62), Inches(12.77), Inches(3.84))
     table = table_shape.table
     widths = (3.15, 2.55, 2.45, 4.62)
     for i, w in enumerate(widths):
         table.columns[i].width = Inches(w)
-    table.rows[0].height = Inches(0.40)
+    table.rows[0].height = Inches(0.36)
     for r in range(1, len(rows)):
-        table.rows[r].height = Inches(0.633)
+        table.rows[r].height = Inches(0.58)
     for r, row in enumerate(rows):
         texts = row[:4]
         fill, fg, bold = row[4], row[5], row[6]

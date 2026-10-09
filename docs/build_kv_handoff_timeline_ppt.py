@@ -371,7 +371,18 @@ def add_recompute_slide(prs):
     x_end = x_token + token_w
 
     box(slide, chart_x, y_zone, x_end - chart_x, zone_bottom - y_zone, COVER_BG, "")
-    textbox(slide, chart_x, y_zone, x_end - chart_x - token_w, 0.24, "时间  →    读历史可与上一层本地计算重叠", 12, True, TEAL, align=PP_ALIGN.CENTER)
+    textbox(
+        slide,
+        chart_x,
+        y_zone,
+        x_end - chart_x - token_w,
+        0.24,
+        "同色、同编号 = 同一层。算层 i 的同时，正在读层 i+1 的 KV",
+        12,
+        True,
+        TEAL,
+        align=PP_ALIGN.CENTER,
+    )
     textbox(slide, x_token - 0.15, y_zone, token_w + 0.2, 0.24, "首 token", 12, True, GREEN, align=PP_ALIGN.CENTER)
 
     textbox(slide, label_x, y_load, label_w, lane_h, "KV 池读取", 13, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
@@ -391,39 +402,81 @@ def add_recompute_slide(prs):
         align=PP_ALIGN.CENTER,
     )
 
+    # Same color on a layer's KV block and that layer's local compute.
+    # Time alignment is different: compute of layer i runs while layer i+1 KV is loading.
+    layer_colors = (
+        (20, 90, 150),
+        (14, 110, 106),
+        (122, 84, 28),
+        (88, 62, 130),
+    )
     for i in range(n):
-        box(slide, load_x(i), y_load + 0.06, load_w - 0.06, lane_h - 0.12, GOLD, f"历史 {i + 1}", 13, True, WHITE)
+        box(
+            slide,
+            load_x(i),
+            y_load + 0.06,
+            load_w - 0.06,
+            lane_h - 0.12,
+            layer_colors[i],
+            f"层{i + 1} KV",
+            13,
+            True,
+            WHITE,
+        )
 
-    # First layer cannot compute until its history arrives. Later stalls appear
+    # First layer cannot compute until its own KV arrives. Later stalls appear
     # because each load is drawn longer than the compute it overlaps.
-    box(slide, load_x(0), y_comp + 0.06, load_w - 0.06, lane_h - 0.12, (255, 220, 210), "等历史 1", 12, True, CORAL)
+    box(slide, load_x(0), y_comp + 0.06, load_w - 0.06, lane_h - 0.12, (255, 220, 210), "等层1 KV", 12, True, CORAL)
     for i in range(n):
-        box(slide, load_x(i) + load_w, y_comp + 0.06, comp_w - 0.06, lane_h - 0.12, ACCENT, f"重算 {i + 1}", 12, True, WHITE)
+        box(
+            slide,
+            load_x(i) + load_w,
+            y_comp + 0.06,
+            comp_w - 0.06,
+            lane_h - 0.12,
+            layer_colors[i],
+            f"算层{i + 1}",
+            12,
+            True,
+            WHITE,
+        )
+        # Same-color bridge: right edge of 层i KV meets the left edge of 算层i.
+        kv_right = load_x(i) + load_w - 0.06
+        comp_left = load_x(i) + load_w
+        kv_bottom = y_load + lane_h - 0.06
+        comp_top = y_comp + 0.06
+        box(
+            slide,
+            kv_right - 0.02,
+            kv_bottom - 0.03,
+            (comp_left + 0.03) - (kv_right - 0.02),
+            (comp_top + 0.03) - (kv_bottom - 0.03),
+            layer_colors[i],
+            "",
+        )
         if i < n - 1:
             stall_x = load_x(i) + load_w + comp_w
             stall_w = load_w - comp_w - 0.06
-            box(slide, stall_x, y_comp + 0.06, stall_w, lane_h - 0.12, (255, 220, 210), "等", 11, True, CORAL)
+            box(
+                slide,
+                stall_x,
+                y_comp + 0.06,
+                stall_w,
+                lane_h - 0.12,
+                (255, 220, 210),
+                f"等层{i + 2}",
+                10,
+                True,
+                CORAL,
+            )
 
     box(slide, x_token, y_comp + 0.06, token_w - 0.08, lane_h - 0.12, GREEN, "首 token", 12, True, WHITE)
     box(slide, x_token - 0.015, y_zone + 0.24, 0.03, zone_bottom - (y_zone + 0.24), GREEN, "")
 
-    textbox(
-        slide,
-        x0,
-        y_load + lane_h,
-        n * load_w,
-        gap_dep,
-        "依赖：该层历史 KV 到位，本地才能算这一层",
-        12,
-        True,
-        ACCENT,
-        align=PP_ALIGN.CENTER,
-    )
-
     notes = [
-        (TEAL, "被盖住", "历史 2 到历史 4 的读取，落在上一层本地重计算的时间里。重算 1 与历史 2 同时进行，重算 2 与历史 3 同时进行。"),
-        (CORAL, "露出，可优化", "本地一层已经算完，下一层历史 KV 还没到，中间就是等待。池带宽变低、历史段变长，等待变长。更便宜的一小段改在本地重算，可以把等待拿掉。"),
-        (GREEN, "露出落在 TTFT", "汇合在首 token 之前，等待直接进入 TTFT。上一页的露出在首 token 和第 2 token 之间，这一页的露出在首 token 之前。"),
+        (TEAL, "被盖住", "上下对齐的是同一时刻，不是同一层。层2 KV 在算层1 的时间里读，层3 KV 在算层2 的时间里读，层4 KV 在算层3 的时间里读。"),
+        (CORAL, "露出，可优化", "算层 i 已经结束，层 i+1 的 KV 还没读完。珊瑚色的「等层 i+1」就是露出。池带宽变低或历史段变长，这段变长。"),
+        (GREEN, "露出落在 TTFT", "层4 KV 读完才能算层4，算完才出首 token。等待在首 token 之前，直接进入 TTFT。"),
     ]
     card_y, card_h = 4.72, 1.95
     card_gap = 0.12

@@ -128,7 +128,7 @@ def main():
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
     box(slide, 0, 0, 13.333, 0.08, ACCENT, "")
-    textbox(slide, 0.32, 0.14, 12.4, 0.22, "PD 分离  ·  KV 交接", 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
+    textbox(slide, 0.32, 0.14, 12.4, 0.22, "PD 分离  ·  KV 交接    1 / 2", 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
     textbox(slide, 0.32, 0.36, 12.6, 0.34, "搬运的时序：谁依赖谁，哪一段露在外面", 24, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
     box(slide, 0.32, 0.78, 0.07, 0.36, ACCENT, "")
     textbox(
@@ -302,9 +302,159 @@ def main():
         "OPT-66B、512 token 约 1.13 GB，10 次/秒约合 90 Gbps，低于此带宽则排队积累。"
     )
 
+    add_recompute_slide(prs)
     out = "/workspace/docs/kv-handoff-timeline.pptx"
     prs.save(out)
     print(out, "chart_end", round(x_end, 2))
+
+
+def add_recompute_slide(prs):
+    """Prefill reads historical KV from the pool and recomputes the miss locally."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box(slide, 0, 0, 13.333, 0.08, ACCENT, "")
+    textbox(slide, 0.32, 0.14, 12.4, 0.22, "PD 分离  ·  Prefill 与 KV 池    2 / 2", 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
+    textbox(slide, 0.32, 0.36, 12.6, 0.34, "读历史 KV，本地只重算未命中的一段", 24, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
+    box(slide, 0.32, 0.78, 0.07, 0.36, ACCENT, "")
+    textbox(
+        slide,
+        0.48,
+        0.74,
+        12.5,
+        0.42,
+        "历史段按层从 KV 池读，未命中的一段在本地算。同一层要等历史 KV 到位才能算。读得比算得慢时，等待出现在首 token 之前。",
+        14,
+        True,
+        INK,
+        anchor=MSO_ANCHOR.MIDDLE,
+    )
+
+    # Prompt split is a token cut, not the time axis.
+    label_x, label_w = 0.28, 1.52
+    chart_x = 1.88
+    split_y = 1.24
+    textbox(slide, label_x, split_y, label_w, 0.36, "上下文切分", 13, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
+    split_w = 10.85
+    hist_w = split_w * 0.70
+    box(slide, chart_x, split_y, hist_w, 0.36, GOLD, "历史段：KV 池已有，只读取", 13, True, WHITE)
+    box(slide, chart_x + hist_w, split_y, split_w - hist_w, 0.36, ACCENT, "重算段：未命中，本地计算", 13, True, WHITE)
+    textbox(
+        slide,
+        chart_x,
+        split_y + 0.36,
+        split_w,
+        0.22,
+        "上面是 token 切分，不是时间轴。下面每一格才是时间。",
+        11,
+        False,
+        MUTED,
+    )
+
+    # Time geometry. Each history load is longer than the local compute of one layer,
+    # so a wait appears before the next local layer.
+    decide_w = 1.12
+    load_w = 1.92
+    comp_w = 1.12
+    n = 4
+    x0 = chart_x + decide_w
+    lane_h = 0.58
+    y_zone = 1.88
+    y_load = 2.16
+    gap_dep = 0.30
+    y_comp = y_load + lane_h + gap_dep
+    zone_bottom = y_comp + lane_h
+
+    def load_x(i):
+        return x0 + i * load_w
+
+    x_token = load_x(n) + comp_w
+    token_w = 1.05
+    x_end = x_token + token_w
+
+    box(slide, chart_x, y_zone, x_end - chart_x, zone_bottom - y_zone, COVER_BG, "")
+    textbox(slide, chart_x, y_zone, x_end - chart_x - token_w, 0.24, "时间  →    读历史可与上一层本地计算重叠", 12, True, TEAL, align=PP_ALIGN.CENTER)
+    textbox(slide, x_token - 0.15, y_zone, token_w + 0.2, 0.24, "首 token", 12, True, GREEN, align=PP_ALIGN.CENTER)
+
+    textbox(slide, label_x, y_load, label_w, lane_h, "KV 池读取", 13, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
+    textbox(slide, label_x, y_comp, label_w, lane_h, "本地重计算", 13, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
+
+    box(slide, chart_x + 0.06, y_load + 0.08, decide_w - 0.10, lane_h - 0.16, NAVY, "判定命中", 12, True, WHITE)
+    textbox(
+        slide,
+        chart_x + 0.06,
+        y_comp,
+        decide_w - 0.08,
+        lane_h,
+        "等切分完成",
+        11,
+        True,
+        MUTED,
+        align=PP_ALIGN.CENTER,
+    )
+
+    for i in range(n):
+        box(slide, load_x(i), y_load + 0.06, load_w - 0.06, lane_h - 0.12, GOLD, f"历史 {i + 1}", 13, True, WHITE)
+
+    # First layer cannot compute until its history arrives. Later stalls appear
+    # because each load is drawn longer than the compute it overlaps.
+    box(slide, load_x(0), y_comp + 0.06, load_w - 0.06, lane_h - 0.12, (255, 220, 210), "等历史 1", 12, True, CORAL)
+    for i in range(n):
+        box(slide, load_x(i) + load_w, y_comp + 0.06, comp_w - 0.06, lane_h - 0.12, ACCENT, f"重算 {i + 1}", 12, True, WHITE)
+        if i < n - 1:
+            stall_x = load_x(i) + load_w + comp_w
+            stall_w = load_w - comp_w - 0.06
+            box(slide, stall_x, y_comp + 0.06, stall_w, lane_h - 0.12, (255, 220, 210), "等", 11, True, CORAL)
+
+    box(slide, x_token, y_comp + 0.06, token_w - 0.08, lane_h - 0.12, GREEN, "首 token", 12, True, WHITE)
+    box(slide, x_token - 0.015, y_zone + 0.24, 0.03, zone_bottom - (y_zone + 0.24), GREEN, "")
+
+    textbox(
+        slide,
+        x0,
+        y_load + lane_h,
+        n * load_w,
+        gap_dep,
+        "依赖：该层历史 KV 到位，本地才能算这一层",
+        12,
+        True,
+        ACCENT,
+        align=PP_ALIGN.CENTER,
+    )
+
+    notes = [
+        (TEAL, "被盖住", "历史 2 到历史 4 的读取，落在上一层本地重计算的时间里。重算 1 与历史 2 同时进行，重算 2 与历史 3 同时进行。"),
+        (CORAL, "露出，可优化", "本地一层已经算完，下一层历史 KV 还没到，中间就是等待。池带宽变低、历史段变长，等待变长。更便宜的一小段改在本地重算，可以把等待拿掉。"),
+        (GREEN, "露出落在 TTFT", "汇合在首 token 之前，等待直接进入 TTFT。上一页的露出在首 token 和第 2 token 之间，这一页的露出在首 token 之前。"),
+    ]
+    card_y, card_h = 4.72, 1.95
+    card_gap = 0.12
+    card_w = (13.333 - 0.56 - 2 * card_gap) / 3
+    for i, (color, title, body) in enumerate(notes):
+        cx = 0.28 + i * (card_w + card_gap)
+        box(slide, cx, card_y, card_w, card_h, WHITE, "", line=(214, 220, 226))
+        box(slide, cx, card_y, 0.08, card_h, color, "")
+        textbox(slide, cx + 0.18, card_y + 0.10, card_w - 0.30, 0.30, title, 14, True, color)
+        textbox(slide, cx + 0.18, card_y + 0.44, card_w - 0.30, 1.40, body, 13, False, INK, anchor=MSO_ANCHOR.TOP)
+
+    textbox(
+        slide,
+        0.28,
+        6.85,
+        12.7,
+        0.48,
+        "层间等待 = max(0, 该层历史 KV 读完的时刻 - 上一层本地算完的时刻)。\n图按每层读取长于每层重计算来画，所以层与层之间有等待；读取更快时，这些等待消失，prefill 时间等于首层读取加上各层本地计算。",
+        12,
+        False,
+        MUTED,
+        anchor=MSO_ANCHOR.TOP,
+    )
+
+    slide.notes_slide.notes_text_frame.text = (
+        "上下文先切成两段：KV 池里已经有的历史段只读取，未命中的一段在本地重计算。"
+        "依赖在层上：本地计算第 i 层的 attention 之前，第 i 层的历史 KV 必须已经到位。"
+        "读取第 i+1 层可以和本地计算第 i 层重叠。读取慢于计算时，两层之间出现等待，这段在首 token 之前，进入 TTFT。"
+        "层间等待 = max(0, 该层历史 KV 读完的时刻 - 上一层本地算完的时刻)。"
+        "若某一小段在本地重算比从池里读取更便宜，就把这一段从读取改成重算，用来消掉等待。"
+    )
 
 
 if __name__ == "__main__":

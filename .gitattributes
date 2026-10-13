@@ -11,6 +11,7 @@
 *.gif binary
 *.ico binary
 *.pdf binary
+*.pptx binary
 *.zip binary
 *.tar.gz binary
 *.so binary

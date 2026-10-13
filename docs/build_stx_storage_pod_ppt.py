@@ -161,8 +161,7 @@ def main():
         box(slide, nvme_x, y, nvme_w, row_h, GOLD, "", line=None)
         textbox(slide, nvme_x + 0.08, y + 0.10, nvme_w - 0.16, 0.28, "NVMe 闪存", 14, True, WHITE)
         textbox(slide, nvme_x + 0.08, y + 0.42, nvme_w - 0.16, 0.96, "本托盘的 KV 介质。\nG3.5 上下文层。\n不直接上交换机。", 12, False, WHITE, anchor=MSO_ANCHOR.TOP)
-        arrow(slide, nvme_x + nvme_w + 0.04, y + 0.62, 0.22, 0.22, GOLD)
-        textbox(slide, nvme_x + nvme_w - 0.02, y + row_h - 0.28, 0.70, 0.22, "NVMe", 10, True, GOLD, align=PP_ALIGN.CENTER)
+        arrow(slide, nvme_x + nvme_w + 0.04, y + 0.64, 0.22, 0.22, GOLD)
 
         box(slide, bf_x, y, bf_w, row_h, WHITE, line=LINE)
         box(slide, bf_x, y, 0.08, row_h, TEAL, "")
@@ -198,17 +197,16 @@ def main():
     box(slide, out_x + 0.14, 1.58, out_w - 0.28, 0.95, OPTIC, "")
     textbox(slide, out_x + 0.22, 1.62, out_w - 0.44, 0.28, "Spectrum-6 SPX 机架", 13, True, WHITE)
     textbox(slide, out_x + 0.22, 1.92, out_w - 0.44, 0.52, "POD 内机架到机架。\n东西向与南北向都从这里走。", 12, False, WHITE, anchor=MSO_ANCHOR.TOP)
-    arrow(slide, out_x + 1.55, 2.58, 0.28, 0.20, OPTIC)
+    down = slide.shapes.add_shape(MSO_SHAPE.DOWN_ARROW, Inches(out_x + 1.48), Inches(2.56), Inches(0.28), Inches(0.24))
+    solid(down, OPTIC)
     box(slide, out_x + 0.14, 2.84, out_w - 0.28, 1.05, TEAL, "")
     textbox(slide, out_x + 0.22, 2.88, out_w - 0.44, 0.26, "计算节点 BlueField-4", 13, True, WHITE)
     textbox(slide, out_x + 0.22, 3.16, out_w - 0.44, 0.64, "KV I/O 平面。\n终结 NVMe-oF 与对象 RDMA。", 12, False, WHITE, anchor=MSO_ANCHOR.TOP)
-    arrow(slide, out_x + 1.55, 3.94, 0.28, 0.20, GREEN)
+    down = slide.shapes.add_shape(MSO_SHAPE.DOWN_ARROW, Inches(out_x + 1.48), Inches(3.92), Inches(0.28), Inches(0.24))
+    solid(down, GREEN)
     box(slide, out_x + 0.14, 4.20, out_w - 0.28, 0.88, GREEN, "")
     textbox(slide, out_x + 0.22, 4.24, out_w - 0.44, 0.26, "Rubin GPU  HBM", 13, True, WHITE)
     textbox(slide, out_x + 0.22, 4.52, out_w - 0.44, 0.48, "热 KV。解码前由 CMX 预取回来。", 12, False, WHITE, anchor=MSO_ANCHOR.TOP)
-
-    # Optical hop label on the rack boundary.
-    textbox(slide, 8.55, 4.55, 1.55, 0.55, "32×OSFP\n单层光", 11, True, OPTIC, align=PP_ALIGN.CENTER)
 
     notes = (
         (GOLD, "盘到处理器", "NVMe 只接到本托盘的 BlueField-4。Vera CPU 跑 DOCA Memos，ConnectX-9 走数据面。"),

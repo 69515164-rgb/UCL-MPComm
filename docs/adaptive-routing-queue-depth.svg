@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="960" height="540">
+  <rect width="960" height="540" fill="#ffffff"/>
+  <text x="480" y="48" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="28" font-weight="700" fill="#111">自适应路由</text>
+  <text x="480" y="74" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="14" fill="#666">逐包选出队列最短的口</text>
+
+  <rect x="48" y="248" width="56" height="52" rx="10" fill="#2563eb"/>
+  <text x="76" y="280" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="16" font-weight="700" fill="#fff">入包</text>
+  <line x1="114" y1="274" x2="188" y2="274" stroke="#111" stroke-width="4" stroke-linecap="round"/>
+  <polygon points="188,266 204,274 188,282" fill="#111"/>
+
+  <rect x="206" y="108" width="540" height="328" rx="18" fill="#fff" stroke="#111" stroke-width="3"/>
+  <text x="476" y="138" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="16" font-weight="700" fill="#111">交换机</text>
+  <text x="228" y="168" font-family="WenQuanYi Micro Hei, sans-serif" font-size="13" fill="#666">出队列</text>
+
+  <rect x="248" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+<rect x="276" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+<rect x="304" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+<rect x="332" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+<rect x="360" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+<rect x="388" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+<rect x="416" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+<rect x="444" y="178" width="22" height="22" rx="4" fill="#9ca3af" stroke="#6b7280" stroke-width="1"/>
+  <text x="480" y="196" font-family="WenQuanYi Micro Hei, sans-serif" font-size="20" fill="#6b7280">8  重</text>
+  <line x1="746" y1="189" x2="880" y2="150" stroke="#c4c4c4" stroke-width="3" stroke-dasharray="7 8"/>
+  <polygon points="880,143 896,150 880,157" fill="#c4c4c4"/>
+
+  <rect x="248" y="268" width="22" height="22" rx="4" fill="#16a34a" stroke="#15803d" stroke-width="1"/>
+<rect x="276" y="268" width="22" height="22" rx="4" fill="#16a34a" stroke="#15803d" stroke-width="1"/>
+  <text x="316" y="286" font-family="WenQuanYi Micro Hei, sans-serif" font-size="20" font-weight="700" fill="#166534">2  最轻</text>
+  <line x1="400" y1="279" x2="860" y2="279" stroke="#16a34a" stroke-width="7" stroke-linecap="round"/>
+  <polygon points="860,268 884,279 860,290" fill="#16a34a"/>
+  <text x="620" y="266" font-family="WenQuanYi Micro Hei, sans-serif" font-size="14" font-weight="700" fill="#166534">本包走这里</text>
+
+  <rect x="248" y="358" width="22" height="22" rx="4" fill="#f97316" stroke="#ea580c" stroke-width="1"/>
+<rect x="276" y="358" width="22" height="22" rx="4" fill="#f97316" stroke="#ea580c" stroke-width="1"/>
+<rect x="304" y="358" width="22" height="22" rx="4" fill="#f97316" stroke="#ea580c" stroke-width="1"/>
+<rect x="332" y="358" width="22" height="22" rx="4" fill="#f97316" stroke="#ea580c" stroke-width="1"/>
+<rect x="360" y="358" width="22" height="22" rx="4" fill="#f97316" stroke="#ea580c" stroke-width="1"/>
+  <text x="400" y="376" font-family="WenQuanYi Micro Hei, sans-serif" font-size="20" fill="#c2410c">5  中</text>
+  <line x1="746" y1="369" x2="880" y2="408" stroke="#c4c4c4" stroke-width="3" stroke-dasharray="7 8"/>
+  <polygon points="880,401 896,408 880,415" fill="#c4c4c4"/>
+
+  <text x="480" y="478" text-anchor="middle" font-family="WenQuanYi Micro Hei, sans-serif" font-size="15" fill="#333">每个包选当前最短口，下一包再选</text>
+</svg>

@@ -163,6 +163,21 @@ def path_rows(slide, x, y, w, h, head_fill, head, rows, control_index=None):
         )
 
 
+def kv_cells(slide, x, y, w, h):
+    gap = 0.08
+    cell_w = (w - 2 * gap) / 3
+    cells = (
+        (TEAL, "实例内 KV", "Block Manager，以及 vLLM 的本卡池"),
+        (ACCENT, "跨实例搬运", "kv connector 与 MooncakeConnector"),
+        (GOLD, "Mooncake", "Conductor 管位置，Store 做共享池"),
+    )
+    for i, (fill, title, body) in enumerate(cells):
+        cx = x + i * (cell_w + gap)
+        box(slide, cx, y, cell_w, h, fill, "")
+        textbox(slide, cx + 0.10, y + 0.06, cell_w - 0.20, 0.26, title, 14, True, WHITE)
+        textbox(slide, cx + 0.10, y + 0.32, cell_w - 0.20, h - 0.38, body, 12, False, WHITE, anchor=MSO_ANCHOR.TOP)
+
+
 def main():
     prs = Presentation()
     prs.slide_width = Inches(13.333)
@@ -201,46 +216,49 @@ def main():
         title_w=1.70,
     )
 
-    textbox(slide, label_x, 1.86, label_w, 3.22, "服务", 13, True, TEAL, anchor=MSO_ANCHOR.MIDDLE)
+    textbox(slide, label_x, 1.80, label_w, 2.70, "服务", 13, True, TEAL, anchor=MSO_ANCHOR.MIDDLE)
     path_w = (bar_w - 0.12) / 2
     path_rows(
         slide,
         bar_x,
-        1.86,
+        1.80,
         path_w,
-        3.22,
+        2.70,
         TEAL,
         "路径 A  ·  MindIE LLM 原生引擎",
         (
-            ("Server", "服务入口。Endpoint 兼容 OpenAI、vLLM、Triton、TGI。"),
-            ("LLM Manager", "请求调度与 KV 池。Engine 内含 Scheduler、Block Manager。"),
-            ("Text Generator", "前处理、自回归、后处理。Executor 负责跨节点下发。"),
-            ("Modeling", "ATB 模型与图执行。后端为 ACLGraph 和 ATBGraph。"),
+            ("Server", "Endpoint 兼容 OpenAI、vLLM、Triton、TGI。"),
+            ("LLM Manager", "连续组批。Engine 内含 Scheduler。"),
+            ("Text Generator", "自回归执行。Executor 负责跨节点下发。"),
+            ("Modeling", "ACLGraph 与 ATBGraph。"),
         ),
     )
     path_rows(
         slide,
         bar_x + path_w + 0.12,
-        1.86,
+        1.80,
         path_w,
-        3.22,
+        2.70,
         ACCENT,
         "路径 B  ·  MindIE Motor",
         (
-            ("Coordinator", "数据面入口。路由、限流、实例隔离。"),
-            ("管控面", "Controller 管 P/D 身份和故障。NodeManager 拉起节点并上报心跳。"),
-            ("EngineServer", "节点入口。北向接 Coordinator 和 Controller。"),
-            ("vLLM-Ascend", "当前版本唯一南向引擎。前向和实例内组批在这里。"),
+            ("Coordinator", "路由、限流、实例隔离。"),
+            ("管控面", "Controller 与 NodeManager。"),
+            ("EngineServer", "北向接 Coordinator 和 Controller。"),
+            ("vLLM-Ascend", "当前唯一南向。前向和实例内组批。"),
         ),
         control_index=1,
     )
 
+    textbox(slide, label_x, 4.60, label_w, 0.72, "KV", 13, True, TEAL, anchor=MSO_ANCHOR.MIDDLE)
+    kv_cells(slide, bar_x, 4.60, bar_w, 0.72)
+
     shared = (
-        (ACCENT, "运行时", "CANN", "AscendCL、GE、Runtime、算子库、HCCL、DVPP。推理运行包用 NNRT。", 0.56),
-        (HDK, "驱动", "HDK / Driver", "驱动与固件，与 CANN 分版本配套。", 0.42),
-        (NAVY, "硬件", "昇腾 NPU", "推理任务在昇腾处理器上执行。", 0.42),
+        (ACCENT, "运行时", "CANN", "AscendCL、GE、Runtime、算子库、HCCL、DVPP。推理运行包用 NNRT。", 0.42),
+        (HDK, "驱动", "HDK / Driver", "驱动与固件，与 CANN 分版本配套。", 0.34),
+        (NAVY, "硬件", "昇腾 NPU", "推理任务在昇腾处理器上执行。", 0.34),
     )
-    y = 5.20
+    y = 5.42
     for fill, label, title, body, h in shared:
         textbox(slide, label_x, y, label_w, h, label, 13, True, fill, anchor=MSO_ANCHOR.MIDDLE)
         band(slide, bar_x, y, bar_w, h, fill, title, body, title_w=1.70)
@@ -249,11 +267,11 @@ def main():
     textbox(
         slide,
         0.32,
-        6.78,
+        6.70,
         12.7,
-        0.56,
-        "两条路径互不为下层。Motor 不跑模型前向；实例内组批在 LLM Manager，或在 vLLM-Ascend。\n"
-        "EngineServer 的接口写了 vLLM、SGLang 和 MindIE，这一版只支持 vLLM。",
+        0.64,
+        "Mooncake 不是调用链上的一层。Conductor 把 KV 位置交给 Coordinator 做亲和调度；Store 和 connector 挂在引擎侧。\n"
+        "池化还可选 MemCache。亲和调度与按层推入共享池是两套配置，不叠在同一次传输上。",
         13,
         False,
         MUTED,
@@ -272,6 +290,12 @@ def main():
         "架构页写明南向接口包括 vLLM、SGLang 和 MindIE，当前版本只支持 vLLM。"
         "MindCluster 提供 Kubernetes、PD 分离 CRD 和 Operator，位于调用链外侧。CCAE 可选。"
         "CANN 组成沿用方案概述：AscendCL、GE、Runtime、算子库、HCCL、DVPP。推理运行包为 NNRT。"
+        "KV：MindIE LLM 的 Block Manager 管 DP 内 KV，kv connector 对接池化后端，Mooncake 是其中一种 backend。"
+        "Motor 的亲和调度依赖 Mooncake Conductor：P 实例用 ZMQ 发布 KV 事件，Coordinator 按位置调度。"
+        "3.1 中文页写优先送到已缓存该 KV 的 D 实例；英文页写优先送到已有前缀 KV 的 P 实例。图上只写按位置调度。"
+        "Motor 的 KV 池基于 vLLM-Ascend：MultiConnector 把 MooncakeConnector 与 AscendStoreConnector 组合。"
+        "Mooncake Store 由 mooncake_master 管理；另一后端是 MemCache。Conductor 设计里还可接 YuanRong。"
+        "共享池推入可以使用按层 connector。亲和调度文档建议此时不要再按层单独传输，由 Conductor 管全局位置。"
     )
 
     out = "/workspace/docs/ascend-infer-stack.pptx"

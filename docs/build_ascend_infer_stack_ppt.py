@@ -163,19 +163,13 @@ def path_rows(slide, x, y, w, h, head_fill, head, rows, control_index=None):
         )
 
 
-def kv_cells(slide, x, y, w, h):
-    gap = 0.08
-    cell_w = (w - 2 * gap) / 3
-    cells = (
-        (TEAL, "实例内 KV", "Block Manager，以及 vLLM 的本卡池"),
-        (ACCENT, "跨实例搬运", "kv connector 与 MooncakeConnector"),
-        (GOLD, "Mooncake", "Conductor 管位置，Store 做共享池"),
-    )
-    for i, (fill, title, body) in enumerate(cells):
+def cells(slide, x, y, w, h, items, gap=0.08):
+    cell_w = (w - gap * (len(items) - 1)) / len(items)
+    for i, (fill, title, body) in enumerate(items):
         cx = x + i * (cell_w + gap)
         box(slide, cx, y, cell_w, h, fill, "")
-        textbox(slide, cx + 0.10, y + 0.06, cell_w - 0.20, 0.26, title, 14, True, WHITE)
-        textbox(slide, cx + 0.10, y + 0.32, cell_w - 0.20, h - 0.38, body, 12, False, WHITE, anchor=MSO_ANCHOR.TOP)
+        textbox(slide, cx + 0.08, y + 0.04, cell_w - 0.16, 0.24, title, 13, True, WHITE)
+        textbox(slide, cx + 0.08, y + 0.28, cell_w - 0.16, h - 0.32, body, 11, False, WHITE, anchor=MSO_ANCHOR.TOP)
 
 
 def main():
@@ -203,27 +197,27 @@ def main():
     label_x, label_w = 0.28, 0.92
     bar_x, bar_w = 1.24, 11.76
 
-    textbox(slide, label_x, 1.24, label_w, 0.48, "集群", 13, True, GOLD, anchor=MSO_ANCHOR.MIDDLE)
+    textbox(slide, label_x, 1.22, label_w, 0.36, "集群", 13, True, GOLD, anchor=MSO_ANCHOR.MIDDLE)
     band(
         slide,
         bar_x,
-        1.24,
+        1.22,
         bar_w,
-        0.48,
+        0.36,
         GOLD,
         "MindCluster",
-        "调用链外侧。承接两条路径的 Pod、PD 分离 CRD 和故障恢复。可选 CCAE 做算存网运维。",
+        "调用链外侧。Pod、PD 分离、故障恢复。可选 CCAE。",
         title_w=1.70,
     )
 
-    textbox(slide, label_x, 1.80, label_w, 2.70, "服务", 13, True, TEAL, anchor=MSO_ANCHOR.MIDDLE)
+    textbox(slide, label_x, 1.66, label_w, 2.48, "服务", 13, True, TEAL, anchor=MSO_ANCHOR.MIDDLE)
     path_w = (bar_w - 0.12) / 2
     path_rows(
         slide,
         bar_x,
-        1.80,
+        1.66,
         path_w,
-        2.70,
+        2.48,
         TEAL,
         "路径 A  ·  MindIE LLM 原生引擎",
         (
@@ -236,9 +230,9 @@ def main():
     path_rows(
         slide,
         bar_x + path_w + 0.12,
-        1.80,
+        1.66,
         path_w,
-        2.70,
+        2.48,
         ACCENT,
         "路径 B  ·  MindIE Motor",
         (
@@ -250,15 +244,41 @@ def main():
         control_index=1,
     )
 
-    textbox(slide, label_x, 4.60, label_w, 0.72, "KV", 13, True, TEAL, anchor=MSO_ANCHOR.MIDDLE)
-    kv_cells(slide, bar_x, 4.60, bar_w, 0.72)
+    textbox(slide, label_x, 4.22, label_w, 0.56, "KV 池", 12, True, GOLD, anchor=MSO_ANCHOR.MIDDLE)
+    cells(
+        slide,
+        bar_x,
+        4.22,
+        bar_w,
+        0.56,
+        (
+            (GOLD, "MemCache", "默认后端。元数据与 DRAM 池。"),
+            (GOLD, "Mooncake", "mooncake_master。Conductor 管 KV 位置。"),
+            (TEAL, "实例内", "Block Manager 与 vLLM 本卡池。另有 YuanRong。"),
+        ),
+    )
+
+    textbox(slide, label_x, 4.86, label_w, 0.64, "通信", 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
+    cells(
+        slide,
+        bar_x,
+        4.86,
+        bar_w,
+        0.64,
+        (
+            (ACCENT, "HCCL", "集合通信。服务张量并行和专家并行。"),
+            (HDK, "HCOMM", "HCCL 的基础库。控制面与数据面。"),
+            (TEAL, "HIXL", "单边。LLM-DataDist 拉取和推送 KV。"),
+            (NAVY, "SHMEM", "对称内存。卡间单边访问，给定制算子。"),
+        ),
+    )
 
     shared = (
-        (ACCENT, "运行时", "CANN", "AscendCL、GE、Runtime、算子库、HCCL、DVPP。推理运行包用 NNRT。", 0.42),
-        (HDK, "驱动", "HDK / Driver", "驱动与固件，与 CANN 分版本配套。", 0.34),
-        (NAVY, "硬件", "昇腾 NPU", "推理任务在昇腾处理器上执行。", 0.34),
+        (ACCENT, "运行时", "CANN", "AscendCL、GE、Runtime、算子库、DVPP。通信四库也在这一层。推理包是 NNRT。", 0.40),
+        (HDK, "驱动", "HDK / Driver", "驱动与固件，与 CANN 分版本配套。", 0.30),
+        (NAVY, "硬件", "昇腾 NPU", "推理任务在昇腾处理器上执行。", 0.30),
     )
-    y = 5.42
+    y = 5.60
     for fill, label, title, body, h in shared:
         textbox(slide, label_x, y, label_w, h, label, 13, True, fill, anchor=MSO_ANCHOR.MIDDLE)
         band(slide, bar_x, y, bar_w, h, fill, title, body, title_w=1.70)
@@ -267,11 +287,11 @@ def main():
     textbox(
         slide,
         0.32,
-        6.70,
+        6.78,
         12.7,
-        0.64,
-        "Mooncake 不是调用链上的一层。Conductor 把 KV 位置交给 Coordinator 做亲和调度；Store 和 connector 挂在引擎侧。\n"
-        "池化还可选 MemCache。亲和调度与按层推入共享池是两套配置，不叠在同一次传输上。",
+        0.58,
+        "HCCL 走集合，服务模型并行。HIXL 走单边，服务 P 到 D 的 KV。按层池化目前只在 MemCache 上。\n"
+        "HCOMM 是文档里的通信基础库名。MemCache、Mooncake、YuanRong 是池后端，不是三条调用链。",
         13,
         False,
         MUTED,
@@ -290,12 +310,13 @@ def main():
         "架构页写明南向接口包括 vLLM、SGLang 和 MindIE，当前版本只支持 vLLM。"
         "MindCluster 提供 Kubernetes、PD 分离 CRD 和 Operator，位于调用链外侧。CCAE 可选。"
         "CANN 组成沿用方案概述：AscendCL、GE、Runtime、算子库、HCCL、DVPP。推理运行包为 NNRT。"
-        "KV：MindIE LLM 的 Block Manager 管 DP 内 KV，kv connector 对接池化后端，Mooncake 是其中一种 backend。"
-        "Motor 的亲和调度依赖 Mooncake Conductor：P 实例用 ZMQ 发布 KV 事件，Coordinator 按位置调度。"
-        "3.1 中文页写优先送到已缓存该 KV 的 D 实例；英文页写优先送到已有前缀 KV 的 P 实例。图上只写按位置调度。"
-        "Motor 的 KV 池基于 vLLM-Ascend：MultiConnector 把 MooncakeConnector 与 AscendStoreConnector 组合。"
-        "Mooncake Store 由 mooncake_master 管理；另一后端是 MemCache。Conductor 设计里还可接 YuanRong。"
-        "共享池推入可以使用按层 connector。亲和调度文档建议此时不要再按层单独传输，由 Conductor 管全局位置。"
+        "KV 池：Motor 3.1 默认后端是 MemCache，由 MetaService 管元数据、LocalService 管 DRAM；Mooncake 用 mooncake_master；还有 YuanRong。"
+        "vLLM-Ascend 的按层池化目前只支持 MemCache。"
+        "Mooncake Conductor 给 Coordinator 提供 KV 位置，用于亲和调度。"
+        "通信库都在 CANN 内。HCCL 是集合通信库，服务张量并行和专家并行；HCOMM 是它的基础库，控制面管拓扑和资源，数据面管搬运和同步。"
+        "HIXL 是单边通信库，LLM-DataDist 在这里做链路和 KV 的拉取、推送，支持 D2D、D2H、H2D。"
+        "SHMEM 是对称内存库，给算子开发提供卡间单边访问。"
+        "用户所说的 HCOM 对应文档名 HCOMM。"
     )
 
     out = "/workspace/docs/ascend-infer-stack.pptx"

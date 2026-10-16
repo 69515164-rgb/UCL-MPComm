@@ -281,7 +281,7 @@ def main():
         "默认后端。元数据与 DRAM 池。",
         TEAL,
         "传输  MemFabric",
-        "rdma、sdma、urma、host_shm。",
+        "与 HIXL 并列。rdma 经 HCCP。",
     )
     kv_column(
         slide,
@@ -375,10 +375,12 @@ def main():
         "CANN 组成沿用方案概述：AscendCL、GE、Runtime、算子库、HCCL、DVPP。推理运行包为 NNRT。"
         "KV 池与传输不是并列关系。AscendStoreConnector.backend 在 memcache、mooncake、yuanrong 里选一个池。"
         "MemCache 是 Motor 3.1 默认池：MetaService 管元数据，LocalService 管 DRAM。它的字节走 MemFabric，协议有 device_rdma（A2）、device_sdma（A3）、host_rdma、device_urma（950）、同节点 host_shm。"
+        "MemFabric 与 HIXL 并列。memfabric_hybrid 源码中没有 hixl。device_rdma 自己建 QP，经 HCCP 的 RaSendWrV2 下发；打开设备时调用 HCCL 的 HcclCommInitClusterInfoMemConfig 取得 RDMA handle。device_sdma 走 ACL 与 HAL。host_rdma、host_tcp、host_urma 走 openEuler ubs-comm 的 libhcom.so，符号前缀是 ubs_hcom_。"
         "Mooncake 是对象层，mooncake_master 管池。昇腾上的字节走 Ascend Direct（adxl），建在 CANN 的 HIXL 上。ASCEND_USE_ASYNC_TRANSFER 打开 HIXL 异步传输。LLM-DataDist 是 HIXL 上的 KV 接口，做链路和 pull、push，覆盖 D2D、D2H、H2D。"
+        "HIXL 的 FabricMem 模式由 OPTION_ENABLE_USE_FABRIC_MEM 打开，vLLM-Ascend 对应环境变量 ASCEND_ENABLE_USE_FABRIC_MEM。它是 HIXL 内部用于 A3 超节点 HCCS 上 D2RH、RH2D 的选项，不是 MemFabric 这个库。"
         "Conductor 只是位置索引，Coordinator 用它做亲和调度，字节不经过 Conductor。"
         "YuanRong 是第三种池后端。按层池化目前只支持 MemCache。"
-        "HCCL 是集合通信，服务张量并行和专家并行。HCOMM 是 HCCL 的基础库，控制面管拓扑和资源，数据面管搬运和同步。用户所说的 HCOM 对应文档名 HCOMM。"
+        "HCCL 是集合通信，服务张量并行和专家并行。HCOMM 是 HCCL 的基础库，库文件 libhcomm.so，控制面管拓扑和资源，数据面管搬运和同步。用户所说的 HCOM 在 CANN 文档里对应 HCOMM。MemFabric 主机侧的 libhcom.so 来自 ubs-comm，是另一套库。"
         "CANN SHMEM（aclshmem）是算子用的对称内存。仓库示例 kv_shuffle 做跨 PE 的 KV 块拷贝，不在默认服务路径上。"
         "MindIE 的 SharedMemCommunication 和 layerwise 的 share_memory 使用主机 POSIX 共享内存传控制标志，不是 CANN SHMEM。"
     )

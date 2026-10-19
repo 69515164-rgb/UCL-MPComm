@@ -180,8 +180,9 @@ def main():
     loop_y = 4.68
     stub_w, stub_h = 0.34, 0.46
     last_x = x0 + 3 * (card_w + gap)
-    arrow(slide, last_x + card_w / 2 - stub_w / 2, y0 + card_h + 0.06, stub_w, stub_h, NAVY, MSO_SHAPE.DOWN_ARROW)
-    arrow(slide, x0 + card_w / 2 - stub_w / 2, y0 + card_h + 0.06, stub_w, stub_h, TEAL, MSO_SHAPE.UP_ARROW)
+    stub_h = (loop_y + 0.06) - (y0 + card_h)
+    arrow(slide, last_x + card_w / 2 - stub_w / 2, y0 + card_h, stub_w, stub_h, NAVY, MSO_SHAPE.DOWN_ARROW)
+    arrow(slide, x0 + card_w / 2 - stub_w / 2, y0 + card_h, stub_w, stub_h, TEAL, MSO_SHAPE.UP_ARROW)
     bar_x = x0 + card_w / 2 + 0.06
     bar_w = (last_x + card_w / 2) - bar_x - 0.06
     loop = slide.shapes.add_shape(

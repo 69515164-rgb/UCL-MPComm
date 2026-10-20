@@ -185,12 +185,12 @@ def add_table(slide, x, y, widths, rows, heights, kinds):
     return shape
 
 
-def chrome(slide, page, title, kicker):
+def chrome(slide, page, title, kicker, total=5):
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.08))
     solid(bar, ACCENT)
     textbox(slide, 0.42, 0.16, 10.6, 0.28, kicker, 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
     textbox(slide, 0.42, 0.42, 12.5, 0.42, title, 26, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
-    textbox(slide, 11.4, 0.18, 1.5, 0.26, f"{page}  /  4", 12, False, MUTED, PP_ALIGN.RIGHT)
+    textbox(slide, 11.4, 0.18, 1.5, 0.26, f"{page}  /  {total}", 12, False, MUTED, PP_ALIGN.RIGHT)
     rule = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.42), Inches(7.18), Inches(12.5), Inches(0.01))
     solid(rule, LINE)
     textbox(
@@ -349,6 +349,110 @@ def model():
     }
 
 
+def length_sweep():
+    """Global batch vs input length. DDR spill enters the GPU through H2D."""
+    E, L, h, dff, topk = 2469, 61, 7168, 3072, 6
+    n_csa, n_hca = 30, 31
+    N, TP = 128, 8
+    DP = N // TP
+    w_one = 3 * h * dff * L
+    routed_bytes = E * w_one * 0.5
+    shared = w_one
+    attn = 19.35e9
+    peak = 486e12
+    hbm = 4e12 * 0.80
+    bus = 400e9 * 0.80
+    p2p = 50e9 * 0.80
+    h2d = 64e9 * 0.80
+    moe = topk * L * 6 * h * dff + L * 6 * h * dff
+    proj = attn * 2
+    bpt = n_csa * (576 / 4 + 64 / 4) + n_hca * (576 / 128)
+    fixed = L * 128 * 576
+    room = N * (96e9 - routed_bytes / N - shared - attn / TP - 6e9)
+    local_ddr = N * (768e9 / 8)
+
+    def align(M):
+        return 1.0 if M <= 0 else M / (math.ceil(M / 16.0) * 16)
+
+    def store_seq(S):
+        return S * bpt + fixed
+
+    def read_seq(S):
+        sel = min(1024.0, S / 4.0)
+        return n_csa * (S / 4.0) * 64 + n_hca * (S / 128.0) * 576 + n_csa * sel * 576 + fixed
+
+    def step(BS, S):
+        frac = 1 - math.exp(-topk * BS / E)
+        e = E / N
+        std = math.sqrt(max(e * frac * (1 - frac), 0.0))
+        e_hot = min(e, e * frac + 2 * std)
+        tok = (BS * topk / E) / frac if frac > 1e-9 else 1.0
+        ue, ua = align(tok), align(BS / DP)
+        sel = min(1024.0, S / 4.0)
+        score = n_csa * 4096 * S + n_hca * 2048 * S + n_csa * 262144 * (sel + 128)
+        tw = (e_hot * w_one * 0.5 + shared) / hbm
+        ss, rs = store_seq(S), read_seq(S)
+        total_store = BS * ss
+        hbm_b = min(total_store, room)
+        loc_b = min(max(total_store - room, 0.0), local_ddr)
+        read_gpu = BS * rs / N
+        t_kh = read_gpu * (hbm_b / total_store) / hbm
+        t_h2d = read_gpu * (loc_b / total_store) / h2d
+        t_wa = (attn / TP) / hbm
+        t_ca = BS * (score + proj) / (N * peak * ua)
+        t_cm = BS * moe / (N * peak * ue)
+        pairs = (e_hot / e) * (BS * topk / N)
+        t_ep = pairs * 2 * h * L / bus
+        toks = math.ceil(BS / DP)
+        t_ar = 2 * (TP - 1) / TP * (toks * h * 2) * L / p2p
+        t_attn = max(t_ca, t_kh + t_wa, t_h2d, t_ar)
+        t_moe = max(t_cm, tw, t_ep)
+        return t_attn + t_moe, loc_b / total_store
+
+    def search(S, limit):
+        cap = int((room + local_ddr) // store_seq(S))
+        lo, hi, best = 1, cap, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if step(mid, S)[0] <= limit:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    rows = []
+    for S in (4096, 8192, 32768, 131072, 262144, 524288, 1048576):
+        ss = store_seq(S)
+        cap_h = int(room // ss)
+        b10 = search(S, 0.01)
+        b30 = search(S, 0.03)
+        _, spill = step(b30, S)
+        rows.append({"S": S, "store": ss, "cap": cap_h, "b10": b10, "b30": b30, "spill": spill})
+    return rows
+
+
+def fmt_len(S):
+    if S >= 1048576:
+        return "1M"
+    if S % 1024 == 0 and S >= 1024:
+        return f"{S // 1024}K"
+    return str(S)
+
+
+def fmt_bytes(n):
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    return f"{n / 1e6:.1f} MB"
+
+
+def fmt_count(n):
+    if n >= 10000:
+        v = n / 10000
+        return f"{v:.1f} 万" if v >= 10 else f"{v:.2f} 万"
+    return str(n)
+
+
 def ms(v):
     return f"{v * 1e3:.1f} 毫秒" if v < 0.1 else f"{v * 1e3:.0f} 毫秒"
 
@@ -428,7 +532,7 @@ def main():
         "10T 把专家数解成 2469，总参数 = 2469×4.030×10^9 + 5.260×10^10 = 1.000×10^13。"
         "FP4 容量 = 2469×4.030×10^9×0.5 字节 = 4.975 TB。640 GB 卡下限是 ceil(4.975 TB / 640 GB) = 8。"
         "单 token 通信量 6×3×7168×61 = 7.87×10^6 字节，专家总数变了，每 token 仍只派 6 个，所以通信量不变。"
-        "后面三页不用 640 GB 这套卡，改用 96 GB、128 卡超节点。"
+        "后面几页不用 640 GB 这套卡，改用 96 GB、128 卡超节点。批大小都是 128 卡这一份副本的全局批。"
     )
 
     # ----- slide 2 -----
@@ -533,10 +637,10 @@ def main():
     )
     # result chips
     chips = [
-        ("4K – 32K", "231", "每卡 1.8 条"),
-        ("128K", "229", "仍是读权重"),
-        ("1×10^6", "214", "KV 开始占额度"),
-        ("2.08×10^6", "179", f"读权重 {dlong['tw']*1e3:.1f} 毫秒\n注意力计算 {dlong['tca']*1e3:.1f} 毫秒"),
+        ("4K – 32K", "231", "全局批\n每卡 1.8 条"),
+        ("128K", "229", "全局批\n每卡 1.8 条"),
+        ("256K", "226", "全局批\n每卡 1.8 条"),
+        ("1M", "213", "全局批\n每卡 1.7 条"),
     ]
     for i, (cap, num, sub) in enumerate(chips):
         x = 0.42 + i * 3.20
@@ -544,7 +648,7 @@ def main():
         solid(card, SOFT, LINE)
         textbox(s3, x + 0.16, 5.48, 2.75, 0.26, cap, 12, True, MUTED)
         textbox(s3, x + 0.16, 5.74, 2.75, 0.50, num, 28, True, TEAL)
-        textbox(s3, x + 0.16, 6.28, 2.75, 0.62, sub if "\n" in sub else "全局批\n" + sub, 12, False, INK)
+        textbox(s3, x + 0.16, 6.28, 2.75, 0.62, sub, 12, False, INK)
     s3.notes_slide.notes_text_frame.text = (
         "Decode 与 Prefill 用同一份 128 卡副本：注意力 TP=8、DP=16，MoE EP=128。"
         "加 Decode 节点是多副本，单副本的 TPOT 不变。"
@@ -556,9 +660,8 @@ def main():
         "全部路由专家加共享专家是 13.4 ms，超过 10 ms，所以不能把专家表一次扫完。"
         "专家计算受 Cube 对齐拖累：1.3 token 按 16 行砖，效率 8%，时间 2.6 ms，仍短于读权重。"
         "机内 allreduce：ceil(231/16)=15 条，每条 7168×2 字节，环上每层 2×7/8，61 层除以 40 GB/s = 0.57 ms。"
-        "输入加长后，注意力计算和 KV 读取变多，读权重能占用的额度变少，批从 231 降到 179。"
-        f"在最大输入上，读权重 {dlong['tw']*1e3:.1f} ms，注意力计算 {dlong['tca']*1e3:.1f} ms，相加仍约 10 ms。"
-        "从主机换入一个专家：2.015 GB / (64 GB/s×80%) ≈ 39 ms，放不进 10 ms 这一步。"
+        "输入加长后，读权重能占用的额度变少。全局批从 4K 的 231 降到 1M 的 213，KV 仍放得进 HBM。"
+        "对照表在第 5 页。从主机换入一个专家：2.015 GB / (64 GB/s×80%) ≈ 39 ms，放不进 10 ms 这一步。"
     )
 
     # ----- slide 4 -----
@@ -575,7 +678,7 @@ def main():
         ["", "Attention", "MoE"],
         ["并行", "仍是 TP=8，DP=16\n6928 / 16 = 433 条 / 组", "仍是 EP=128\n每卡 19.3 个专家全醒"],
         ["通信", "allreduce 随批线性涨\n这一档是注意力侧最长", "combine 走 320 GB/s\n0.9 毫秒，短于读权重"],
-        ["访存", "KV 在短输入上可忽略\n长输入改由容量卡住", "38.9 GB 路由 + 4.03 GB 共享\n/ 3.2 TB/s = 13.4 毫秒"],
+        ["访存", "短输入全在 HBM\n放不下走本卡 H2D 51.2 GB/s", "38.9 GB 路由 + 4.03 GB 共享\n/ 3.2 TB/s = 13.4 毫秒"],
         ["计算", "注意力计算 5.6 毫秒\n短于 allreduce", "每专家约 17 token\n按 32 行砖，效率 53%，11.9 毫秒"],
     ]
     add_table(
@@ -606,10 +709,10 @@ def main():
         ["head", "key", "key", "body", "body", "body", "sum"],
     )
     chips4 = [
-        ("4K – 128K", "6928", "每卡 54 条\n一步顶满 30 毫秒"),
-        ("1×10^6", "1156", "每条 4.94 GB\n这一步 18.2 毫秒"),
-        ("2.08×10^6", "555", "每条 10.3 GB\n这一步 18.1 毫秒"),
-        ("KV 余量", "5.72 TB", "96−38.9−4.03−2.42−6\n每卡 44.7 GB"),
+        ("4K – 128K", "6928", "全局批，每卡 54 条\n全在 HBM"),
+        ("256K", "4991", "全局批，每卡 39 条\n12% 经 H2D 读"),
+        ("512K", "2518", "全局批，每卡 20 条\n约 12% 经 H2D 读"),
+        ("1M", "1265", "全局批，每卡 9.9 条\n13% 经 H2D 读"),
     ]
     for i, (cap, num, sub) in enumerate(chips4):
         x = 0.42 + i * 3.20
@@ -626,9 +729,78 @@ def main():
         "两项相加 30.0 ms。专家 combine 只有 0.9 ms，所以 30 毫秒的通信限制在机内 8 卡，不在 128 卡专家域。"
         "专家计算 11.9 ms：每专家约 17 个 token，ceil(17/16)×16=32，效率 17/32=53%。"
         "显存：每卡 96 − 38.9 − 4.03 − 2.42 − 6 = 44.7 GB，128 卡共 5.72 TB。"
-        "每条 KV = S×4939.5 B + 4.50 MB。1×10^6 时约 4.94 GB，能放 1156 条，这一步 18.2 ms，30 ms 还没用完。"
-        "2.08×10^6 时约 10.3 GB，能放 555 条，这一步 18.1 ms。"
-        "1×10^6 的 30 毫秒搜索结果被显存上限截断，批等于 1156，时间 18.2 ms。"
+        "HBM 放不下的 KV 走本卡 H2D，64×0.8 = 51.2 GB/s。远端 DDR 进卡也走这条 H2D，不按 DDR 的 1288.8 GB/s 计。"
+        "1M 时 HBM 能放 1103 条，H2D 再多放一些，30 毫秒全局批到 1265，其中约 13% 的存量经 H2D 读。"
+        "下一页是 4K 到 1M 的全局批对照。"
+    )
+
+    # ----- slide 5: global batch vs input length -----
+    sweep = length_sweep()
+    s5 = prs.slides.add_slide(blank)
+    chrome(s5, 5, "输入越长，30 毫秒的全局批掉得越快", "Decode    ·    不同输入下的最大全局批")
+    banner(
+        s5,
+        0.92,
+        "全局批是 128 卡一份副本上的条数，每卡 = 全局批 / 128。HBM 放不下的 KV 走本卡 H2D，每卡 51.2 GB/s。远端 DDR 进卡也走这条 H2D。",
+    )
+    head = ["输入", "每条 KV", "HBM 能放", "10 毫秒全局批", "每卡", "30 毫秒全局批", "每卡", "30 毫秒的 KV 放哪"]
+    body = []
+    kinds = ["head"]
+    for row in sweep:
+        spill = row["spill"]
+        if spill < 0.01:
+            where = "全在 HBM"
+            kinds.append("body")
+        else:
+            where = f"{spill * 100:.0f}% 经本卡 H2D"
+            kinds.append("key")
+        body.append(
+            [
+                fmt_len(row["S"]),
+                fmt_bytes(row["store"]),
+                fmt_count(row["cap"]),
+                f"{row['b10']}",
+                f"{row['b10'] / 128:.1f}",
+                f"{row['b30']}",
+                f"{row['b30'] / 128:.1f}",
+                where,
+            ]
+        )
+    add_table(
+        s5,
+        0.42,
+        1.56,
+        [1.15, 1.45, 1.45, 1.70, 1.05, 1.75, 1.05, 2.90],
+        [head] + body,
+        [0.40] + [0.52] * len(body),
+        kinds,
+    )
+    note = s5.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.78), Inches(12.5), Inches(1.24))
+    solid(note, GOLD_BG)
+    textbox(
+        s5,
+        0.58,
+        5.86,
+        12.18,
+        1.08,
+        "10 毫秒到 1M 都在 HBM 里，时间卡在读专家权重，全局批从 231 降到 213。\n"
+        "30 毫秒在 128K 及更短仍是 6928，卡在机内 allreduce 16.6 毫秒加读权重 13.4 毫秒。约 1.66×10^5 token 以后，6928 条放不进 5.72 TB，溢出走 H2D。\n"
+        "Prefill 另按 90% KV 命中、参数面 40 GB/s 读 KV。1M 的 TTFT 是 0.35 秒，4K 到 1M 都在 10 秒以内。",
+        14,
+        False,
+        GOLD,
+        anchor=MSO_ANCHOR.MIDDLE,
+    )
+    s5.notes_slide.notes_text_frame.text = (
+        "BS 一律是 128 卡副本的全局批。每卡条数 = 全局批 / 128。"
+        "存量 = S×4939.5 字节 + 4.50 MB。一步真正读的是压缩 indexer、最多 1024 条完整 KV 和 HCA，1M 时约为存量的 13%。"
+        "HBM 余量 5.72 TB。溢出进 GPU 的口是本卡 H2D：64×0.8 = 51.2 GB/s。"
+        "节点 DDR 有效 1031 GB/s，8 条 H2D 合计 410 GB/s，所以卡点在 H2D，不能把 1031/8 = 128.9 GB/s 当成 GPU 的读取速度。"
+        "远端 DDR 进这张卡仍走这张卡的 H2D，和本机 DDR 共用 51.2 GB/s。"
+        "三条通路同时走，取最慢的一条，再和专家阶段相加。"
+        "10 毫秒全局批：4K 231，8K 231，32K 231，128K 229，256K 226，512K 222，1M 213。"
+        "30 毫秒全局批：4K 到 128K 为 6928，256K 为 4991，512K 为 2518，1M 为 1265。"
+        "Prefill 90% 命中时，现算约为冷启动的 10%，1M 的 TTFT 为 0.345 秒，参数面读 KV 0.91 毫秒。"
     )
 
     out = "/workspace/docs/deepseek-10t-slo.pptx"

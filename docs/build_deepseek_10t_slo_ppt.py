@@ -185,7 +185,7 @@ def add_table(slide, x, y, widths, rows, heights, kinds):
     return shape
 
 
-def chrome(slide, page, title, kicker, total=5):
+def chrome(slide, page, title, kicker, total=6):
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.08))
     solid(bar, ACCENT)
     textbox(slide, 0.42, 0.16, 10.6, 0.28, kicker, 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
@@ -432,6 +432,111 @@ def length_sweep():
     return rows
 
 
+def prefill_batch(BS, S, hit=0.9):
+    """TTFT of a global batch on one 128-GPU replica, with a 90% KV hit.
+
+    Attention and MoE each keep the slower pipe, then the two phases add.
+    Hit KV is read on the parameter plane before that.
+    """
+    E, L, h, dff, topk = 2469, 61, 7168, 3072, 6
+    n_csa, n_hca = 30, 31
+    N, TP = 128, 8
+    DP = N // TP
+    w_one = 3 * h * dff * L
+    routed_bytes = E * w_one * 0.5
+    shared = float(w_one)
+    attn = 19.35e9
+    peak = 486e12
+    hbm = 4e12 * 0.80
+    bus = 400e9 * 0.80
+    p2p = 50e9 * 0.80
+    param = 50e9 * 0.80
+    moe = topk * L * 6 * h * dff + L * 6 * h * dff
+    proj = attn * 2
+    bpt = n_csa * (576 / 4 + 64 / 4) + n_hca * (576 / 128)
+    fixed = L * 128 * 576
+    room = N * (96e9 - routed_bytes / N - shared - attn / TP - 6e9)
+
+    def align(M):
+        return 1.0 if M <= 0 else M / (math.ceil(M / 16.0) * 16)
+
+    q = (1 - hit) * S
+    Q = BS * q
+    idx = BS * n_csa * 2048 * q * S
+    hca = BS * n_hca * 1024 * q * S
+    core = BS * n_csa * 262144 * (1024 + 128) * q
+    ua = align(max(Q / DP, 1e-9))
+    frac = 1 - math.exp(-topk * Q / E) if Q > 0 else 0.0
+    e = E / N
+    std = math.sqrt(max(e * frac * (1 - frac), 0.0))
+    e_hot = min(e, e * frac + 2 * std) if frac > 0 else 0.0
+    tok = (Q * topk / E) / frac if frac > 1e-12 else 1.0
+    ue = align(tok)
+    t_idx = idx / (ua * N * peak)
+    t_hca = hca / (ua * N * peak)
+    t_core = core / (ua * N * peak)
+    t_proj = proj * Q / (ua * N * peak)
+    t_attn = t_idx + t_hca + t_core + t_proj
+    t_moe = moe * Q / (ue * N * peak)
+    t_wa = (attn / TP) / hbm
+    t_we = (e_hot * w_one * 0.5 + shared) / hbm
+    t_kv = BS * hit * S * bpt / (N * param)
+    toks = Q / DP
+    t_ar = 2 * (TP - 1) / TP * (toks * h * 2) * L / p2p
+    pairs = (e_hot / e) * (Q * topk / N) if e > 0 else 0.0
+    t_ep = pairs * 2 * h * L / bus
+    t_attn_phase = max(t_attn, t_ar, t_wa)
+    t_moe_phase = max(t_moe, t_we, t_ep)
+    store = S * bpt + fixed
+    return {
+        "t": t_kv + t_attn_phase + t_moe_phase,
+        "tkv": t_kv,
+        "t_attn": t_attn,
+        "t_ar": t_ar,
+        "t_moe": t_moe,
+        "t_ep": t_ep,
+        "t_we": t_we,
+        "t_idx": t_idx,
+        "Q": Q,
+        "cap": int(room // store),
+        "store": store,
+        "room": room,
+    }
+
+
+def prefill_max_bs(S, limit=10.0):
+    lo, hi, best = 1, 1, 0
+    while prefill_batch(hi, S)["t"] <= limit and hi < 5_000_000:
+        hi *= 2
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if prefill_batch(mid, S)["t"] <= limit:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def prefill_sweep():
+    rows = []
+    for S in (4096, 8192, 32768, 131072, 262144, 524288, 1048576):
+        bs = prefill_max_bs(S)
+        row = prefill_batch(bs, S)
+        row["S"] = S
+        row["bs"] = bs
+        rows.append(row)
+    return rows
+
+
+def fmt_tok(n):
+    if n >= 1e6:
+        return f"{n / 1e6:.2f}×10^6"
+    if n >= 1e3:
+        return f"{n / 1e3:.1f}×10^3"
+    return f"{n:.0f}"
+
+
 def fmt_len(S):
     if S >= 1048576:
         return "1M"
@@ -589,11 +694,122 @@ def main():
         f"读权重 {p['tw']*1e3:.1f} ms，KV 搬运 {p['ship']*1e3:.1f} ms。"
         "若只留 S² 两项，10 秒能写到约 2.58×10^6；线性项占掉约 3.5 秒，输入收到 2.08×10^6。"
         "带宽 80%：访存 3.2 TB/s，参数面 40 GB/s。这两笔相对 10 秒可以忽略，所以 80% 不改变最大输入。"
+        "下一页换成 90% KV 命中，问的是同一份副本上 TTFT 仍不超过 10 秒时，能同时放进多少条。"
     )
 
-    # ----- slide 3 -----
+    # ----- slide 3: prefill max global batch -----
+    pb = prefill_sweep()
+    by_s = {row["S"]: row for row in pb}
+    p4 = by_s[4096]
+    p1m = by_s[1048576]
     s3 = prs.slides.add_slide(blank)
-    chrome(s3, 3, "10 毫秒、短输入，全局批 231", "Decode    ·    TPOT ≤ 10 毫秒")
+    chrome(s3, 3, "4K 的 prefill 全局批是 7378，1M 是 28", "Prefill    ·    TTFT ≤ 10 秒    ·    KV 命中 90%")
+    banner(
+        s3,
+        0.92,
+        "多条同时进同一份 128 卡副本，命中 90% 的 KV 走参数面，只现算 10%。注意力侧取 allreduce 和计算里较长的一项，再加专家计算。",
+    )
+    textbox(s3, 0.42, 1.46, 12.5, 0.24, "10 秒在两个端点上怎么加完", 13, True, ACCENT)
+    walk = [
+        ["笔", "算法", "4K，全局批 7378", "1M，全局批 28"],
+        [
+            "现算 token",
+            "批 × 输入 × 0.1",
+            fmt_tok(p4["Q"]),
+            fmt_tok(p1m["Q"]),
+        ],
+        [
+            "机内 allreduce",
+            "每组现算 token × 7168 × 2 字节\n61 层 × 2×7/8 / 40 GB/s",
+            sec(p4["t_ar"]),
+            sec(p1m["t_ar"]),
+        ],
+        [
+            "注意力计算",
+            "indexer、HCA、1024 条稀疏注意力、投影\n和 allreduce 同时走",
+            sec(p4["t_attn"]),
+            sec(p1m["t_attn"]),
+        ],
+        [
+            "专家计算",
+            "现算 token × 5.64×10^10 FLOP\n除以 128 × 486×10^12",
+            sec(p4["t_moe"]),
+            sec(p1m["t_moe"]),
+        ],
+        [
+            "相加",
+            "注意力侧取较长的一项，加上专家计算，再加参数面读 KV",
+            sec(p4["t"]),
+            sec(p1m["t"]),
+        ],
+    ]
+    add_table(
+        s3,
+        0.42,
+        1.72,
+        [1.70, 5.15, 2.85, 2.80],
+        walk,
+        [0.26, 0.32, 0.46, 0.46, 0.46, 0.36],
+        ["head", "body", "key", "body", "body", "sum"],
+    )
+    textbox(s3, 0.42, 4.08, 12.5, 0.22, "同一条 10 秒，输入从 4K 到 1M", 13, True, ACCENT)
+    sweep_head = ["输入", "10 秒全局批", "每卡", "现算 token", "allreduce", "专家计算", "注意力计算", "读 KV"]
+    sweep_body = []
+    sweep_kinds = ["head"]
+    for row in pb:
+        sweep_kinds.append("key" if row["S"] in (4096, 1048576) else "body")
+        sweep_body.append(
+            [
+                fmt_len(row["S"]),
+                f"{row['bs']}",
+                f"{row['bs'] / 128:.1f}",
+                fmt_tok(row["Q"]),
+                sec(row["t_ar"]),
+                sec(row["t_moe"]),
+                sec(row["t_attn"]),
+                ms(row["tkv"]),
+            ]
+        )
+    add_table(
+        s3,
+        0.42,
+        4.36,
+        [1.05, 1.55, 0.95, 1.70, 1.55, 1.55, 1.85, 2.30],
+        [sweep_head] + sweep_body,
+        [0.28] + [0.28] * len(sweep_body),
+        sweep_kinds,
+    )
+    textbox(
+        s3,
+        0.42,
+        6.68,
+        12.5,
+        0.32,
+        f"这些批的 KV 都放得进 HBM：4K 能放 {fmt_count(p4['cap'])} 条，1M 能放 {p1m['cap']} 条。参数面读命中 KV 约 26 毫秒。",
+        13,
+        False,
+        MUTED,
+        anchor=MSO_ANCHOR.MIDDLE,
+    )
+    s3.notes_slide.notes_text_frame.text = (
+        "这一页的批是 128 卡副本上的全局批，每卡条数 = 全局批 / 128。切分与上一页相同：注意力 TP=8、DP=16，MoE EP=128。"
+        "KV 命中 90%。命中部分按参数面 40 GB/s 读，每条只把 10% 的 token 送进计算，这 10% 的 query 仍看全长上下文。"
+        "时间 = 参数面读 KV + 注意力侧较长的一项 + 专家侧较长的一项。"
+        "注意力侧在注意力计算、机内 allreduce、注意力权重之间取最大。专家侧在专家 GEMM、读专家权重、EP combine 之间取最大。"
+        "机内 allreduce 与 Decode 用同一式：每组 token 数 = 现算 token / 16，每 token 7168×2 字节，环上 2×7/8，61 层，除以 40 GB/s。"
+        f"4K 全局批 7378：现算 {p4['Q']:.3e} token，allreduce {p4['t_ar']:.3f}s，注意力计算 {p4['t_attn']:.3f}s，专家计算 {p4['t_moe']:.3f}s，读 KV {p4['tkv']*1e3:.1f} ms，合计 {p4['t']:.3f}s。"
+        f"1M 全局批 28：现算 {p1m['Q']:.3e}，allreduce {p1m['t_ar']:.3f}s，注意力计算 {p1m['t_attn']:.3f}s（其中 indexer {p1m['t_idx']:.3f}s），专家计算 {p1m['t_moe']:.3f}s，合计 {p1m['t']:.3f}s。29 条是 {prefill_batch(29, 1048576)['t']:.2f}s。"
+        "4K 到 128K，allreduce 和专家 GEMM 都只跟现算 token 数有关，所以全局批大致按输入反比下降，现算总量停在约 3.0×10^6。"
+        "1M 时 indexer 升到 3.0 秒，仍短于 allreduce 的 7.0 秒。"
+        "读专家权重约 13 毫秒，EP combine 约 0.4 秒，都短于专家 GEMM。Cube 在这个批上的行数已经超过 16，对齐效率按 1 计。"
+        f"HBM 余量 {p4['room']/1e12:.2f} TB。4K 能放 {p4['cap']} 条，1M 能放 {p1m['cap']} 条，都高于这页的时间批，所以 KV 放得下。"
+        "单条、1,048,576 token、90% 命中的 TTFT 是 "
+        f"{prefill_batch(1, 1048576)['t']:.3f} 秒，其中参数面读 KV {prefill_batch(1, 1048576)['tkv']*1e3:.2f} 毫秒。"
+    )
+
+    # ----- slide 4 -----
+    s3 = prs.slides.add_slide(blank)
+    chrome(s3, 4, "10 毫秒、短输入，全局批 231", "Decode    ·    TPOT ≤ 10 毫秒")
     banner(
         s3,
         0.92,
@@ -661,12 +877,12 @@ def main():
         "专家计算受 Cube 对齐拖累：1.3 token 按 16 行砖，效率 8%，时间 2.6 ms，仍短于读权重。"
         "机内 allreduce：ceil(231/16)=15 条，每条 7168×2 字节，环上每层 2×7/8，61 层除以 40 GB/s = 0.57 ms。"
         "输入加长后，读权重能占用的额度变少。全局批从 4K 的 231 降到 1M 的 213，KV 仍放得进 HBM。"
-        "对照表在第 5 页。从主机换入一个专家：2.015 GB / (64 GB/s×80%) ≈ 39 ms，放不进 10 ms 这一步。"
+        "对照表在第 6 页。从主机换入一个专家：2.015 GB / (64 GB/s×80%) ≈ 39 ms，放不进 10 ms 这一步。"
     )
 
     # ----- slide 4 -----
     s4 = prs.slides.add_slide(blank)
-    chrome(s4, 4, "30 毫秒、短输入，全局批 6928", "Decode    ·    TPOT ≤ 30 毫秒")
+    chrome(s4, 5, "30 毫秒、短输入，全局批 6928", "Decode    ·    TPOT ≤ 30 毫秒")
     banner(
         s4,
         0.92,
@@ -731,13 +947,13 @@ def main():
         "显存：每卡 96 − 38.9 − 4.03 − 2.42 − 6 = 44.7 GB，128 卡共 5.72 TB。"
         "HBM 放不下的 KV 走本卡 H2D，64×0.8 = 51.2 GB/s。远端 DDR 进卡也走这条 H2D，不按 DDR 的 1288.8 GB/s 计。"
         "1M 时 HBM 能放 1103 条，H2D 再多放一些，30 毫秒全局批到 1265，其中约 13% 的存量经 H2D 读。"
-        "下一页是 4K 到 1M 的全局批对照。"
+        "下一页是 4K 到 1M 的 Decode 全局批对照。Prefill 的 10 秒全局批在第 3 页。"
     )
 
     # ----- slide 5: global batch vs input length -----
     sweep = length_sweep()
     s5 = prs.slides.add_slide(blank)
-    chrome(s5, 5, "输入越长，30 毫秒的全局批掉得越快", "Decode    ·    不同输入下的最大全局批")
+    chrome(s5, 6, "输入越长，30 毫秒的全局批掉得越快", "Decode    ·    不同输入下的最大全局批")
     banner(
         s5,
         0.92,
@@ -785,7 +1001,7 @@ def main():
         1.08,
         "10 毫秒到 1M 都在 HBM 里，时间卡在读专家权重，全局批从 231 降到 213。\n"
         "30 毫秒在 128K 及更短仍是 6928，卡在机内 allreduce 16.6 毫秒加读权重 13.4 毫秒。约 1.66×10^5 token 以后，6928 条放不进 5.72 TB，溢出走 H2D。\n"
-        "Prefill 另按 90% KV 命中、参数面 40 GB/s 读 KV。1M 的 TTFT 是 0.35 秒，4K 到 1M 都在 10 秒以内。",
+        "Prefill 的 10 秒全局批在第 3 页：4K 为 7378，1M 为 28。单条 1M、90% 命中的 TTFT 是 0.35 秒。",
         14,
         False,
         GOLD,
@@ -800,7 +1016,8 @@ def main():
         "三条通路同时走，取最慢的一条，再和专家阶段相加。"
         "10 毫秒全局批：4K 231，8K 231，32K 231，128K 229，256K 226，512K 222，1M 213。"
         "30 毫秒全局批：4K 到 128K 为 6928，256K 为 4991，512K 为 2518，1M 为 1265。"
-        "Prefill 90% 命中时，现算约为冷启动的 10%，1M 的 TTFT 为 0.345 秒，参数面读 KV 0.91 毫秒。"
+        "Prefill 90% 命中、带全局批的 10 秒容量在第 3 页。单条 1,048,576 token 的 TTFT 为 0.35 秒，参数面读 KV 0.91 毫秒。"
+        "第 3 页：4K 7378，8K 3689，32K 922，128K 230，256K 115，512K 57，1M 28。注意力侧取机内 allreduce。"
     )
 
     out = "/workspace/docs/deepseek-10t-slo.pptx"

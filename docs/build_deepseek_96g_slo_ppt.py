@@ -279,13 +279,21 @@ def chips(slide, items, number_size=28):
         textbox(slide, x + 0.16, 6.26, 2.75, 0.64, sub, 13, False, INK)
 
 
-def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0):
+def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0, activation=0.0, split_weights=False):
     """Add one per-busiest-GPU 96 GB HBM pie."""
-    weights = (ROUTED / N + SHARED + ATTN / TP) / 1e9
+    expert_weights = (ROUTED / N + SHARED) / 1e9
+    attention_weights = (ATTN / TP) / 1e9
+    weights = expert_weights + attention_weights
     reserve = RESERVE / 1e9
     data = ChartData()
-    data.categories = ["模型权重", "系统预留", "KV cache", "空闲"]
-    data.add_series("", (weights, reserve, kv_hbm, max(free, 0.0)))
+    if split_weights:
+        data.categories = ["专家权重", "Attention权重", "激活/workspace", "系统预留", "KV cache", "空闲"]
+        data.add_series("", (expert_weights, attention_weights, activation, reserve, kv_hbm, max(free, 0.0)))
+        colors = (NAVY, ACCENT, "7A4EAB", GOLD, TEAL, "DCE3E9")
+    else:
+        data.categories = ["模型权重", "系统预留", "KV cache", "空闲"]
+        data.add_series("", (weights, reserve, kv_hbm, max(free, 0.0)))
+        colors = (NAVY, GOLD, TEAL, "DCE3E9")
     chart = slide.shapes.add_chart(
         XL_CHART_TYPE.PIE,
         Inches(x),
@@ -296,7 +304,6 @@ def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0):
     ).chart
     chart.has_legend = False
     chart.chart_style = 10
-    colors = (NAVY, GOLD, TEAL, "DCE3E9")
     for point, color in zip(chart.series[0].points, colors):
         point.format.fill.solid()
         point.format.fill.fore_color.rgb = rgb(color)
@@ -313,19 +320,17 @@ def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0):
     labels.font.bold = True
     labels.font.color.rgb = rgb(INK)
     textbox(slide, x, 1.38, 3.86, 0.30, title, 15, True, NAVY, PP_ALIGN.CENTER)
-    textbox(
-        slide,
-        x,
-        5.12,
-        3.86,
-        0.58,
-        f"BS {bs}    权重 {weights:.2f} GB    预留 {reserve:.0f} GB\n"
-        f"HBM KV {kv_hbm:.2f} GB  ｜  空闲 {max(free, 0.0):.2f} GB",
-        11,
-        False,
-        INK,
-        PP_ALIGN.CENTER,
-    )
+    if split_weights:
+        summary = (
+            f"BS {bs}  专家 {expert_weights:.2f} GB  Attention {attention_weights:.2f} GB\n"
+            f"激活 {activation:.2f} GB  ｜  KV {kv_hbm:.2f} GB  ｜  空闲 {max(free, 0.0):.2f} GB"
+        )
+    else:
+        summary = (
+            f"BS {bs}    权重 {weights:.2f} GB    预留 {reserve:.0f} GB\n"
+            f"HBM KV {kv_hbm:.2f} GB  ｜  空闲 {max(free, 0.0):.2f} GB"
+        )
+    textbox(slide, x, 5.12, 3.86, 0.58, summary, 11, False, INK, PP_ALIGN.CENTER)
     pool_text = f"DDR 池 KV（图外）：{pool:.2f} GB / 卡" if pool > 0 else "DDR 池 KV（图外）：0"
     textbox(slide, x, 5.72, 3.86, 0.28, pool_text, 11, pool > 0, GOLD if pool > 0 else MUTED, PP_ALIGN.CENTER)
 
@@ -1433,7 +1438,13 @@ def main():
         "生产摸高需要先给 measured fixed overhead 预留预算，再重新搜索 BS。"
     )
 
-    def hbm_pie_values(bs, s):
+    def prefill_activation_gb(bs, s):
+        """Four live BF16 hidden-equivalent buffers over an 8K query chunk."""
+        query_rows = math.ceil(bs / DP) * (1 - PREFIX_HIT) * s
+        live_rows = min(query_rows, 8192)
+        return 4 * live_rows * H * 2 / 1e9
+
+    def hbm_pie_values(bs, s, activation=0.0):
         """Busiest active GPU, not the whole-supernode average."""
         n = math.ceil(bs / DP)
         raw_kv = n * store_seq(s) / TP / 1e9
@@ -1441,16 +1452,16 @@ def main():
         kv_hbm = min(raw_kv, room_gpu)
         pool_kv = max(raw_kv - room_gpu, 0.0)
         weights = (ROUTED / N + SHARED + ATTN / TP) / 1e9
-        free = HBM_CAP / 1e9 - weights - RESERVE / 1e9 - kv_hbm
+        free = HBM_CAP / 1e9 - weights - activation - RESERVE / 1e9 - kv_hbm
         return kv_hbm, max(free, 0.0), pool_kv
 
     # ----- slide 12: Prefill HBM pies -----
     s12 = prs.slides.add_slide(blank)
-    chrome(s12, 12, "Prefill：输入变长后，时间摸高批下降，单卡 KV 占用仍小", "HBM 容量    ·    TTFT ≤ 10 秒    ·    98% prefix 命中")
+    chrome(s12, 12, "Prefill：专家权重、Attention权重和激活分别计入 HBM", "HBM 容量    ·    TTFT ≤ 10 秒    ·    98% prefix 命中")
     banner(
         s12,
         0.92,
-        "每个饼是最忙活跃卡的 96 GB HBM。模型权重固定 45.31 GB，系统预留 6 GB；prefix 经参数面拉入 HBM。",
+        f"每个饼是最忙活跃卡：专家权重{(ROUTED/N+SHARED)/1e9:.2f} GB，Attention权重{ATTN/TP/1e9:.2f} GB；激活按8K query chunk、4个BF16 hidden等价缓冲区。",
         size=13,
     )
     pf_pies = [
@@ -1459,24 +1470,25 @@ def main():
         (1048576, p1m["bs"], "1M"),
     ]
     for x, (s, bs, label) in zip((0.42, 4.72, 9.02), pf_pies):
-        kv_hbm, free, pool_kv = hbm_pie_values(bs, s)
-        add_hbm_pie(s12, x, label, bs, kv_hbm, free, pool_kv)
+        activation = prefill_activation_gb(bs, s)
+        kv_hbm, free, pool_kv = hbm_pie_values(bs, s, activation)
+        add_hbm_pie(s12, x, label, bs, kv_hbm, free, pool_kv, activation, True)
     note = s12.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.16), Inches(12.5), Inches(0.86))
     solid(note, GOLD_BG)
     textbox(
         s12, 0.58, 6.20, 12.18, 0.78,
-        "Prefill 的长输入先被 TTFT 限制：4K / 256K / 1M 的最大批分别是 "
-        f"{pf_pies[0][1]} / {pf_pies[1][1]} / {pf_pies[2][1]}，最忙卡 HBM KV 只有 "
-        f"{hbm_pie_values(pf_pies[0][1], pf_pies[0][0])[0]:.2f} / "
-        f"{hbm_pie_values(pf_pies[1][1], pf_pies[1][0])[0]:.2f} / "
-        f"{hbm_pie_values(pf_pies[2][1], pf_pies[2][0])[0]:.2f} GB，均不需要 DDR 池。",
+        f"激活/workspace估算为4×min(query rows, 8192)×7168×2字节，三档均为{prefill_activation_gb(pf_pies[0][1], pf_pies[0][0]):.2f} GB。"
+        "这是流水实现的活跃集，不乘61层；若不做query chunk，4K摸高批的单个hidden张量约3.35 GB，不能沿用本图。",
         12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s12.notes_slide.notes_text_frame.text = (
         f"饼图按最忙活跃GPU，不按{N}卡平均。每卡固定：路由专家{ROUTED/N/1e9:.3f} GB，共享专家{SHARED/1e9:.3f} GB，"
         f"Attention {ATTN/TP/1e9:.3f} GB，系统预留6 GB。KV=ceil(BS/{DP})×store_seq(S)/{TP}。"
+        "激活按8K query chunk、4个BF16 hidden等价buffer估算，包含Attention/MoE/collective活跃临时区，不代表框架峰值实测。"
         + " ".join(
-            f"{label}: BS={bs}, kv={hbm_pie_values(bs, s)[0]:.3f}GB, free={hbm_pie_values(bs, s)[1]:.3f}GB."
+            f"{label}: BS={bs}, act={prefill_activation_gb(bs, s):.3f}GB, "
+            f"kv={hbm_pie_values(bs, s, prefill_activation_gb(bs, s))[0]:.3f}GB, "
+            f"free={hbm_pie_values(bs, s, prefill_activation_gb(bs, s))[1]:.3f}GB."
             for s, bs, label in pf_pies
         )
     )

@@ -1563,7 +1563,7 @@ def main():
         f"+ combine {p4['t_combine']:.2f} 秒 = {p4['t_moe']:.2f} 秒。\n"
         f"1M：dispatch {p1m['t_dispatch']:.2f} 秒 + max(权重 {p1m['t_we']*1e3:.1f} 毫秒，GEMM {p1m['t_gemm']:.2f} 秒) "
         f"+ combine {p1m['t_combine']:.2f} 秒 = {p1m['t_moe']:.2f} 秒。\n"
-        "所有长度都已激活每卡全部路由专家，权重读取稳定在13.4毫秒并被GEMM完全隐藏；主要开销是专家GEMM，其次是两次EP通信。",
+        f"所有长度都已激活每卡全部路由专家，权重读取稳定在{p4['t_we']*1e3:.1f}毫秒并被GEMM完全隐藏；主要开销是专家GEMM，其次是两次EP通信。",
         13,
         False,
         GOLD,

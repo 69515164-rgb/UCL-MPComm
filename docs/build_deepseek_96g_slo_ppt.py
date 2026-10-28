@@ -14,6 +14,11 @@ The supernode is 128 GPUs, intra-machine fullmesh is 8 GPUs.
 The bus DDR pool is rated 480 GB/s per GPU but is capped by that
 400 GB/s D2D port, so the swap path is also 320 GB/s effective.
 Pool capacity is unlimited. Decode KV swap uses the pool; H2D does not.
+
+Slides 7 and 8 are the DDR-swap pages. They list only input lengths where
+the reported decode batch spills KV into the bus pool. Lengths that stay
+in HBM, including a whole SLO curve with zero swap, stay on the earlier
+sweep and are not repeated here as zeros. Keep this filter on later decks.
 """
 
 from __future__ import annotations
@@ -1044,122 +1049,182 @@ def main():
     def both(n, t):
         return f"{qty(n)} · {ms2(t)}"
 
-    g10, g30 = lane_bytes(d10, bs10, 4096), lane_bytes(d30, bs30, 4096)
-    d_next = decode(bs30 + 1, 4096)
+    def len_name(s):
+        return s_label if s == s_show else fmt_len(s)
+
+    def attn_name(d):
+        cands = (
+            ("换入", d["t_pool"]),
+            ("allreduce", d["t_ar"]),
+            ("注意力计算", d["t_ca"]),
+            ("HBM 读", d["t_kv"] + d["t_wa"]),
+        )
+        name, t = max(cands, key=lambda item: item[1])
+        return name, t
+
+    def pack(s, src):
+        return {
+            "S": s,
+            "store": store_seq(s),
+            "b30": src["b30"],
+            "d30": src["d30"],
+            "d10": src["d10"],
+        }
+
+    # Slides 7–8 keep only lengths whose decode KV actually enters the DDR pool.
+    swap_pts = [pack(row["S"], row) for row in sweep if row["d30"]["spill"] >= 0.005 or row["d10"]["spill"] >= 0.005]
+    if extra[s_show]["d30"]["spill"] >= 0.005 or extra[s_show]["d10"]["spill"] >= 0.005:
+        swap_pts.append(pack(s_show, extra[s_show]))
+    if not swap_pts:
+        raise SystemExit("slides 7–8 need at least one length with DDR KV swap")
+    for pt in swap_pts:
+        if pt["d30"]["spill"] < 0.005 and pt["d10"]["spill"] < 0.005:
+            raise SystemExit(f"non-swap length leaked onto the swap pages: {pt['S']}")
+
+    hold = swap_pts[0]
+    bound = next(
+        pt for pt in swap_pts
+        if attn_name(pt["d30"])[0] == "换入"
+    )
+    g_hold = lane_bytes(hold["d30"], hold["b30"], hold["S"])
+    g_bound = lane_bytes(bound["d30"], bound["b30"], bound["S"])
+
+    def step_sum(d):
+        side, _ = attn_name(d)
+        expert = "读专家" if d["tw"] >= d["t_cm"] and d["tw"] >= d["t_ep"] else "专家计算"
+        return f"{side} + {expert} · {ms2(d['t'])}"
 
     s7 = prs.slides.add_slide(blank)
-    chrome(s7, 7, f"4K 上，10 毫秒读到 {ms2(d10['t'])}，30 毫秒读到 {ms2(d30['t'])}", "Decode    ·    短输入一步里的每一笔")
+    chrome(
+        s7, 7,
+        f"{len_name(hold['S'])} 每卡换入 {qty(g_hold['pool'])}，{len_name(bound['S'])} 换入成为最长的一笔",
+        "Decode    ·    只统计进了 DDR 池的长度",
+    )
     banner(
         s7, 0.92,
-        "一步先取注意力侧最长的一笔，再加专家侧最长的一笔。4K 的这两档换入都是 0，存量全在 HBM。",
+        "这两页只列 KV 换进 DDR 池的输入。一步仍是注意力侧最长的一笔，加上专家侧最长的一笔。",
         size=14,
     )
     step_rows = [
-        ["步骤", f"10 毫秒 · 全局批 {bs10}", f"30 毫秒 · 全局批 {bs30}"],
-        ["读专家权重", both(g10["w"], d10["tw"]), both(g30["w"], d30["tw"])],
-        ["机内 allreduce", both(g10["ar"], d10["t_ar"]), both(g30["ar"], d30["t_ar"])],
-        ["专家 GEMM", f"效率 {d10['ue']*100:.0f}% · {ms2(d10['t_cm'])}", f"效率 {d30['ue']*100:.0f}% · {ms2(d30['t_cm'])}"],
-        ["专家 combine", both(g10["ep"], d10["t_ep"]), both(g30["ep"], d30["t_ep"])],
-        ["注意力计算", ms2(d10["t_ca"]), ms2(d30["t_ca"])],
-        ["注意力权重", both(g10["attn"], d10["t_wa"]), both(g30["attn"], d30["t_wa"])],
-        ["HBM 上的 KV", both(g10["hbm"], d10["t_kv"]), both(g30["hbm"], d30["t_kv"])],
-        ["DDR 池换入", "0 · 0.00 毫秒", "0 · 0.00 毫秒"],
-        ["相加", f"读专家 + allreduce · {ms2(d10['t'])}", f"读专家 + allreduce · {ms2(d30['t'])}"],
+        [
+            "步骤",
+            f"{len_name(hold['S'])} · 批 {hold['b30']} · 溢出 {hold['d30']['spill']*100:.1f}%",
+            f"{len_name(bound['S'])} · 批 {bound['b30']} · 溢出 {bound['d30']['spill']*100:.1f}%",
+        ],
+        ["读专家权重", both(g_hold["w"], hold["d30"]["tw"]), both(g_bound["w"], bound["d30"]["tw"])],
+        ["机内 allreduce", both(g_hold["ar"], hold["d30"]["t_ar"]), both(g_bound["ar"], bound["d30"]["t_ar"])],
+        ["专家 GEMM", f"效率 {hold['d30']['ue']*100:.0f}% · {ms2(hold['d30']['t_cm'])}", f"效率 {bound['d30']['ue']*100:.0f}% · {ms2(bound['d30']['t_cm'])}"],
+        ["专家 combine", both(g_hold["ep"], hold["d30"]["t_ep"]), both(g_bound["ep"], bound["d30"]["t_ep"])],
+        ["注意力计算", ms2(hold["d30"]["t_ca"]), ms2(bound["d30"]["t_ca"])],
+        ["注意力权重", both(g_hold["attn"], hold["d30"]["t_wa"]), both(g_bound["attn"], bound["d30"]["t_wa"])],
+        ["HBM 上的 KV", both(g_hold["hbm"], hold["d30"]["t_kv"]), both(g_bound["hbm"], bound["d30"]["t_kv"])],
+        ["DDR 池换入", both(g_hold["pool"], hold["d30"]["t_pool"]), both(g_bound["pool"], bound["d30"]["t_pool"])],
+        ["相加", step_sum(hold["d30"]), step_sum(bound["d30"])],
     ]
     add_table(
-        s7, 0.42, 1.48, [2.30, 5.00, 5.20], step_rows,
-        [0.30, 0.36, 0.36, 0.36, 0.36, 0.32, 0.36, 0.36, 0.36, 0.40],
-        ["head", "key", "key", "body", "body", "body", "body", "body", "body", "sum"],
+        s7, 0.42, 1.48, [2.20, 5.05, 5.25], step_rows,
+        [0.36, 0.34, 0.34, 0.34, 0.34, 0.32, 0.34, 0.34, 0.38, 0.40],
+        ["head", "body", "body", "body", "body", "body", "body", "body", "key", "sum"],
         size=13,
     )
-    note = s7.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.28), Inches(12.5), Inches(1.58))
+    note = s7.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.30), Inches(12.5), Inches(1.56))
     solid(note, GOLD_BG)
     textbox(
-        s7, 0.58, 5.34, 12.18, 1.46,
-        f"字节都按每卡。10 毫秒醒了 {d10['e_hot']:.1f} 个专家，读 {qty(g10['w'])}。整卡 19.3 个加共享要 13.40 毫秒，这一档放不下。"
-        f"再加一条是 {decode(bs10+1, 4096)['t']*1e3:.2f} 毫秒。\n"
-        f"30 毫秒把 19.3 个专家读满，{qty(g30['w'])}，{d30['tw']*1e3:.2f} 毫秒；allreduce {qty(g30['ar'])}，{d30['t_ar']*1e3:.2f} 毫秒。"
-        f"每个专家 {d30['tok']:.2f} 个 token，砖效率 {d30['ue']*100:.0f}%。再加一条跨过 16，效率掉到 {d_next['ue']*100:.0f}%，"
-        f"专家 GEMM 变成 {d_next['t_cm']*1e3:.2f} 毫秒，一步到 {d_next['t']*1e3:.2f} 毫秒。\n"
-        "专家 combine 走 320 GB/s。池上的换入也是这条口，但 4K 的存量还在 HBM 里，下一页才出现非零换入。",
+        s7, 0.58, 5.36, 12.18, 1.44,
+        f"字节按每卡。{len_name(hold['S'])} 溢出 {hold['d30']['spill']*100:.1f}%，换入 {qty(g_hold['pool'])} / 320 GB/s = {hold['d30']['t_pool']*1e3:.2f} 毫秒，"
+        f"短于 allreduce {hold['d30']['t_ar']*1e3:.2f} 毫秒，批保持 {hold['b30']}。128 卡合计 {qty(g_hold['pool'] * N)}。\n"
+        f"{len_name(bound['S'])} 换入 {qty(g_bound['pool'])}、{bound['d30']['t_pool']*1e3:.2f} 毫秒，长过 allreduce 和注意力计算，"
+        f"和读专家 {bound['d30']['tw']*1e3:.2f} 毫秒相加，批降到 {bound['b30']}。128 卡合计 {qty(g_bound['pool'] * N)}。\n"
+        f"10 毫秒到 {s_label} 仍全在 HBM，没有进池的长度，不进这两页。后面的分析沿用这个口径。",
         13, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s7.notes_slide.notes_text_frame.text = (
-        f"4K，BS={bs10}：权重 {g10['w']/1e9:.3f} GB，allreduce {g10['ar']/1e6:.2f} MB，EP {g10['ep']/1e6:.2f} MB，"
-        f"HBM KV {g10['hbm']/1e6:.2f} MB，池 0。t={d10['t']*1e3:.3f} ms。"
-        f"BS={bs30}：权重 {g30['w']/1e9:.3f} GB，allreduce {g30['ar']/1e6:.2f} MB，EP {g30['ep']/1e6:.2f} MB，"
-        f"HBM KV {g30['hbm']/1e6:.2f} MB，池 0。t={d30['t']*1e3:.3f} ms。"
-        f"BS={bs30+1}：ue={d_next['ue']:.3f}，cm={d_next['t_cm']*1e3:.3f} ms，t={d_next['t']*1e3:.3f} ms。"
+        "第 7、8 页只统计 decode KV 溢出到 DDR 池的输入长度。全在 HBM 的长度留在第 6 页，不在这里记 0。"
+        f"{len_name(hold['S'])} BS={hold['b30']} pool={g_hold['pool']/1e6:.1f} MB t={hold['d30']['t_pool']*1e3:.3f} ms "
+        f"ar={hold['d30']['t_ar']*1e3:.3f} ca={hold['d30']['t_ca']*1e3:.3f} step={hold['d30']['t']*1e3:.3f}。"
+        f"{len_name(bound['S'])} BS={bound['b30']} pool={g_bound['pool']/1e6:.1f} MB t={bound['d30']['t_pool']*1e3:.3f} ms "
+        f"step={bound['d30']['t']*1e3:.3f}。"
+        "10 毫秒曲线在本档没有溢出长度。"
     )
 
-    def swap_row(s):
-        b = by_len[s]["b30"]
-        d = by_len[s]["d30"]
-        g = lane_bytes(d, b, s)
-        longer = "短于 allreduce" if d["t_pool"] + 1e-9 < d["t_ar"] else "长于 allreduce，和读权重相加"
+    def census_row(pt):
+        d = pt["d30"]
+        g = lane_bytes(d, pt["b30"], pt["S"])
+        side, side_t = attn_name(d)
         return [
-            fmt_len(s),
-            str(b),
-            fmt_bytes(by_len[s]["store"]),
+            len_name(pt["S"]),
+            str(pt["b30"]),
+            per_card(pt["b30"]),
             f"{d['spill']*100:.1f}%",
             qty(g["pool"]),
             qty(g["pool"] * N),
             ms2(d["t_pool"]),
-            longer,
+            f"{side} {side_t*1e3:.2f} 毫秒",
         ]
 
     s8 = prs.slides.add_slide(blank)
-    chrome(s8, 8, f"256K 每卡换入 {qty(lane_bytes(by_len[262144]['d30'], by_len[262144]['b30'], 262144)['pool'])}，30 毫秒的批仍是 {bs30}", "Decode    ·    DDR 池换入的量和时间")
+    last = swap_pts[-1]
+    chrome(
+        s8, 8,
+        f"进池的长度从 {len_name(hold['S'])} 起，批从 {hold['b30']} 降到 {last['b30']}",
+        "Decode    ·    DDR 池换入的量和时间",
+    )
     banner(
         s8, 0.92,
-        "换入量是溢出比例乘这一步真正读的稀疏 KV。每卡带宽 320 GB/s，即 min(480 GB/s, 400 GB/s) 的 80%。10 毫秒在这些长度上换入为 0。",
-        size=13,
+        "只统计 KV 换进 DDR 池的输入。换入量 = 溢出比例 × 这一步的稀疏读，每卡带宽 320 GB/s。",
+        size=14,
     )
-    swap_head = ["输入", "30 毫秒批", "每条存量", "溢出", "每卡换入", "128 卡合计", "换入耗时", "这一笔的位置"]
-    swap_body = [swap_row(s) for s in (262144, 524288, 1048576)]
+    census_head = ["输入", "30 毫秒批", "每卡", "溢出", "每卡换入", "128 卡合计", "换入耗时", "注意力侧取"]
     add_table(
-        s8, 0.42, 1.50, [1.15, 1.45, 1.40, 1.15, 1.45, 1.70, 1.45, 2.75],
-        [swap_head] + swap_body,
-        [0.40, 0.52, 0.52, 0.52],
-        ["head", "key", "body", "body"],
+        s8, 0.42, 1.48,
+        [1.35, 1.25, 0.90, 1.05, 1.50, 1.65, 1.45, 3.15],
+        [census_head] + [census_row(pt) for pt in swap_pts],
+        [0.38] + [0.42] * len(swap_pts),
+        ["head"] + ["key" if pt is hold or attn_name(pt["d30"])[0] == "换入" else "body" for pt in swap_pts],
         size=12,
     )
-    textbox(s8, 0.42, 3.70, 12.5, 0.24, "同一长度上，10 毫秒的批仍全在 HBM", 13, True, ACCENT)
-    ten_head = ["输入", "10 毫秒批", "每卡", "每条存量", "HBM 能放", "每卡换入", "换入耗时"]
-    ten_body = []
-    for s in (262144, 524288, 1048576):
-        row = by_len[s]
-        ten_body.append([
-            fmt_len(s), str(row["b10"]), per_card(row["b10"]),
-            fmt_bytes(row["store"]), fmt_count(row["cap"]), "0", "0.00 毫秒",
+    textbox(s8, 0.42, 3.70, 12.5, 0.22, "同一批长度上，换入和另外几笔的耗时", 13, True, ACCENT)
+    time_head = ["输入", "换入", "allreduce", "注意力计算", "HBM 上的 KV", "读专家", "一步"]
+    time_body = []
+    time_kinds = ["head"]
+    for pt in swap_pts:
+        d = pt["d30"]
+        time_body.append([
+            len_name(pt["S"]),
+            ms2(d["t_pool"]),
+            ms2(d["t_ar"]),
+            ms2(d["t_ca"]),
+            ms2(d["t_kv"]),
+            ms2(d["tw"]),
+            ms2(d["t"]),
         ])
+        time_kinds.append("key" if attn_name(d)[0] == "换入" else "body")
     add_table(
-        s8, 0.42, 4.02, [1.20, 1.60, 1.20, 1.70, 1.70, 2.40, 2.70],
-        [ten_head] + ten_body,
-        [0.34, 0.36, 0.36, 0.36],
-        ["head", "body", "body", "body"],
+        s8, 0.42, 4.06,
+        [1.45, 1.70, 1.80, 1.90, 1.80, 1.70, 1.95],
+        [time_head] + time_body,
+        [0.36] + [0.36] * len(swap_pts),
+        time_kinds,
         size=12,
     )
-    g256 = lane_bytes(by_len[262144]["d30"], by_len[262144]["b30"], 262144)
-    note = s8.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.56), Inches(12.5), Inches(1.48))
+    note = s8.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.04), Inches(12.5), Inches(1.00))
     solid(note, GOLD_BG)
     textbox(
-        s8, 0.58, 5.62, 12.18, 1.36,
-        f"每条这一步读的是 30 层压缩 indexer、31 层 HCA、最多 1024 条完整 latent，再加 4.50 MB 固定项，不是整段存量。"
-        f"256K、批 {by_len[262144]['b30']}：每卡 {qty(g256['pool'])} / 320 GB/s = {by_len[262144]['d30']['t_pool']*1e3:.2f} 毫秒，"
-        f"128 卡合计 {qty(g256['pool']*N)}。它短于 allreduce {by_len[262144]['d30']['t_ar']*1e3:.2f} 毫秒，所以批还是 {bs30}。\n"
-        f"512K 的换入升到 {ms2(by_len[524288]['d30']['t_pool'])}，和读权重 {by_len[524288]['d30']['tw']*1e3:.2f} 毫秒相加，批降到 {by_len[524288]['b30']}。"
-        f"1M 的换入仍是 {ms2(by_len[1048576]['d30']['t_pool'])}，批 {by_len[1048576]['b30']}。",
+        s8, 0.58, 6.08, 12.18, 0.92,
+        "稀疏读不是整段存量：30 层压缩 indexer、31 层 HCA、最多 1024 条完整 latent，再加 4.50 MB。带宽 320 GB/s。\n"
+        f"10 毫秒到 {s_label} 仍全在 HBM，128K 也全在 HBM。这两页只保留溢出大于 0 的长度，后面的分析沿用这个口径。",
         13, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s8.notes_slide.notes_text_frame.text = (
-        "池上字节 = spill × 每卡稀疏读。稀疏读 = bs × n_csa_read(S) / 128。"
+        "池上字节 = spill × bs × n_csa_read(S) / 128。带宽 320 GB/s。"
         "n_csa_read = 30×(S/4)×64 + 31×(S/128)×576 + 30×min(1024,S/4)×576 + 61×128×576。"
-        f"带宽 {POOL/1e9:.0f} GB/s。256K 每卡 {g256['pool']/1e6:.1f} MB，合计 {g256['pool']*N/1e9:.2f} GB，"
-        f"时间 {by_len[262144]['d30']['t_pool']*1e3:.3f} ms。"
-        f"512K 每卡 {lane_bytes(by_len[524288]['d30'], by_len[524288]['b30'], 524288)['pool']/1e6:.1f} MB，"
-        f"1M 每卡 {lane_bytes(by_len[1048576]['d30'], by_len[1048576]['b30'], 1048576)['pool']/1e6:.1f} MB。"
-        "10 毫秒在 256K、512K、1M 的 spill 都是 0。"
+        + " ".join(
+            f"{len_name(pt['S'])} bs={pt['b30']} spill={pt['d30']['spill']*100:.2f}% "
+            f"pool={lane_bytes(pt['d30'], pt['b30'], pt['S'])['pool']/1e6:.1f}MB "
+            f"t={pt['d30']['t_pool']*1e3:.3f}ms step={pt['d30']['t']*1e3:.3f}ms"
+            for pt in swap_pts
+        )
+        + " 口径已固化：第 7、8 页不收录换入为 0 的输入长度。"
     )
 
     out = "/workspace/docs/deepseek-96g-slo.pptx"

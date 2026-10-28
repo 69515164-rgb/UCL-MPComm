@@ -27,7 +27,9 @@ from __future__ import annotations
 import math
 
 from pptx import Presentation
+from pptx.chart.data import ChartData
 from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
@@ -236,7 +238,7 @@ def add_table(slide, x, y, widths, rows, heights, kinds, size=12):
     return shape
 
 
-def chrome(slide, page, title, kicker, total=11):
+def chrome(slide, page, title, kicker, total=13):
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.08))
     solid(bar, ACCENT)
     textbox(slide, 0.42, 0.16, 10.6, 0.28, kicker, 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
@@ -272,6 +274,57 @@ def chips(slide, items, number_size=28):
         textbox(slide, x + 0.16, 5.48, 2.75, 0.26, cap, 12, True, MUTED)
         textbox(slide, x + 0.16, 5.74, 2.75, 0.50, num, number_size, True, TEAL)
         textbox(slide, x + 0.16, 6.26, 2.75, 0.64, sub, 13, False, INK)
+
+
+def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0):
+    """Add one per-busiest-GPU 96 GB HBM pie."""
+    weights = (ROUTED / N + SHARED + ATTN / TP) / 1e9
+    reserve = RESERVE / 1e9
+    data = ChartData()
+    data.categories = ["模型权重", "系统预留", "KV cache", "空闲"]
+    data.add_series("", (weights, reserve, kv_hbm, max(free, 0.0)))
+    chart = slide.shapes.add_chart(
+        XL_CHART_TYPE.PIE,
+        Inches(x),
+        Inches(1.72),
+        Inches(3.86),
+        Inches(3.42),
+        data,
+    ).chart
+    chart.has_legend = False
+    chart.chart_style = 10
+    colors = (NAVY, GOLD, TEAL, "DCE3E9")
+    for point, color in zip(chart.series[0].points, colors):
+        point.format.fill.solid()
+        point.format.fill.fore_color.rgb = rgb(color)
+        point.format.line.color.rgb = rgb(WHITE)
+    chart.plots[0].has_data_labels = True
+    labels = chart.plots[0].data_labels
+    labels.position = XL_LABEL_POSITION.OUTSIDE_END
+    labels.show_category_name = True
+    labels.show_percentage = True
+    labels.show_value = False
+    labels.number_format = "0.0%"
+    labels.font.name = FONT
+    labels.font.size = Pt(9)
+    labels.font.bold = True
+    labels.font.color.rgb = rgb(INK)
+    textbox(slide, x, 1.38, 3.86, 0.30, title, 15, True, NAVY, PP_ALIGN.CENTER)
+    textbox(
+        slide,
+        x,
+        5.12,
+        3.86,
+        0.58,
+        f"BS {bs}    权重 {weights:.2f} GB    预留 {reserve:.0f} GB\n"
+        f"HBM KV {kv_hbm:.2f} GB  ｜  空闲 {max(free, 0.0):.2f} GB",
+        11,
+        False,
+        INK,
+        PP_ALIGN.CENTER,
+    )
+    pool_text = f"DDR 池 KV（图外）：{pool:.2f} GB / 卡" if pool > 0 else "DDR 池 KV（图外）：0"
+    textbox(slide, x, 5.72, 3.86, 0.28, pool_text, 11, pool > 0, GOLD if pool > 0 else MUTED, PP_ALIGN.CENTER)
 
 
 def align(m):
@@ -1367,6 +1420,92 @@ def main():
         f"4K 10ms BS={bs10} data-plane={d10['t']*1e3:.6f}ms；"
         f"4K 30ms BS={bs30} data-plane={d30['t']*1e3:.6f}ms。"
         "生产摸高需要先给 measured fixed overhead 预留预算，再重新搜索 BS。"
+    )
+
+    def hbm_pie_values(bs, s):
+        """Busiest active GPU, not the 128-GPU average."""
+        n = math.ceil(bs / DP)
+        raw_kv = n * store_seq(s) / TP / 1e9
+        room_gpu = ROOM / N / 1e9
+        kv_hbm = min(raw_kv, room_gpu)
+        pool_kv = max(raw_kv - room_gpu, 0.0)
+        weights = (ROUTED / N + SHARED + ATTN / TP) / 1e9
+        free = HBM_CAP / 1e9 - weights - RESERVE / 1e9 - kv_hbm
+        return kv_hbm, max(free, 0.0), pool_kv
+
+    # ----- slide 12: Prefill HBM pies -----
+    s12 = prs.slides.add_slide(blank)
+    chrome(s12, 12, "Prefill：输入变长后，时间摸高批下降，单卡 KV 占用仍小", "HBM 容量    ·    TTFT ≤ 10 秒    ·    90% prefix 命中")
+    banner(
+        s12,
+        0.92,
+        "每个饼是最忙活跃卡的 96 GB HBM。模型权重固定 45.31 GB，系统预留 6 GB；prefix 经参数面拉入 HBM。",
+        size=13,
+    )
+    pf_pies = [
+        (4096, p4["bs"], "4K"),
+        (262144, next(row["bs"] for row in pb if row["S"] == 262144), "256K"),
+        (1048576, p1m["bs"], "1M"),
+    ]
+    for x, (s, bs, label) in zip((0.42, 4.72, 9.02), pf_pies):
+        kv_hbm, free, pool_kv = hbm_pie_values(bs, s)
+        add_hbm_pie(s12, x, label, bs, kv_hbm, free, pool_kv)
+    note = s12.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.16), Inches(12.5), Inches(0.86))
+    solid(note, GOLD_BG)
+    textbox(
+        s12, 0.58, 6.20, 12.18, 0.78,
+        "Prefill 的长输入先被 TTFT 限制：4K / 256K / 1M 的最大批分别是 "
+        f"{pf_pies[0][1]} / {pf_pies[1][1]} / {pf_pies[2][1]}，最忙卡 HBM KV 只有 "
+        f"{hbm_pie_values(pf_pies[0][1], pf_pies[0][0])[0]:.2f} / "
+        f"{hbm_pie_values(pf_pies[1][1], pf_pies[1][0])[0]:.2f} / "
+        f"{hbm_pie_values(pf_pies[2][1], pf_pies[2][0])[0]:.2f} GB，均不需要 DDR 池。",
+        12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    s12.notes_slide.notes_text_frame.text = (
+        "饼图按最忙活跃 GPU，不按 128 卡平均。每卡固定：路由专家 38.864 GB，共享专家 4.030 GB，"
+        "Attention 2.419 GB，系统预留 6 GB。KV = ceil(BS/16) × store_seq(S) / 8。"
+        + " ".join(
+            f"{label}: BS={bs}, kv={hbm_pie_values(bs, s)[0]:.3f}GB, free={hbm_pie_values(bs, s)[1]:.3f}GB."
+            for s, bs, label in pf_pies
+        )
+    )
+
+    # ----- slide 13: Decode HBM pies -----
+    s13 = prs.slides.add_slide(blank)
+    chrome(s13, 13, "Decode：30 毫秒摸高时，512K 起把 HBM KV 房间占满", "HBM 容量    ·    TPOT ≤ 30 毫秒")
+    banner(
+        s13,
+        0.92,
+        "饼图只画单卡 96 GB HBM；放不下的 KV 在饼图外标出 DDR 池占用。仍按最忙活跃卡。",
+        size=13,
+    )
+    d_pies = [
+        (4096, by_len[4096]["b30"], "4K"),
+        (524288, by_len[524288]["b30"], "512K"),
+        (1048576, by_len[1048576]["b30"], "1M"),
+    ]
+    for x, (s, bs, label) in zip((0.42, 4.72, 9.02), d_pies):
+        kv_hbm, free, pool_kv = hbm_pie_values(bs, s)
+        add_hbm_pie(s13, x, label, bs, kv_hbm, free, pool_kv)
+    d10_4 = hbm_pie_values(by_len[4096]["b10"], 4096)
+    d10_512 = hbm_pie_values(by_len[524288]["b10"], 524288)
+    d10_1m = hbm_pie_values(by_len[1048576]["b10"], 1048576)
+    note = s13.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.16), Inches(12.5), Inches(0.86))
+    solid(note, GOLD_BG)
+    textbox(
+        s13, 0.58, 6.20, 12.18, 0.78,
+        f"30 毫秒：512K / 1M 的最忙卡各有 {hbm_pie_values(d_pies[1][1], d_pies[1][0])[2]:.2f} / "
+        f"{hbm_pie_values(d_pies[2][1], d_pies[2][0])[2]:.2f} GB KV 在 DDR 池。"
+        f"10 毫秒批更小，4K / 512K / 1M 的 HBM KV 仅 {d10_4[0]:.2f} / {d10_512[0]:.2f} / {d10_1m[0]:.2f} GB，均不进池。",
+        12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    s13.notes_slide.notes_text_frame.text = (
+        "Decode 饼图使用 30ms 最大批，按最忙活跃 GPU。HBM KV 上限 44.687 GB。"
+        + " ".join(
+            f"{label}: BS={bs}, hbm_kv={hbm_pie_values(bs, s)[0]:.3f}GB, "
+            f"pool={hbm_pie_values(bs, s)[2]:.3f}GB, free={hbm_pie_values(bs, s)[1]:.3f}GB."
+            for s, bs, label in d_pies
+        )
     )
 
     out = "/workspace/docs/deepseek-96g-slo.pptx"

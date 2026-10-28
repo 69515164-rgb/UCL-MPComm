@@ -798,7 +798,7 @@ def main():
             "AR 在 Attention 内取瓶颈；完整 KV 按层发送",
             f"{sec(p['t_ar'])} + {ms2(p['t_pd'])}",
         ],
-        ["合计", "Attention 9.60 秒 + MoE 0.40 秒；P→D 尾巴为 0", "10.0 秒"],
+        ["合计", f"Attention {p['t_attention']:.2f} 秒 + MoE {p['t_moe']:.2f} 秒；P→D 尾巴为 0", sec(p["t"])],
     ]
     add_table(
         s2,
@@ -1159,6 +1159,7 @@ def main():
     swap_pts = [pack(row["S"], row) for row in sweep if row["d30"]["spill"] >= 0.005 or row["d10"]["spill"] >= 0.005]
     if extra[s_show]["d30"]["spill"] >= 0.005 or extra[s_show]["d10"]["spill"] >= 0.005:
         swap_pts.append(pack(s_show, extra[s_show]))
+    swap_pts.sort(key=lambda pt: pt["S"])
     if not swap_pts:
         raise SystemExit("slides 7–8 need at least one length with DDR KV swap")
     for pt in swap_pts:

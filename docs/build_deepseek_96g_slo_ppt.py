@@ -6,6 +6,7 @@ Attention and experts share one peak: 486 T x 70% = 340.2 T.
 
 H2D is 64 GB/s per GPU: 51.2 GB/s effective, prefill only.
 DDR5 is 1288.8 GB/s and 768 GB per 8-GPU machine.
+Prefix-cache hits use the 40 GB/s effective parameter plane, not H2D.
 
 D2D is 3.2 Tb/s per GPU: 400 GB/s peak, 320 GB/s effective.
 P2P and the parameter plane are 400 Gb/s: 40 GB/s effective.
@@ -350,7 +351,8 @@ def prefill_batch(bs, s, hit=0.9):
     t_core = n * core / denom
     t_proj = n * proj / denom
     t_compute = t_idx + t_hca + t_core + t_proj
-    t_pull = n * p * BPT / (TP * H2D)
+    # Prefix hits reside behind the parameter plane, not in host DDR.
+    t_pull = n * p * BPT / (TP * PARAM)
     # Ideal fused-kernel reuse: read the context once and write new KV once.
     hbm_bytes = ATTN / TP + n * (s * BPT + q * BPT) / TP
     t_hbm = hbm_bytes / HBM_BW
@@ -762,7 +764,7 @@ def main():
     banner(
         s3,
         0.92,
-        "90% prefix 从主机 DDR 经 H2D 拉入 HBM，只现算 10%。Attention 取拉取、融合 kernel、AR 的瓶颈，再加完整 MoE。",
+        "90% prefix 经参数面 40 GB/s 拉入 HBM，只现算 10%。Attention 取拉取、融合 kernel、AR 的瓶颈，再加完整 MoE。",
         size=14,
     )
     textbox(s3, 0.42, 1.44, 12.5, 0.22, "10 秒在两个端点上怎么加完", 13, True, ACCENT)
@@ -829,7 +831,7 @@ def main():
         6.66,
         12.5,
         0.28,
-        f"90% prefix 走 H2D：4K 这一批拉取 {ms(p4['t_pull'])}，1M 拉取 {ms(p1m['t_pull'])}；均短于 Attention 主瓶颈。",
+        f"90% prefix 走参数面：4K 这一批拉取 {ms(p4['t_pull'])}，1M 拉取 {ms(p1m['t_pull'])}；均短于 Attention 主瓶颈。",
         13,
         False,
         MUTED,
@@ -837,7 +839,7 @@ def main():
     )
     s3.notes_slide.notes_text_frame.text = (
         "这一页的批是 128 卡副本上的全局批，每卡条数 = 全局批 / 128。切分与上一页相同：注意力 TP=8、DP=16，MoE EP=128。"
-        "KV 命中 90%，命中部分在主机 DDR，经每卡 51.2 GB/s 的 H2D 拉到 HBM。每条只现算 10%，这些 query 的平均上下文约为 95%S。"
+        "KV 命中 90%，命中部分经每卡 40 GB/s 的参数面拉到 HBM。每条只现算 10%，这些 query 的平均上下文约为 95%S。"
         "Attention = max(prefix pull, HBM, compute, AR)。MoE = dispatch + max(weight, GEMM) + combine。Attention 与 MoE 相加。"
         f"4K 全局批 {p4['bs']}：现算 {p4['Q']:.4e} token，allreduce {p4['t_ar']:.3f}s，注意力计算 {p4['t_attn']:.3f}s，专家计算 {p4['t_moe']:.3f}s，"
         f"EP 双向 {p4['t_ep']:.3f}s，读专家权重 {p4['t_we']*1e3:.2f} ms，拉 prefix {p4['t_pull']*1e3:.1f} ms，合计 {p4['t']:.3f}s。"
@@ -1259,7 +1261,7 @@ def main():
         ["并行域", "Attention TP=8、DP=16；MoE EP=128", "同左；最忙 TP 组 n=⌈BS/16⌉"],
         ["Attention", "拉 prefix、融合 kernel、AR 跨 query chunk 流水，取瓶颈", "SWAP 在前；融合 kernel 后再加 AR"],
         ["MoE", "dispatch + max(权重, GEMM) + combine", "同左；两个 EP 方向分别统计"],
-        ["KV 位置", "90% prefix 在主机 DDR；Decode 没有副本", "HBM 放不下先从 DDR 池写回 HBM"],
+        ["KV 位置", "90% prefix 在远端 KV 缓存，经参数面拉取；Decode 没有副本", "HBM 放不下先从 DDR 池写回 HBM"],
         ["P→D", "完整 KV 按层发送；只加未被后续计算隐藏的尾巴", "不进入单步 TPOT"],
         ["负载", "Attention 按 TP=8；MoE 取最忙 EP 卡，逐专家 16 行 padding", "同左"],
         ["固定开销", "不伪造数值；单列为未计入项", "不伪造数值；SLO 结果是数据面理论上限"],
@@ -1290,13 +1292,13 @@ def main():
     banner(
         s10,
         0.92,
-        "本页所有时间已经包含完整 61 层。90% prefix 在主机 DDR，Decode 没有副本。",
+        "本页所有时间已经包含完整 61 层。90% prefix 经参数面拉取，Decode 没有副本。",
         size=14,
     )
     ttft_rows = [
         ["部分", "公式", "注释"],
         ["Attention", "max(拉 prefix，HBM，Attention 计算，AR)", "四条通路跨 query chunk 流水"],
-        ["拉 prefix", "⌈BS/16⌉ × 0.9S × 4939.5 / (8 × 51.2 GB/s)", "DDR → H2D → HBM；写入后 kernel 还会读一次"],
+        ["拉 prefix", "⌈BS/16⌉ × 0.9S × 4939.5 / (8 × 40 GB/s)", "远端 KV → 参数面 → HBM；写入后 kernel 还会读一次"],
         ["计算上下文", "C = 0.1S × 0.9S + 0.1S × (0.1S + 1) / 2", "新 token 平均看到约 95% 的完整上下文"],
         ["融合 kernel", "max(Attention HBM，Attention FLOP / 340.2 T)", "HBM 含权重、prefix KV、新 KV 和激活"],
         ["MoE", "dispatch + max(专家权重，专家 GEMM) + combine", "最忙 EP 卡；逐专家 16 行 padding"],

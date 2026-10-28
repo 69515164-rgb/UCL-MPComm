@@ -9,7 +9,9 @@ DDR5 is 1288.8 GB/s and 768 GB per 8-GPU machine.
 Prefix-cache hits use the 40 GB/s effective parameter plane, not H2D.
 
 D2D is 3.2 Tb/s per GPU: 400 GB/s peak, 320 GB/s effective.
-P2P and the parameter plane are 400 Gb/s: 40 GB/s effective.
+Each link in the 8-GPU fullmesh is 400 Gb/s.  Seven links run in
+parallel per GPU, so TP collectives get 280 GB/s effective, below the
+3.2 Tb/s D2D-port ceiling.  The parameter plane remains 40 GB/s.
 The supernode is 128 GPUs, intra-machine fullmesh is 8 GPUs.
 
 The bus DDR pool is rated 480 GB/s per GPU but is capped by that
@@ -60,7 +62,8 @@ D2D_PEAK = 3.2e12 / 8
 POOL_PEAK = min(480e9, D2D_PEAK)
 D2D = D2D_PEAK * 0.80
 POOL = POOL_PEAK * 0.80
-P2P = 400e9 / 8 * 0.80
+P2P_LINK = 400e9 / 8
+P2P = min(D2D_PEAK, (NODE - 1) * P2P_LINK) * 0.80
 PARAM = 400e9 / 8 * 0.80
 H2D = 64e9 * 0.80
 DDR_NODE_BW = 1288.8e9 * 0.80
@@ -727,7 +730,7 @@ def main():
         "外推式：总参数 = 专家数 × 4.030×10^9 + 5.260×10^10。单个专家 = 3 × 7168 × 3072 × 61。\n"
         "本档：96 GB HBM，4 TB/s 取 80% 为 3.20 TB/s。算力 486 T 取 70% 为 340.2 T，注意力和专家共用。H2D 每卡 64 GB/s 取 80% 为 51.2 GB/s，只在 prefill。机内 DDR5 每机 1288.8 GB/s、768 GB。\n"
         "D2D 每卡 3.2 Tb/s = 400 GB/s，取 80% 为 320 GB/s。内存池标称 480 GB/s，被这条 400 GB/s 的口卡住，有效也是 320 GB/s，容量不设上限。"
-        "P2P 与参数面 400 Gb/s 取 80% 为 40 GB/s。超节点 128 卡，机内 8 卡 fullmesh。",
+        "8卡fullmesh每条链路400 Gb/s，7链路并发后取80%为280 GB/s；参数面仍为40 GB/s。",
         13,
         False,
         GOLD,
@@ -743,7 +746,7 @@ def main():
         "后面几页是 96 GB、486 T 这一档。算力 486×10^12 再乘 70%，有效 340.2×10^12。注意力和专家用同一个峰值。"
         "HBM 96 GB，带宽 4 TB/s，计时取 80% 即 3.20 TB/s。"
         "H2D 是 64 GB/s（字节），80% 后 51.2 GB/s。这条链路只在 prefill 使用。权重放得进 HBM，冷的 10 秒不走 H2D。"
-        "D2D 写的是 3.2 Tb/s（小写 b，比特）：3.2×10^12 / 8 = 400 GB/s 峰值，80% 后 320 GB/s。机内 8 卡 fullmesh，P2P 400 Gb/s = 50 GB/s 峰值，80% 后 40 GB/s。参数面同样 400 Gb/s，80% 后 40 GB/s。"
+        "D2D 3.2 Tb/s：换算400 GB/s峰值，80%后320 GB/s。8卡fullmesh每卡有7条400 Gb/s链路：聚合350 GB/s峰值，受D2D口约束前已较低，80%后AllReduce按280 GB/s。参数面400 Gb/s，80%后40 GB/s。"
         "DDR5 的 1288.8 GB/s 和 768 GB 按一台 8 卡机器记。有效 1031 GB/s，每卡分到 128.9 GB/s 和 96 GB。H2D 只有 51.2 GB/s，主机路径被 H2D 卡住。"
         "超节点内直挂总线的 DDR 池容量不设上限，标称每卡 480 GB/s。GPU 单向口只有 400 GB/s，池的访问取两者里较慢的，80% 后 320 GB/s。换入发生在注意力阶段，专家 combine 发生在 MoE 阶段，两段各用满这条 320 GB/s。"
         "本页的池带宽按每卡，不把 480 GB/s 理解成 128 卡共享。"
@@ -765,13 +768,13 @@ def main():
     par_rows = [
         ["", "Attention", "MoE"],
         ["并行", "机内 TP=8\n16 台机器做 DP=16", "超节点 EP=128\n一份模型铺满 128 卡"],
-        ["通信域", "8 卡 fullmesh\n有效 40 GB/s", "128 卡 D2D，有效 320 GB/s\nKV 走参数面，有效 40 GB/s"],
+        ["通信域", "8卡 fullmesh，7链路并发\nAllReduce 有效 280 GB/s", "128卡 D2D，有效320 GB/s\nKV走参数面，有效40 GB/s"],
         [
             "每卡权重",
             f"注意力 19.35 GB / 8\n= {ATTN / TP / 1e9:.2f} GB FP8",
             f"路由专家 {E / N:.1f} 个，{ROUTED / N / 1e9:.1f} GB FP4\n共享专家 {SHARED / 1e9:.2f} GB，每卡一份",
         ],
-        ["本阶段角色", "Attention 取计算、HBM、AR 的瓶颈\n这一点由 AR 限制", f"dispatch + 融合专家 kernel + combine\n到这个长度合计 {sec(p['moe'])}"],
+        ["本阶段角色", "Attention 取计算、HBM、AR 的瓶颈\n按实际最长通路决定", f"dispatch + 融合专家 kernel + combine\n到这个长度合计 {sec(p['moe'])}"],
     ]
     add_table(
         s2,
@@ -831,7 +834,7 @@ def main():
         ["现算 token", "批 × 输入 × 0.02", fmt_tok(p4["Q"]), fmt_tok(p1m["Q"])],
         [
             "机内 allreduce",
-            "每组现算 token × 7168 × 2 字节\n61 层 × 2×7/8 / 40 GB/s",
+            "每组现算 token × 7168 × 2 字节\n61 层 × 2×7/8 / 280 GB/s",
             sec(p4["t_ar"]),
             sec(p1m["t_ar"]),
         ],
@@ -930,7 +933,7 @@ def main():
     step4 = [
         ["笔", "白话", "时间"],
         ["Attn kernel", f"max(HBM {d10['t_hbm']*1e3:.2f}, 计算 {d10['t_ca']*1e3:.2f})", ms2(max(d10["t_hbm"], d10["t_ca"]))],
-        ["AR", f"每组 {d10['toks']} 条；61 层 ring\n不假设与 kernel 重叠", ms2(d10["t_ar"])],
+        ["AR", f"每组 {d10['toks']} 条；61层 fullmesh\n7链路并发，不与kernel重叠", ms2(d10["t_ar"])],
         ["MoE 通信", "最忙卡 dispatch + combine\n两个方向分别统计", ms2(d10["t_ep"])],
         ["专家 kernel", f"max(读权重 {d10['tw']*1e3:.2f}, GEMM {d10['t_cm']*1e3:.2f})", ms2(max(d10["tw"], d10["t_cm"]))],
         ["相加", f"Attention {d10['t_attn']*1e3:.2f} + MoE {d10['t_moe']*1e3:.2f}", ms2(d10["t"])],
@@ -960,7 +963,7 @@ def main():
         "Attention = SWAP + max(HBM, compute) + AR。MoE = dispatch + max(weight, GEMM) + combine。两段相加。"
         f"命中率 = 1 − exp(−6×{bs10} / 2469) = {d10['frac']:.4f}。最忙卡激活专家 {d10['e_hot']:.3f}。"
         f"读权重 ({d10['e_hot']:.3f}×{EXPERT_GB:.3f} GB + {SHARED/1e9:.3f} GB) / 3.20 TB/s = {d10['tw']*1e3:.3f} ms。"
-        f"机内 allreduce：ceil({bs10}/16) = {d10['toks']} 条，每条 7168×2 字节，环上每层 2×7/8，61 层除以 40 GB/s = {d10['t_ar']*1e3:.3f} ms。"
+        f"机内 allreduce：ceil({bs10}/16) = {d10['toks']} 条，每条7168×2字节，每层通信量2×7/8，61层除以280 GB/s = {d10['t_ar']*1e3:.3f} ms。"
         f"Attention {d10['t_attn']*1e3:.3f} ms，MoE {d10['t_moe']*1e3:.3f} ms，合计 {d10['t']*1e3:.3f} ms。{bs10+1} 条是 {decode(bs10+1, 4096)['t']*1e3:.3f} ms。"
         f"专家计算 {d10['t_cm']*1e3:.3f} ms，EP 双向 {d10['t_ep']*1e3:.3f} ms。注意力计算 {d10['t_ca']*1e3:.3f} ms，HBM {d10['t_hbm']*1e3:.3f} ms。"
         f"{span10} 的全局批都是 {bs10}，KV 全在 HBM。"
@@ -985,13 +988,13 @@ def main():
         ["并行", f"仍是 TP=8，DP=16\n{bs30} / 16 = {d30['toks']} 条 / 组", "仍是 EP=128\n每卡 19.3 个专家全醒"],
         ["通信", "AR 在融合 kernel 后单独加\n这一档不能隐藏", f"dispatch + combine 走 320 GB/s\n合计 {ms2(d30['t_ep'])}"],
         ["访存", "短输入全在 HBM\n放不下走每卡内存池 320 GB/s", f"{ROUTED/N/1e9:.1f} GB 路由 + {SHARED/1e9:.2f} GB 共享\n/ 3.20 TB/s = {ms2(d30['tw'])}"],
-        ["计算", f"注意力计算 {ms2(d30['t_ca'])}\n短于 allreduce", f"每专家约 {d30['tok']:.1f} token\n16 行砖，效率 {d30['ue']*100:.0f}%，{ms2(d30['t_cm'])}"],
+        ["计算", f"注意力计算 {ms2(d30['t_ca'])}\n与HBM取大后再加AR", f"每专家约 {d30['tok']:.1f} token\n16 行砖，效率 {d30['ue']*100:.0f}%，{ms2(d30['t_cm'])}"],
     ]
     add_table(s5, 0.42, 1.78, [1.15, 2.55, 2.70], par5, [0.28, 0.58, 0.58, 0.62, 0.58], ["head", "body", "key", "body", "body"], size=12)
     step5 = [
         ["笔", "白话", "时间"],
         ["Attn kernel", f"max(HBM {d30['t_hbm']*1e3:.2f}, 计算 {d30['t_ca']*1e3:.2f})", ms2(max(d30["t_hbm"], d30["t_ca"]))],
-        ["AR", f"每组 {d30['toks']} 条；61 层 ring\n不假设与 kernel 重叠", ms2(d30["t_ar"])],
+        ["AR", f"每组 {d30['toks']} 条；61层 fullmesh\n7链路并发，不与kernel重叠", ms2(d30["t_ar"])],
         ["MoE 通信", "最忙卡 dispatch + combine\n两个方向分别统计", ms2(d30["t_ep"])],
         ["专家 kernel", f"max(读权重 {d30['tw']*1e3:.2f}, GEMM {d30['t_cm']*1e3:.2f})", ms2(max(d30["tw"], d30["t_cm"]))],
         ["相加", f"Attention {d30['t_attn']*1e3:.2f} + MoE {d30['t_moe']*1e3:.2f}", ms2(d30["t"])],
@@ -1020,19 +1023,19 @@ def main():
         "30 毫秒用的切分与 10 毫秒相同：TP=8，DP=16，EP=128，128 卡一份副本。"
         f"BS={bs30} 时命中率 {d30['frac']:.4f}，最忙卡激活 {d30['e_hot']:.3f} 个专家。"
         f"读权重 ({ROUTED/N/1e9:.2f} GB + {SHARED/1e9:.2f} GB) / 3.20 TB/s = {d30['tw']*1e3:.3f} ms。"
-        f"机内 allreduce：ceil({bs30}/16) = {d30['toks']} 条，环上每层 2×7/8，61 层，除以 40 GB/s = {d30['t_ar']*1e3:.3f} ms。"
+        f"机内 allreduce：ceil({bs30}/16) = {d30['toks']} 条，每层通信量2×7/8，61层，除以280 GB/s = {d30['t_ar']*1e3:.3f} ms。"
         f"Attention {d30['t_attn']*1e3:.3f} ms，MoE {d30['t_moe']*1e3:.3f} ms，合计 {d30['t']*1e3:.3f} ms。{bs30+1} 条是 {decode(bs30+1, 4096)['t']*1e3:.3f} ms。"
         f"EP 双向 {d30['t_ep']*1e3:.3f} ms，专家计算 {d30['t_cm']*1e3:.3f} ms，效率 {d30['ue']:.3f}。注意力计算 {d30['t_ca']*1e3:.3f} ms。"
         f"显存：每卡 96 − {ROUTED/N/1e9:.2f} − {SHARED/1e9:.2f} − {ATTN/TP/1e9:.2f} − 6 = {(HBM_CAP - ROUTED/N - SHARED - ATTN/TP - RESERVE)/1e9:.2f} GB，128 卡共 {ROOM/1e12:.2f} TB。"
         "HBM 放不下的 KV 走每卡总线内存池。标称 480 GB/s，被 3.2 Tb/s 的口卡住，有效 320 GB/s，容量不设上限。H2D 只在 prefill。"
-        f"256K、全局批 {by_len[262144]['b30']} 时仍全在 HBM。"
+        f"256K、全局批 {by_len[262144]['b30']} 时已有 {by_len[262144]['d30']['spill']*100:.1f}% KV 在池中，池上读 {by_len[262144]['d30']['t_pool']*1e3:.2f} ms。"
         f"512K 降到 {by_len[524288]['b30']}，池上读 {by_len[524288]['d30']['t_pool']*1e3:.2f} ms。1M 降到 {by_len[1048576]['b30']}，{s_label} 降到 {extra[s_show]['b30']}。"
         f"4K、输出 512、命中 98%：Prefill {prefill_rps:.1f} 请求/秒。10 毫秒 Decode {dec10_rps:.1f} 请求/秒，P:D ≈ 1:{pd10:.1f}。30 毫秒 Decode {dec30_rps:.1f} 请求/秒，P:D ≈ 1:{pd30:.1f}。"
     )
 
     # ----- slide 6 -----
     s6 = prs.slides.add_slide(blank)
-    chrome(s6, 6, f"10 毫秒这些长度都不进池；256K 的 30 毫秒仍是 {bs30}", "Decode    ·    不同输入下的最大全局批")
+    chrome(s6, 6, "10 毫秒都不进池；30 毫秒从 256K 开始使用 DDR 池", "Decode    ·    不同输入下的最大全局批")
     banner(
         s6,
         0.92,
@@ -1075,7 +1078,7 @@ def main():
         1.72,
         f"10 毫秒在 {span10} 都是 {bs10}，全在 HBM。短输入 Attention {d10['t_attn']*1e3:.2f} 毫秒，MoE {d10['t_moe']*1e3:.2f} 毫秒。"
         f"1M 降到 {by_len[1048576]['b10']}，{s_label} 是 {extra[s_show]['b10']}，仍然全在 HBM。\n"
-        f"30 毫秒短输入为 {bs30}。256K 为 {by_len[262144]['b30']}，仍全在 HBM；"
+        f"30 毫秒短输入为 {bs30}。256K 为 {by_len[262144]['b30']}，已有 {by_len[262144]['d30']['spill']*100:.1f}% KV 在池中；"
         f"Attention {by_len[262144]['d30']['t_attn']*1e3:.1f} 毫秒，MoE {by_len[262144]['d30']['t_moe']*1e3:.1f} 毫秒。"
         f"512K 降到 {by_len[524288]['b30']}，1M 为 {by_len[1048576]['b30']}，{s_label} 为 {extra[s_show]['b30']}。\n"
         f"Prefill 的 10 秒全局批在第 3 页：4K 为 {p4['bs']}，1M 为 {p1m['bs']}。"
@@ -1401,7 +1404,7 @@ def main():
         ["溢出比例", "f = max(0，(BS × KV 存量 − 5.72 TB) / (BS × KV 存量))", "池容量不设上限"],
         ["SWAP", "f × 每卡 KV 读量 / 320 GB/s", "DDR 池 → D2D → HBM；必须先完成"],
         ["Attention kernel", "max((全部 KV + 2.42 GB 权重) / 3.20 TB/s，FLOP / 340.2 T)", "换入 KV 仍从 HBM 再读；kernel 内访存/计算重叠"],
-        ["AR", "61 × 2×7/8 × n×7168×2 / 40 GB/s", "没有实测融合，单独加在 kernel 后面"],
+        ["AR", "61 × 2×7/8 × n×7168×2 / 280 GB/s", "8卡fullmesh七链路并发；单独加在kernel后"],
         ["Decode Attention", "SWAP + Attention kernel + AR", "三段存在业务依赖"],
         ["Decode MoE", "dispatch + max(专家权重，专家 GEMM) + combine", "EP 两个方向分别统计；最忙卡、逐专家 padding"],
         ["最终", "TPOT = Decode Attention + Decode MoE + fixed", "固定开销未计入，结果是数据面理论上限"],
@@ -1477,7 +1480,7 @@ def main():
 
     # ----- slide 13: Decode HBM pies -----
     s13 = prs.slides.add_slide(blank)
-    chrome(s13, 13, "Decode：30 毫秒摸高时，512K 起把 HBM KV 房间占满", "HBM 容量    ·    TPOT ≤ 30 毫秒")
+    chrome(s13, 13, "Decode：30 毫秒摸高时，256K 起把 HBM KV 房间占满", "HBM 容量    ·    TPOT ≤ 30 毫秒")
     banner(
         s13,
         0.92,
@@ -1486,7 +1489,7 @@ def main():
     )
     d_pies = [
         (4096, by_len[4096]["b30"], "4K"),
-        (524288, by_len[524288]["b30"], "512K"),
+        (262144, by_len[262144]["b30"], "256K"),
         (1048576, by_len[1048576]["b30"], "1M"),
     ]
     for x, (s, bs, label) in zip((0.42, 4.72, 9.02), d_pies):
@@ -1499,7 +1502,7 @@ def main():
     solid(note, GOLD_BG)
     textbox(
         s13, 0.58, 6.20, 12.18, 0.78,
-        f"30 毫秒：512K / 1M 的最忙卡各有 {hbm_pie_values(d_pies[1][1], d_pies[1][0])[2]:.2f} / "
+        f"30 毫秒：256K / 1M 的最忙卡各有 {hbm_pie_values(d_pies[1][1], d_pies[1][0])[2]:.2f} / "
         f"{hbm_pie_values(d_pies[2][1], d_pies[2][0])[2]:.2f} GB KV 在 DDR 池。"
         f"10 毫秒批更小，4K / 512K / 1M 的 HBM KV 仅 {d10_4[0]:.2f} / {d10_512[0]:.2f} / {d10_1m[0]:.2f} GB，均不进池。",
         12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,

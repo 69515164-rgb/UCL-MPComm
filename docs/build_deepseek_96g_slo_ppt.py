@@ -311,7 +311,7 @@ def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0, activation=0.0, spl
     chart.plots[0].has_data_labels = True
     labels = chart.plots[0].data_labels
     labels.position = XL_LABEL_POSITION.OUTSIDE_END
-    labels.show_category_name = True
+    labels.show_category_name = not split_weights
     labels.show_percentage = True
     labels.show_value = False
     labels.number_format = "0.0%"
@@ -322,15 +322,16 @@ def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0, activation=0.0, spl
     textbox(slide, x, 1.38, 3.86, 0.30, title, 15, True, NAVY, PP_ALIGN.CENTER)
     if split_weights:
         summary = (
-            f"BS {bs}  专家 {expert_weights:.2f} GB  Attention {attention_weights:.2f} GB\n"
-            f"激活 {activation:.2f} GB  ｜  KV {kv_hbm:.2f} GB  ｜  空闲 {max(free, 0.0):.2f} GB"
+            f"BS {bs}\n"
+            f"专家 {expert_weights:.2f}  Attention {attention_weights:.2f}  激活 {activation:.2f} GB\n"
+            f"预留 {reserve:.0f}  KV {kv_hbm:.2f}  空闲 {max(free, 0.0):.2f} GB"
         )
     else:
         summary = (
             f"BS {bs}    权重 {weights:.2f} GB    预留 {reserve:.0f} GB\n"
             f"HBM KV {kv_hbm:.2f} GB  ｜  空闲 {max(free, 0.0):.2f} GB"
         )
-    textbox(slide, x, 5.12, 3.86, 0.58, summary, 11, False, INK, PP_ALIGN.CENTER)
+    textbox(slide, x, 5.04, 3.86, 0.72, summary, 10 if split_weights else 11, False, INK, PP_ALIGN.CENTER)
     pool_text = f"DDR 池 KV（图外）：{pool:.2f} GB / 卡" if pool > 0 else "DDR 池 KV（图外）：0"
     textbox(slide, x, 5.72, 3.86, 0.28, pool_text, 11, pool > 0, GOLD if pool > 0 else MUTED, PP_ALIGN.CENTER)
 

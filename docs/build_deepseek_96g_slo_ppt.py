@@ -242,7 +242,7 @@ def add_table(slide, x, y, widths, rows, heights, kinds, size=12):
     return shape
 
 
-def chrome(slide, page, title, kicker, total=13):
+def chrome(slide, page, title, kicker, total=14):
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.08))
     solid(bar, ACCENT)
     textbox(slide, 0.42, 0.16, 10.6, 0.28, kicker, 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
@@ -1514,6 +1514,66 @@ def main():
             f"{label}: BS={bs}, hbm_kv={hbm_pie_values(bs, s)[0]:.3f}GB, "
             f"pool={hbm_pie_values(bs, s)[2]:.3f}GB, free={hbm_pie_values(bs, s)[1]:.3f}GB."
             for s, bs, label in d_pies
+        )
+    )
+
+    # ----- slide 14: Prefill MoE stage breakdown -----
+    s14 = prs.slides.add_slide(blank)
+    chrome(s14, 14, "Prefill MoE：长输入的摸高批下降，MoE 耗时随总现算 token 下降", "Prefill    ·    MoE 分阶段    ·    KV 命中 98%")
+    banner(
+        s14,
+        0.92,
+        "每行采用该输入长度在 TTFT≤10秒下的最大全局批。MoE = dispatch + max(专家权重读取, 专家GEMM) + combine。",
+        size=13,
+    )
+    moe_head = ["输入", "10秒全局批", "现算token", "dispatch", "读专家权重", "专家GEMM", "combine", "MoE合计"]
+    moe_rows = []
+    for row in pb:
+        moe_rows.append([
+            fmt_len(row["S"]),
+            str(row["bs"]),
+            fmt_tok(row["Q"]),
+            sec(row["t_dispatch"]),
+            ms(row["t_we"]),
+            sec(row["t_gemm"]),
+            sec(row["t_combine"]),
+            sec(row["t_moe"]),
+        ])
+    add_table(
+        s14,
+        0.42,
+        1.50,
+        [0.90, 1.25, 1.45, 1.45, 1.55, 1.55, 1.45, 1.90],
+        [moe_head] + moe_rows,
+        [0.38] + [0.43] * len(moe_rows),
+        ["head"] + ["key" if row["S"] in (4096, 1048576) else "body" for row in pb],
+        size=12,
+    )
+    note = s14.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.30), Inches(12.5), Inches(1.56))
+    solid(note, GOLD_BG)
+    textbox(
+        s14,
+        0.58,
+        5.36,
+        12.18,
+        1.44,
+        f"4K：dispatch {p4['t_dispatch']:.2f} 秒 + max(权重 {p4['t_we']*1e3:.1f} 毫秒，GEMM {p4['t_gemm']:.2f} 秒) "
+        f"+ combine {p4['t_combine']:.2f} 秒 = {p4['t_moe']:.2f} 秒。\n"
+        f"1M：dispatch {p1m['t_dispatch']:.2f} 秒 + max(权重 {p1m['t_we']*1e3:.1f} 毫秒，GEMM {p1m['t_gemm']:.2f} 秒) "
+        f"+ combine {p1m['t_combine']:.2f} 秒 = {p1m['t_moe']:.2f} 秒。\n"
+        "所有长度都已激活每卡全部路由专家，权重读取稳定在13.4毫秒并被GEMM完全隐藏；主要开销是专家GEMM，其次是两次EP通信。",
+        13,
+        False,
+        GOLD,
+        anchor=MSO_ANCHOR.MIDDLE,
+    )
+    s14.notes_slide.notes_text_frame.text = (
+        "Prefill MoE按最忙EP卡统计。dispatch和combine分别计算，不能互相重叠；"
+        "专家权重读取与GEMM位于融合kernel内，取二者最大值。"
+        + " ".join(
+            f"{fmt_len(row['S'])}: BS={row['bs']}, Q={row['Q']:.0f}, dispatch={row['t_dispatch']:.6f}s, "
+            f"weight={row['t_we']:.6f}s, gemm={row['t_gemm']:.6f}s, combine={row['t_combine']:.6f}s, total={row['t_moe']:.6f}s."
+            for row in pb
         )
     )
 

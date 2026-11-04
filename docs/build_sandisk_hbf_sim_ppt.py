@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """One slide on Sandisk's August 13, 2026 Investor Day HBF simulation.
 
-The comparison freezes GPU performance, on-package bandwidth, GPU-to-GPU
-bandwidth, and the LPDDR spill path. Capacity is the only difference:
-4 TB HBF versus 192 GB HBM. Claims are Sandisk's internal test, not a
-third-party silicon measurement.
+Pages 87 and 88 are the published slides, placed as images. The reading
+under them is ours: capacity is the only input that differs.
 """
 
 from __future__ import annotations
@@ -33,7 +31,10 @@ PALE = "E7F3F2"
 GOLD_BG = "F8F1E4"
 GOLD = "7A541C"
 
-OUT = Path(__file__).resolve().parent / "sandisk-hbf-sim.pptx"
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / "sandisk-hbf-sim.pptx"
+PAGE_87 = ROOT / "images" / "sandisk" / "investor-day-p-87.png"
+PAGE_88 = ROOT / "images" / "sandisk" / "investor-day-p-88.png"
 
 
 def rgb(value):
@@ -168,115 +169,70 @@ def main():
     prs.core_properties.title = "Sandisk HBF：容量带来的 GPU 规模和成本"
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.08))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.06))
     solid(bar, ACCENT)
     textbox(
         slide,
-        0.36,
-        0.14,
-        12.6,
-        0.24,
-        "Sandisk Investor Day    2026-08-13    ·    内部仿真    ·    HBF Only 对 HBM Only",
+        0.32,
+        0.10,
+        9.6,
+        0.22,
+        "原图取自 Sandisk Investor Day 2026-08-13 第 87、88 页    ·    内部仿真",
         12,
         True,
         ACCENT,
     )
-    textbox(slide, 0.36, 0.38, 12.6, 0.40, "容量单独把 GPU 规模拉开：最少 8 张降到 1 张", 24, True, NAVY)
+    textbox(slide, 0.32, 0.32, 12.7, 0.34, "容量单独把 GPU 规模拉开：最少 8 张降到 1 张", 22, True, NAVY)
+
+    # Source pages are 960×540. Keep that ratio.
+    img_w, img_h = 6.22, 6.22 * 540 / 960
+    y_img = 1.02
+    slide.shapes.add_picture(str(PAGE_87), Inches(0.36), Inches(y_img), Inches(img_w), Inches(img_h))
+    slide.shapes.add_picture(str(PAGE_88), Inches(0.36 + img_w + 0.16), Inches(y_img), Inches(img_w), Inches(img_h))
+    cap_y = y_img + img_h + 0.02
+    textbox(slide, 0.36, cap_y, img_w, 0.20, "第 87 页  仿真配置", 11, False, MUTED, PP_ALIGN.CENTER)
+    textbox(slide, 0.36 + img_w + 0.16, cap_y, img_w, 0.20, "第 88 页  token 输出和两套倍数", 11, False, MUTED, PP_ALIGN.CENTER)
 
     cards = [
-        (PALE, TEAL, "最少可运行配置", "8×", "1 张 HBF 对 8 张 HBM\nSandisk 称为 capex efficiency"),
-        (GOLD_BG, GOLD, "同样的 token 输出", "2×", "4 张 HBF = 8 张 HBM\nSandisk 称为 GPU efficiency"),
-        (SOFT, NAVY, "仿真里唯一的变量", "21×", "4 TB 对 192 GB\n算力、带宽、溢出口都相同"),
+        (
+            "唯一拉开结果的是容量",
+            "算力 4.5 PFLOPS、片上 12.8 TB/s、卡间 900 GB/s、溢出 128 GB/s，两边相同。不同的是 4 TB 对 192 GB，约 21 倍。4 TB 放下 960 GB 后还剩约 3 TB。",
+        ),
+        (
+            "右图里的 8× 和 2×",
+            "8× 是最少能跑起来的卡数，1 张对 8 张。2× 是同样 token 输出：绿线 4 张 HBF 与蓝线 8 张 HBM 叠在一起。黄线是 1 张，能跑，输出更低。",
+        ),
+        (
+            "卡数由容量决定",
+            "960 GB 权重正好 5 张 192 GB，最少配置仍是 8 张。溢出口是片上带宽的 1/100，KV 离开封装后 token 被卡住。每次约激活 35B，多出的卡在为容量值班。",
+        ),
     ]
-    for i, (fill, num_color, cap, num, body) in enumerate(cards):
-        x = 0.36 + i * 4.30
-        card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(0.90), Inches(4.16), Inches(1.42))
-        solid(card, fill, LINE)
-        textbox(slide, x + 0.16, 0.96, 3.84, 0.22, cap, 12, True, MUTED)
-        textbox(slide, x + 0.16, 1.16, 3.84, 0.42, num, 26, True, num_color)
-        textbox(slide, x + 0.16, 1.60, 3.84, 0.60, body, 13, False, INK, anchor=MSO_ANCHOR.TOP)
-
-    textbox(slide, 0.36, 2.46, 6.2, 0.26, "两边锁死的条件", 14, True, NAVY)
-    add_table(
-        slide,
-        0.36,
-        2.76,
-        [1.70, 4.35],
-        [
-            ["项目", "HBF 与 HBM 取同一值"],
-            ["单卡算力", "4.5 PFLOPS"],
-            ["片上带宽", "12.8 TB/s"],
-            ["卡间带宽", "900 GB/s"],
-            ["KV 溢出", "128 GB/s，接到 LPDDR"],
-            ["模型", "Qwen3-480B-A35B"],
-            ["权重", "960 GB，BF16"],
-            ["负载", "多轮 agent，到达间隔对数正态"],
-        ],
-        0.36,
-    )
-
-    read = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.70), Inches(2.76), Inches(6.26), Inches(2.88))
-    solid(read, SOFT, LINE)
-    textbox(slide, 6.88, 2.88, 5.92, 0.26, "这组数字在说什么", 14, True, NAVY)
-    textbox(
-        slide,
-        6.88,
-        3.20,
-        5.92,
-        2.28,
-        "960 GB 权重正好是 5 张 192 GB。\n"
-        "仿真给出的最少配置却是 8 张，\n"
-        "只把权重大切开还不够这次多轮负载。\n"
-        "4 TB 放下 960 GB 后还剩约 3 TB，\n"
-        "一张卡就能留下权重和 KV。\n"
-        "溢出口 128 GB/s，是片上带宽的 1/100。\n"
-        "HBM 的 KV 离开封装后，token 输出被这条口卡住。\n"
-        "480B 里每次约激活 35B。算力按小的那份走，\n"
-        "显存要放下全部专家。多出的卡是在为容量值班。",
-        13,
-        False,
-        INK,
-        anchor=MSO_ANCHOR.TOP,
-    )
-
-    note = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.36), Inches(5.82), Inches(12.60), Inches(1.22))
-    solid(note, PALE, LINE)
-    textbox(
-        slide,
-        0.52,
-        5.94,
-        12.28,
-        0.98,
-        "8× 是最少能跑起来的卡数，1 张对 8 张。2× 是同样 token 输出的卡数，4 张对 8 张。两者都是 GPU 张数。\n"
-        "产品口径另写容量是 HBM 的 8 到 16 倍、成本相近。这次仿真用的容量比是 4 TB / 192 GB，约 21 倍，高于那个产品口径。\n"
-        "比较的是 HBF Only。算力和读带宽被设成与 HBM 相同，所以收益来自容量把权重和 KV 留在封装里。",
-        13,
-        False,
-        INK,
-        anchor=MSO_ANCHOR.TOP,
-    )
+    card_y = cap_y + 0.24
+    card_h = 1.78
+    for i, (title, body) in enumerate(cards):
+        x = 0.32 + i * 4.32
+        card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(card_y), Inches(4.18), Inches(card_h))
+        solid(card, PALE if i == 1 else SOFT, LINE)
+        textbox(slide, x + 0.14, card_y + 0.08, 3.90, 0.28, title, 13, True, NAVY, anchor=MSO_ANCHOR.TOP)
+        textbox(slide, x + 0.14, card_y + 0.40, 3.90, card_h - 0.50, body, 13, False, INK, anchor=MSO_ANCHOR.TOP)
 
     textbox(
         slide,
-        0.36,
-        7.14,
-        12.6,
-        0.26,
-        "来源：Sandisk 2026 Investor Day，HBF vs HBM Simulation。标注 Based on internal testing。未公布 token/s 坐标。",
+        0.32,
+        card_y + card_h + 0.06,
+        12.7,
+        0.22,
+        "两套倍数都是 GPU 张数。产品口径另写容量为 HBM 的 8 到 16 倍、成本相近。比较的是 HBF Only，标注 Based on internal testing。",
         11,
         False,
         MUTED,
     )
 
     slide.notes_slide.notes_text_frame.text = (
-        "Sandisk Investor Day, August 13, 2026. Slides HBF vs HBM Simulation Configurations "
-        "and HBF vs HBM Performance Comparison for AI Inference.\n"
-        "Locked: 4.5 PFLOPS, 12.8 TB/s, 900 GB/s GPU-to-GPU, 128 GB/s LPDDR spill.\n"
-        "Capacity: 4 TB HBF vs 192 GB HBM. Model Qwen3-480B-A35B, 960 GB BF16.\n"
-        "8x capex efficiency = minimum configuration, 1 HBF GPU vs 8 HBM GPUs.\n"
-        "2x GPU efficiency = 4 HBF GPUs match the token output of 8 HBM GPUs.\n"
-        "960/192 = 5 exactly for weights alone. 4 TB - 0.96 TB = 3.04 TB headroom. "
-        "12.8 TB/s / 128 GB/s = 100. Active parameters are the model's published 35B."
+        "Images are pages 87 and 88 of the Sandisk Investor Day 2026 presentation, "
+        "13 August 2026, 98 pages, 960×540 pt.\n"
+        "8x is the minimum configuration. 2x is equal token output. "
+        "The chart axis is tokens per second versus elapsed time; this slide does not read numbers off that axis."
     )
     prs.save(OUT)
     print(OUT)

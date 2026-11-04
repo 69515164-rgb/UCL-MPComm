@@ -1,0 +1,84 @@
+# 96 GB / 486 T、256 卡超节点。
+# 对应 deepseek-96g-256p-slo.pptx。
+# 模型见 deepseek-10t-model.yaml。与 128 卡档共用 GPU、机器和链路标称值。
+# 差别是超节点 256 卡，以及 Decode 的 DDR 池换入走 D2D，不被 H2D 截断。
+#
+# 带宽字段的单位是字节/秒。带 _bps 的是链路标称比特率。
+# 1 GB = 10^9 字节。有效值 = 标称 × 效率。
+
+name: cluster-96g-256p
+kind: cluster
+model: deepseek-10t
+
+gpu:
+  count_per_replica: 256
+  peak_flops: 4.86e14
+  hbm_bytes: 96000000000
+  hbm_bandwidth_Bps: 4.0e12
+
+machine:
+  gpus: 8
+  ddr5_bytes: 768000000000
+  ddr5_bandwidth_Bps: 1.2888e12
+
+fabric:
+  # 每卡单向。
+  h2d_Bps: 64000000000
+  d2d_bps: 3.2e12
+  # 机内 8 卡 fullmesh。每卡连另外 7 卡，每条链路 400 Gb/s，7 条同时可用。
+  fullmesh_gpus: 8
+  fullmesh_link_bps: 4.0e11
+  fullmesh_peer_links: 7
+  # 参数面是每卡一条 400 Gb/s，不是 fullmesh 聚合。
+  parameter_plane_bps: 4.0e11
+  # 超节点内直挂 DDR 池。容量不设上限。标称是每卡访问带宽。
+  ddr_pool_bandwidth_Bps: 480000000000
+  ddr_pool_capacity: unlimited
+
+efficiency:
+  compute: 0.70
+  memory: 0.80
+  communication: 0.80
+
+# 计时实际使用的有效速率。
+effective:
+  peak_flops: 3.402e14
+  hbm_bandwidth_Bps: 3.2e12
+  # 3.2 Tb/s / 8 × 0.80
+  d2d_Bps: 320000000000
+  # min(D2D 口 400 GB/s, 7 × 50 GB/s) × 0.80。聚合峰值 350 GB/s，不再被 D2D 口截断。
+  fullmesh_Bps: 280000000000
+  parameter_plane_Bps: 40000000000
+  h2d_Bps: 51200000000
+  # 1288.8 GB/s × 0.80，再除以 8 卡。
+  ddr5_bandwidth_Bps: 1031040000000
+  ddr5_per_gpu_Bps: 128880000000
+  ddr5_per_gpu_bytes: 96000000000
+  # Decode 换入：min(池标称 480 GB/s, D2D 口 400 GB/s) × 0.80。不走 H2D。
+  ddr_pool_to_gpu_Bps: 320000000000
+
+placement:
+  supernode_gpus: 256
+  replicas_elastic: true
+  # 一条请求不跨副本。加减 Prefill / Decode 副本不改变单条 TTFT、TPOT。
+  attention_tp: 8
+  attention_dp: 32
+  moe_ep: 256
+  experts_per_gpu: 9.64453125
+  # 系统预留，覆盖 runtime、碎片和未单列的临时区。
+  hbm_reserve_bytes: 6000000000
+  # 路由 FP4 / 256 + 共享 FP8 + 注意力 FP8 / TP
+  weight_bytes_per_gpu: 25880603184
+  kv_bytes_per_gpu: 64119396816
+  kv_bytes_per_replica: 16414565584896
+
+traffic:
+  moe_dispatch_combine: d2d
+  attention_allreduce: fullmesh
+  # AllReduce 字节仍按 ring 的 2×(TP-1)/TP 计，带宽用上面的 fullmesh 聚合。
+  prefix_fetch: parameter_plane
+  prefill_to_decode: parameter_plane
+  prefill_host_input: h2d
+  # 本档的 DDR 池换入受 D2D 口约束，不走 H2D。
+  decode_kv_swap: d2d
+  hbm_resident_read: hbm

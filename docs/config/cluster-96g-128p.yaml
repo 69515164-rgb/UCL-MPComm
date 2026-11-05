@@ -12,32 +12,32 @@ model: deepseek-10t
 gpu:
   count_per_replica: 128
   # 非张量算力，标称 486 T。原计时模型的 Attention 与专家 GEMM 仍用这一档。
-  non_tensor_peak_flops: 4.86e14
-  peak_flops: 4.86e14
+  non_tensor_peak_flops: 4.86e+14
+  peak_flops: 4.86e+14
   hbm_bytes: 96000000000
   # HBM 标称带宽不变，仍是 4 TB/s。
-  hbm_bandwidth_Bps: 4.0e12
+  hbm_bandwidth_Bps: 4.0e+12
   tensor_core:
     # 新增张量计算核。
     dtype: fp8
-    peak_flops: 1.08e14
+    peak_flops: 1.08e+14
     compute_efficiency: 0.60
 
 machine:
   gpus: 8
   ddr5_bytes: 768000000000
-  ddr5_bandwidth_Bps: 1.2888e12
+  ddr5_bandwidth_Bps: 1.2888e+12
 
 fabric:
   # 每卡单向。
   h2d_Bps: 64000000000
-  d2d_bps: 3.2e12
+  d2d_bps: 3.2e+12
   # 机内 8 卡 fullmesh。每卡连另外 7 卡，每条链路 400 Gb/s，7 条同时可用。
   fullmesh_gpus: 8
-  fullmesh_link_bps: 4.0e11
+  fullmesh_link_bps: 4.0e+11
   fullmesh_peer_links: 7
   # 参数面是每卡一条 400 Gb/s，不是 fullmesh 聚合。
-  parameter_plane_bps: 4.0e11
+  parameter_plane_bps: 4.0e+11
   # 超节点内直挂 DDR 池。容量不设上限。标称是每卡访问带宽。
   ddr_pool_bandwidth_Bps: 480000000000
   ddr_pool_capacity: unlimited
@@ -56,12 +56,12 @@ efficiency:
 # 计时实际使用的有效速率。
 effective:
   # 486 × 10^12 × 0.70
-  non_tensor_flops: 3.402e14
-  peak_flops: 3.402e14
+  non_tensor_flops: 3.402e+14
+  peak_flops: 3.402e+14
   # 108 × 10^12 × 0.60
-  tensor_core_flops: 6.48e13
+  tensor_core_flops: 6.48e+13
   # 4 TB/s × 80%。HBM 标称带宽未改。
-  hbm_bandwidth_Bps: 3.2e12
+  hbm_bandwidth_Bps: 3.2e+12
   # 3.2 Tb/s / 8 × 0.80
   d2d_Bps: 320000000000
   # min(D2D 口 400 GB/s, 7 × 50 GB/s) × 0.80。聚合峰值 350 GB/s，不再被 D2D 口截断。

@@ -1,0 +1,91 @@
+# 10T DeepSeek 外推的模型假设。
+# 骨架是论文 V4-Pro（1.6T）。这一档只增加路由专家个数。
+# DeepSeek 没有发布 10T。计时重叠规则不在本文件。
+#
+# 容量按十进制：1 GB = 10^9 字节，1 TB = 10^12 字节。
+
+name: deepseek-10t
+kind: model-extrapolation
+nominal_total_params: 10000000000000
+
+baseline:
+  name: DeepSeek-V4-Pro
+  total_params: 1600000000000
+  routed_experts: 384
+  # 1.6T 减去 384 个路由专家后的其余参数：共享专家、注意力、词表、mHC、MTP。
+  other_params: 52603813888
+
+# 外推时保持不动的骨架。
+held_fixed:
+  layers: 61
+  hidden: 7168
+  expert_intermediate: 3072
+  shared_experts_per_layer: 1
+  topk_routed: 6
+  # 前 3 层按 token id 哈希路由，其后为 top-6。
+  hash_routed_layers: 3
+  active_params: 4.9e10
+  mhc_residual_expansion: 4
+  mtp_depth: 1
+  context_tokens: 1048576
+  # 论文写明未另给的设置沿用 V3。
+  vocab_size: 129280
+
+scaled:
+  # (10^13 - other_params) / params_per_expert = 2468.534，向上取整为 2469。
+  routed_experts: 2469
+
+expert:
+  # 一个路由专家是 gate、up、down 三个矩阵，61 层各一份。
+  # params_per_expert = 3 × 7168 × 3072 × 61
+  params_per_expert: 4029677568
+  params_per_expert_per_layer: 66060288
+
+# 整数回代。名义档位仍写 1.000×10^13，整数和比 10^13 多 187,772,928。
+integer_total_params: 10001877729280
+
+attention:
+  # 前 2 层 HCA，其后 CSA 与 HCA 交错，合计 30 层 CSA、31 层 HCA。
+  layout: first-2-hca-then-interleaved
+  csa_layers: 30
+  hca_layers: 31
+  csa_compress: 4
+  hca_compress: 128
+  # Decode 一步 CSA 最多选中的压缩 token 数。
+  csa_topk_compressed: 1024
+  # 576 已是 K/V 合并后的 latent，不再乘 2。
+  latent_bytes: 576
+  csa_indexer_bytes: 64
+  sliding_window_tokens: 128
+  query_heads: 128
+  head_dim: 512
+  query_compress_dim: 1536
+
+kv:
+  # b_KV = 30 × (576/4 + 64/4) + 31 × (576/128)
+  bytes_per_token: 4939.5
+  # K_window = 61 × 128 × 576。输入不短于 128 时不再随长度增长。
+  sliding_window_bytes: 4497408
+  # 存量 K(S) = bytes_per_token × S + sliding_window_bytes
+  # Decode 一步读取量只含索引、HCA 压缩历史、最多 1024 条 CSA latent 和滑窗。
+
+precision:
+  routed_expert: fp4
+  routed_expert_bytes_per_param: 0.5
+  shared_expert: fp8
+  attention: fp8
+  # TP AllReduce 的 hidden。
+  collective_hidden: bf16
+  collective_hidden_bytes: 2
+
+# 计时模型直接使用的权重字节。FP8 权重的字节数等于参数个数。
+timing_weights:
+  routed_expert_table_bytes: 4974636957696
+  shared_expert_bytes: 4029677568
+  attention_bytes: 19350000000
+
+# 已固化进 96 GB / 486 T 两套幻灯片的负载口径。冷请求与 98% 命中共用同一套模型。
+workload:
+  cold_prefix_hit: 0
+  prefix_hit: 0.98
+  # 98% 命中的 prefix 不在 Decode 节点上，拉取走参数面。

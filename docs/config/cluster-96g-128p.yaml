@@ -1,0 +1,102 @@
+# 96 GB / 486 T、128 卡超节点。
+# 对应 deepseek-96g-slo.pptx 与 deepseek-96g-slo-calculation.md。
+# 模型见 deepseek-10t-model.yaml。Decode 的 DDR 池换入走 H2D。
+#
+# 带宽字段的单位是字节/秒。带 _bps 的是链路标称比特率。
+# 1 GB = 10^9 字节。有效值 = 标称 × 效率。
+
+name: cluster-96g-128p
+kind: cluster
+model: deepseek-10t
+
+gpu:
+  count_per_replica: 128
+  # 非张量算力，标称 486 T。原计时模型的 Attention 与专家 GEMM 仍用这一档。
+  non_tensor_peak_flops: 4.86e+14
+  peak_flops: 4.86e+14
+  hbm_bytes: 96000000000
+  # HBM 标称带宽不变，仍是 4 TB/s。
+  hbm_bandwidth_Bps: 4.0e+12
+  tensor_core:
+    # 新增张量计算核。
+    dtype: fp8
+    peak_flops: 1.08e+14
+    compute_efficiency: 0.60
+
+machine:
+  gpus: 8
+  ddr5_bytes: 768000000000
+  ddr5_bandwidth_Bps: 1.2888e+12
+
+fabric:
+  # 每卡单向。
+  h2d_Bps: 64000000000
+  d2d_bps: 3.2e+12
+  # 机内 8 卡 fullmesh。每卡连另外 7 卡，每条链路 400 Gb/s，7 条同时可用。
+  fullmesh_gpus: 8
+  fullmesh_link_bps: 4.0e+11
+  fullmesh_peer_links: 7
+  # 参数面是每卡一条 400 Gb/s，不是 fullmesh 聚合。
+  parameter_plane_bps: 4.0e+11
+  # 超节点内直挂 DDR 池。容量不设上限。标称是每卡访问带宽。
+  ddr_pool_bandwidth_Bps: 480000000000
+  ddr_pool_capacity: unlimited
+
+efficiency:
+  # 非张量计算效率。原统一的 0.70 现在只落在 486 T 这一档。
+  non_tensor_compute: 0.70
+  compute: 0.70
+  # 张量计算核效率。
+  tensor_compute: 0.60
+  # 带宽利用率 80%。通信与访存都用这个数。HBM 标称带宽不改。
+  bandwidth_utilization: 0.80
+  memory: 0.80
+  communication: 0.80
+
+# 计时实际使用的有效速率。
+effective:
+  # 486 × 10^12 × 0.70
+  non_tensor_flops: 3.402e+14
+  peak_flops: 3.402e+14
+  # 108 × 10^12 × 0.60
+  tensor_core_flops: 6.48e+13
+  # 4 TB/s × 80%。HBM 标称带宽未改。
+  hbm_bandwidth_Bps: 3.2e+12
+  # 3.2 Tb/s / 8 × 0.80
+  d2d_Bps: 320000000000
+  # min(D2D 口 400 GB/s, 7 × 50 GB/s) × 0.80。聚合峰值 350 GB/s，不再被 D2D 口截断。
+  fullmesh_Bps: 280000000000
+  parameter_plane_Bps: 40000000000
+  h2d_Bps: 51200000000
+  # 1288.8 GB/s × 0.80，再除以 8 卡。
+  ddr5_bandwidth_Bps: 1031040000000
+  ddr5_per_gpu_Bps: 128880000000
+  ddr5_per_gpu_bytes: 96000000000
+  # Decode 换入：min(池 480×0.80, H2D 64×0.80, 每卡 DDR 份额)
+  ddr_pool_to_gpu_Bps: 51200000000
+
+placement:
+  supernode_gpus: 128
+  replicas_elastic: true
+  # 一条请求不跨副本。加减 Prefill / Decode 副本不改变单条 TTFT、TPOT。
+  attention_tp: 8
+  attention_dp: 16
+  moe_ep: 128
+  experts_per_gpu: 19.2890625
+  # 系统预留，覆盖 runtime、碎片和未单列的临时区。
+  hbm_reserve_bytes: 6000000000
+  # 路由 FP4 / 128 + 共享 FP8 + 注意力 FP8 / TP
+  weight_bytes_per_gpu: 45312778800
+  kv_bytes_per_gpu: 44687221200
+  kv_bytes_per_replica: 5719964313600
+
+traffic:
+  moe_dispatch_combine: d2d
+  attention_allreduce: fullmesh
+  # AllReduce 字节仍按 ring 的 2×(TP-1)/TP 计，带宽用上面的 fullmesh 聚合。
+  prefix_fetch: parameter_plane
+  prefill_to_decode: parameter_plane
+  prefill_host_input: h2d
+  # 本档要求 Decode 的外部访存进入 GPU 时走 H2D。
+  decode_kv_swap: h2d
+  hbm_resident_read: hbm

@@ -4,7 +4,7 @@
 
 公式全部写在 Markdown 代码块里，不用 LaTeX。代码块中 `#` 后面是符号注释。容量按十进制：`1 GB = 10^9 字节`，`1 TB = 10^12 字节`。幻灯片上的「秒 / 毫秒」是四舍五入后的展示值，正文同时给出未舍入的代入结果。
 
-集合通信按 Hockney 计算：每一层的 AllReduce、dispatch、combine 各付 10 微秒启动，再加字节/带宽。10 微秒是这套 8 卡 fullmesh 与 128 卡 D2D 上的规划值，不是实测。调度、kernel 启动、RMSNorm、RoPE、Router、残差、logits、sampling 和 P/D 控制面没有实测值，不并进 10 秒或 10/30 毫秒。KV 换入仍整段计入 TPOT。
+集合通信按 Hockney 计算：每一层的 AllReduce、dispatch、combine 各付 5 微秒启动，再加字节/带宽。5 微秒是这套 8 卡 fullmesh 与 128 卡 D2D 上的规划值，不是实测。调度、kernel 启动、RMSNorm、RoPE、Router、残差、logits、sampling 和 P/D 控制面没有实测值，不并进 10 秒或 10/30 毫秒。KV 换入仍整段计入 TPOT。Prefill 的拉 prefix、融合 kernel、AllReduce 串行相加，只在融合 kernel 内部对 HBM 和 FLOP 取最大。
 
 下文第 8 节以后的代入表仍是未加启动项、按 98% 命中写出的旧数。当前幻灯片以 `docs/build_deepseek_96g_slo_ppt.py` 为准。
 
@@ -405,12 +405,12 @@ Attention 的 KV、AllReduce、投影都先落在这 `n` 条上，再除以 `TP 
 每层字节 = 2 × (8 − 1) / 8 × (行数 × 7168 × 2)
          = 1.75 × 行数 × 14,336
 
-T_AR = 61 × (10 × 10^-6 + 每层字节 / 280 × 10^9)
+T_AR = 61 × (5 × 10^-6 + 每层字节 / 280 × 10^9)
 ```
 
 Prefill 的「行数」是最忙 TP 组的现算 token 行 `n × q`。Decode 的「行数」是 `n`，因为一步只生成 1 个 token。
 
-AR 不和 GEMM 重叠：Decode 把它加在 Attention kernel 后面；Prefill 把它放进 query chunk 流水，和拉取、HBM、计算四者取最大。
+AR 不和 GEMM 重叠。Decode 把它加在 Attention kernel 后面。Prefill 先把 prefix 整段拉完，融合 kernel 内部只对 HBM 和计算取最大，AR 再加在 kernel 后面。
 
 ### 7.2 Attention FLOP
 
@@ -503,11 +503,11 @@ F_gemm = (routed_rows + shared_rows) × 6 × 7168 × 3072 × 61
 T_gemm = F_gemm / PEAK
 ```
 
-EP 通信按最忙卡的 `hot` 次指派。dispatch 是 FP8，每元素 1 字节；combine 是 BF16，每元素 2 字节。两段都不能和 GEMM 重叠，彼此也不能重叠。带宽项里 combine 的字节是 dispatch 的 2 倍；每一层两边还各加 10 微秒，所以两段时间不再是 2 倍关系：
+EP 通信按最忙卡的 `hot` 次指派。dispatch 是 FP8，每元素 1 字节；combine 是 BF16，每元素 2 字节。两段都不能和 GEMM 重叠，彼此也不能重叠。带宽项里 combine 的字节是 dispatch 的 2 倍；每一层两边还各加 5 微秒，所以两段时间不再是 2 倍关系：
 
 ```
-T_dispatch = 61 × (10 × 10^-6 + hot × 7168 × 1 / 320 × 10^9)
-T_combine  = 61 × (10 × 10^-6 + hot × 7168 × 2 / 320 × 10^9)
+T_dispatch = 61 × (5 × 10^-6 + hot × 7168 × 1 / 320 × 10^9)
+T_combine  = 61 × (5 × 10^-6 + hot × 7168 × 2 / 320 × 10^9)
 ```
 
 融合 kernel 里读权重和 GEMM 取最大。kernel 前后各加一次 EP：
@@ -903,14 +903,14 @@ P:D(30 毫秒) = 5,492.8 / 683.333 = 8.04
 
 - 10 秒、10 毫秒、30 毫秒都是数据面预算被算满后的上限。
 - 生产上要先从这些预算里扣掉测得的固定开销，再重跑 `BS` 和最大 `S` 的搜索。
-- Prefill 的 query chunk 流水没有单列 fill / drain 气泡，气泡也放在未计入项。
+- Prefill 不再做跨 query chunk 流水。拉 prefix、融合 kernel、AllReduce 按顺序相加。
 
 ---
 
 ## 17. 计时规则一览
 
 ```
-TTFT Attention = max(拉 prefix, HBM, Attention 计算, AR)
+TTFT Attention = 拉 prefix + max(HBM, Attention 计算) + AR
 TTFT MoE       = dispatch(FP8) + max(读专家权重, GEMM) + combine(BF16)
 TTFT           = TTFT Attention + TTFT MoE + P→D 尾巴
 
@@ -919,15 +919,16 @@ TPOT MoE       = dispatch(FP8) + max(读专家权重, GEMM) + combine(BF16)
 TPOT           = TPOT Attention + TPOT MoE
 ```
 
-`AR`、`dispatch`、`combine` 都是 `61 × (10 微秒 + 该层字节 / 带宽)`。10 微秒不参与取最大之前的抵消：Decode 里它加在 kernel 外面；Prefill 里它先加进 `AR`、`dispatch`、`combine`，再进入原有的取最大或相加。
+`AR`、`dispatch`、`combine` 都是 `61 × (5 微秒 + 该层字节 / 带宽)`。5 微秒加在对应集合通信上，不和 kernel 取最大。
 
-允许取最大的只有两类：
+允许取最大的只有融合 kernel 内部：
 
-- Prefill 的 prefix 拉取、HBM、Attention 计算、AR，被看成跨 query chunk 的流水。
-- 同一个融合 kernel 内部的权重读取和 GEMM，以及 Decode Attention kernel 内部的 HBM 读取和计算。
+- Prefill 与 Decode 的 Attention kernel：HBM 读取和 FLOP。
+- MoE 的专家 kernel：读权重和 GEMM。
 
 必须相加的是：
 
+- Prefill 的拉 prefix、Attention kernel、AR。prefix 整段先拉完，AR 不和 kernel 重叠。
 - Attention 整段和 MoE 整段。
 - dispatch 与 combine 两个方向。dispatch 每元素 1 字节，combine 每元素 2 字节，时间不相等。
 - Decode 的 SWAP、Attention kernel、AR。SWAP 先把 KV 写进 HBM，kernel 再读 HBM，AR 不假设已经和投影融合。

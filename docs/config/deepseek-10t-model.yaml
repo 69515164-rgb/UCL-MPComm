@@ -109,20 +109,21 @@ timing_weights:
 # dispatch 与 combine 分开写：前者 FP8、每元素 1 字节，后者 BF16、每元素 2 字节。
 # 不得合并成一个相等的通信时间。
 # 例：
-#   T_Attention = max(T_pull, T_HBM, T_compute, T_AR)
-#   T_AR        = 61 × (10e-6 + 2×7/8 × 行 × 7168 × 2 / fullmesh)
-#   T_dispatch  = 61 × (10e-6 + hot × 7168 × 1 / D2D)
-#   T_combine   = 61 × (10e-6 + hot × 7168 × 2 / D2D)
+#   T_AR        = 61 × (5e-6 + 2×7/8 × 行 × 7168 × 2 / fullmesh)
+#   T_dispatch  = 61 × (5e-6 + hot × 7168 × 1 / D2D)
+#   T_combine   = 61 × (5e-6 + hot × 7168 × 2 / D2D)
 #   T_MoE       = T_dispatch + max(T_weight, T_gemm) + T_combine
+#   T_Attention = T_pull + max(T_HBM, T_compute) + T_AR
 #   TTFT        = T_Attention + T_MoE + P→D 尾巴
+#   T_TPOT      = T_SWAP + max(T_HBM, T_compute) + T_AR + T_MoE
 timing_presentation:
   ttft_table_requires_formulas_below: true
 
 # 集合通信的 Hockney 启动项。每一层、每一次集合通信付一次，再加字节/带宽。
-# 10 微秒是 8 卡 fullmesh 与 128 卡 D2D 上、空集合通信完成时间的规划值，不是实测。
+# 5 微秒是 8 卡 fullmesh 与 128 卡 D2D 上、空集合通信完成时间的规划值，不是实测。
 # AllReduce、dispatch、combine 各付一次，不与计算重叠。Prefill 与 Decode 同一口径。
 collective_latency:
-  per_collective_per_layer_s: 1.0e-5
+  per_collective_per_layer_s: 5.0e-6
 
 # 已固化进 96 GB / 486 T、128 卡幻灯片的负载口径。冷请求与 99.5% 命中共用同一套模型。
 workload:

@@ -843,7 +843,7 @@ def main():
         "单请求不跨副本。增加 Prefill 节点是多放几份 128 卡副本，提高并发，单条 TTFT 不变。"
         "冷请求没有 prefix 拉取。Attention = max(HBM, compute) + AR，MoE = dispatch + max(weight, GEMM) + combine，两段相加。"
         f"在 S={s_show:.0f}：indexer {p['idx']:.4f}s，HCA {p['hca']:.4f}s，投影 {p['proj']:.4f}s，稀疏注意力 {p['core']:.4f}s，"
-        f"Attention 计算 {p['t_attn']:.4f}s，AR {p['t_ar']:.4f}s，所以 Attention 取 {p['t_attention']:.4f}s。"
+        f"Attention 计算 {p['t_attn']:.4f}s，HBM {p['t_hbm']:.4f}s，AR {p['t_ar']:.4f}s，拉取 {p['t_pull']:.4f}s，Attention 合计 {p['t_attention']:.4f}s。"
         f"MoE {p['t_moe']:.4f}s。完整 KV 的 P-D 传输 {p['t_pd']*1e3:.2f} ms，layer-wise 发送后尾巴 {p['t_tail']*1e3:.2f} ms。"
         f"数据面合计 {p['t']:.4f}s。固定开销没有实测，不计入；生产最大长度必须再留余量。"
     )
@@ -879,7 +879,7 @@ def main():
             sec(p4["t_moe"]),
             sec(p1m["t_moe"]),
         ],
-        ["相加", "Attention 瓶颈 + 完整 MoE；P→D 尾巴为 0", sec(p4["t"]), sec(p1m["t"])],
+        ["相加", "拉 prefix + 融合 kernel + AR + MoE；P→D 尾巴为 0", sec(p4["t"]), sec(p1m["t"])],
     ]
     add_table(
         s3,
@@ -921,7 +921,7 @@ def main():
         6.66,
         12.5,
         0.28,
-        f"{HIT_LABEL} prefix 走参数面：4K 这一批拉取 {ms(p4['t_pull'])}，1M 拉取 {ms(p1m['t_pull'])}；均短于 Attention 主瓶颈。",
+        f"{HIT_LABEL} prefix 整段先拉完，加在 kernel 之前：4K 这一批 {ms(p4['t_pull'])}，1M 这一批 {ms(p1m['t_pull'])}。",
         13,
         False,
         MUTED,
@@ -1371,7 +1371,7 @@ def main():
         12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s9.notes_slide.notes_text_frame.text = (
-        "这一页是后续固化口径。TTFT 的 chunk 流水忽略显式 fill/drain 气泡，气泡和软件固定开销都放在未计入项。"
+        "这一页是后续固化口径。Prefill 不做跨 query chunk 流水，拉 prefix、融合 kernel、AR 按顺序相加。软件固定开销仍放在未计入项。"
         "Prefill attention 假设融合 kernel 有理想 tile 复用，每个 KV 字节从 HBM 读一次；没有实测 IO 放大系数。"
         "Decode 不假设输出投影与 collective 融合，AR 单独加。"
     )

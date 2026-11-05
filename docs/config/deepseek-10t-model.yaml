@@ -117,8 +117,8 @@ timing_weights:
 timing_presentation:
   ttft_table_requires_formulas_below: true
 
-# 已固化进 96 GB / 486 T 两套幻灯片的负载口径。冷请求与 98% 命中共用同一套模型。
+# 已固化进 96 GB / 486 T、128 卡幻灯片的负载口径。冷请求与 99.5% 命中共用同一套模型。
 workload:
   cold_prefix_hit: 0
-  prefix_hit: 0.98
-  # 98% 命中的 prefix 不在 Decode 节点上，拉取走参数面。
+  prefix_hit: 0.995
+  # 99.5% 命中的 prefix 不在 Decode 节点上，拉取走参数面。

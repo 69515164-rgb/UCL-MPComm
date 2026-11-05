@@ -100,6 +100,23 @@ timing_weights:
   shared_expert_bytes: 4029677568
   attention_bytes: 19350000000
 
+# 整理 TTFT 耗时表时，表格下面必须逐列标出公式和汇总方法。
+# 只看格子看不出这一列是相加、取最大，还是按哪种字节宽度除以带宽。
+# 公式写在该表正下方，不另指前面的章节。每一列一个式子，至少写明：
+#   分段有哪些
+#   哪些取最大，哪些相加
+#   字节宽度、层数和带宽
+# dispatch 与 combine 分开写：前者 FP8、每元素 1 字节，后者 BF16、每元素 2 字节。
+# 不得合并成一个相等的通信时间。
+# 例：
+#   T_Attention = max(T_pull, T_HBM, T_compute, T_AR)
+#   T_dispatch  = hot × 7168 × 1 × 61 / 单向带宽
+#   T_combine   = hot × 7168 × 2 × 61 / 单向带宽
+#   T_MoE       = T_dispatch + max(T_weight, T_gemm) + T_combine
+#   TTFT        = T_Attention + T_MoE + P→D 尾巴
+timing_presentation:
+  ttft_table_requires_formulas_below: true
+
 # 已固化进 96 GB / 486 T 两套幻灯片的负载口径。冷请求与 98% 命中共用同一套模型。
 workload:
   cold_prefix_hit: 0

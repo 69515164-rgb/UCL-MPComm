@@ -9,7 +9,9 @@ but TopK, norm and RoPE are not given a separate FLOP term.
 H2D is 64 GB/s per GPU: 51.2 GB/s effective.  It carries prefill
 host input and every decode-side DDR/KV swap into GPU HBM.
 DDR5 is 1288.8 GB/s and 768 GB per 8-GPU machine.
-Prefix-cache hits use the 40 GB/s effective parameter plane, not H2D.
+Prefix-cache hits use 40% of the physical parameter-plane rate, 20 GB/s,
+because that storage serves the whole prefill cluster at once. P-to-D
+stays at 80% of the same link, 40 GB/s.
 
 D2D is 3.2 Tb/s per GPU: 400 GB/s peak, 320 GB/s effective.
 Each link in the 8-GPU fullmesh is 400 Gb/s.  Seven links run in
@@ -72,7 +74,12 @@ P2P = min(D2D_PEAK, (NODE - 1) * P2P_LINK) * 0.80
 # Empty-collective completion, paid once per layer. Planning value for this
 # fullmesh and the 128-GPU D2D domain, not a measured NCCL ping.
 COLL_ALPHA = 5e-6
-PARAM = 400e9 / 8 * 0.80
+PARAM_PEAK = 400e9 / 8
+PARAM = PARAM_PEAK * 0.80
+# Storage is shared by the whole prefill cluster, so a concurrent prefix
+# fetch gets 40% of the physical parameter-plane rate, not the 80% used
+# for a dedicated P-to-D transfer.
+PREFIX_PULL = PARAM_PEAK * 0.40
 H2D = 64e9 * 0.80
 DDR_NODE_BW = 1288.8e9 * 0.80
 DDR_SHARE = DDR_NODE_BW / NODE
@@ -439,7 +446,7 @@ def prefill_batch(bs, s, hit=PREFIX_HIT):
     t_compute = t_idx + t_hca + t_core + t_proj
     # Prefix hits reside behind the parameter plane, not in host DDR.
     prefix_bytes = p * BPT + L * min(p, 128) * 576
-    t_pull = n * prefix_bytes / (TP * PARAM)
+    t_pull = n * prefix_bytes / (TP * PREFIX_PULL)
     # Ideal fused-kernel reuse: read the context once and write new KV once.
     hbm_bytes = ATTN / TP + n * (store_seq(s) + q * BPT) / TP
     t_hbm = hbm_bytes / HBM_BW
@@ -759,7 +766,7 @@ def main():
         "外推式：总参数 = 专家数 × 4.030×10^9 + 5.260×10^10。单个专家 = 3 × 7168 × 3072 × 61。\n"
         "本档：96 GB HBM，4 TB/s取80%为3.20 TB/s。张量算力 486 T×70% 再加 108 T×60%，有效 405.0 T。H2D每卡64 GB/s取80%为51.2 GB/s，用于Prefill主机输入及全部Decode DDR换入。机内DDR5每机1288.8 GB/s、768 GB。\n"
         "D2D每卡3.2 Tb/s取80%为320 GB/s，只承载MoE EP等GPU间通信。DDR池标称480 GB/s，但Decode访存统一经H2D进入GPU，因此换入有效带宽为51.2 GB/s。"
-        "8卡fullmesh每条链路400 Gb/s，7链路并发后取80%为280 GB/s；参数面仍为40 GB/s。",
+        "8卡fullmesh每条链路400 Gb/s，7链路并发后取80%为280 GB/s。参数面物理50 GB/s：P→D取80%为40 GB/s，prefix拉取因存储服务整个Prefill集群只取40%为20 GB/s。",
         13,
         False,
         GOLD,
@@ -775,7 +782,7 @@ def main():
         "后面几页是 96 GB、486 T 加 108 T 这一档。张量有效算力 405.0×10^12。注意力和专家 GEMM 用同一个峰值。Indexer 打分也走这档。非张量的 TopK、Norm 不单列 FLOP。"
         "HBM 96 GB，带宽 4 TB/s，计时取 80% 即 3.20 TB/s。"
         "H2D是64 GB/s（字节），80%后51.2 GB/s。Prefill主机输入和Decode的外部DDR/KV换入都走这条链路；HBM内权重与KV仍按3.20 TB/s读取。"
-        "D2D 3.2 Tb/s：换算400 GB/s峰值，80%后320 GB/s。8卡fullmesh每卡有7条400 Gb/s链路：聚合350 GB/s峰值，受D2D口约束前已较低，80%后AllReduce按280 GB/s。参数面400 Gb/s，80%后40 GB/s。"
+        "D2D 3.2 Tb/s：换算400 GB/s峰值，80%后320 GB/s。8卡fullmesh每卡有7条400 Gb/s链路：聚合350 GB/s峰值，受D2D口约束前已较低，80%后AllReduce按280 GB/s。参数面400 Gb/s，物理50 GB/s。P→D取80%为40 GB/s。prefix拉取取物理带宽的40%，每卡20 GB/s。"
         "DDR5 的 1288.8 GB/s 和 768 GB 按一台 8 卡机器记。有效 1031 GB/s，每卡分到 128.9 GB/s 和 96 GB。H2D 只有 51.2 GB/s，主机路径被 H2D 卡住。"
         "DDR池容量不设上限、标称480 GB/s，但Decode外部访存必须经过每卡H2D：min(480×80%, 64×80%, 128.9)=51.2 GB/s。MoE dispatch/combine仍走独立D2D平面320 GB/s。"
         "本页的池带宽按每卡，不把 480 GB/s 理解成 128 卡共享。"
@@ -797,7 +804,7 @@ def main():
     par_rows = [
         ["", "Attention", "MoE"],
         ["并行", "机内 TP=8\n16 台机器做 DP=16", "超节点 EP=128\n一份模型铺满 128 卡"],
-        ["通信域", "8卡 fullmesh，7链路并发\nAllReduce 有效 280 GB/s", "128卡 D2D，有效320 GB/s\nKV走参数面，有效40 GB/s"],
+        ["通信域", "8卡 fullmesh，7链路并发\nAllReduce 有效 280 GB/s", "128卡 D2D，有效320 GB/s\n拉 KV 每卡 20 GB/s；P→D 40 GB/s"],
         [
             "每卡权重",
             f"注意力 19.35 GB / 8\n= {ATTN / TP / 1e9:.2f} GB FP8",
@@ -854,7 +861,7 @@ def main():
     banner(
         s3,
         0.92,
-        f"{HIT_LABEL} prefix 先经参数面 40 GB/s 整段拉入 HBM，只现算 {MISS_LABEL}。拉 prefix、融合 kernel、AR 串行相加，再加完整 MoE。",
+        f"{HIT_LABEL} prefix 按每卡 20 GB/s 整段先拉完，只现算 {MISS_LABEL}。再串行加融合 kernel、AR 和 MoE。",
         size=14,
     )
     textbox(s3, 0.42, 1.44, 12.5, 0.22, "10 秒在两个端点上怎么加完", 13, True, ACCENT)
@@ -929,7 +936,7 @@ def main():
     )
     s3.notes_slide.notes_text_frame.text = (
         "这一页的批是 128 卡副本上的全局批，每卡条数 = 全局批 / 128。切分与上一页相同：注意力 TP=8、DP=16，MoE EP=128。"
-        f"KV 命中 {HIT_LABEL}，命中部分经每卡 40 GB/s 的参数面拉到 HBM。每条只现算 {MISS_LABEL}，这些 query 的平均上下文约为 {AVG_LABEL}S。"
+        f"KV 命中 {HIT_LABEL}，命中部分按每卡 20 GB/s 从共享存储拉到 HBM。这个 20 GB/s 是参数面物理 50 GB/s 的 40%。每条只现算 {MISS_LABEL}，这些 query 的平均上下文约为 {AVG_LABEL}S。"
         "Attention = prefix pull + max(HBM, compute) + AR。MoE = dispatch + max(weight, GEMM) + combine。Attention 与 MoE 相加。"
         f"4K 全局批 {p4['bs']}：现算 {p4['Q']:.4e} token，allreduce {p4['t_ar']:.3f}s，注意力计算 {p4['t_attn']:.3f}s，专家计算 {p4['t_moe']:.3f}s，"
         f"EP 双向 {p4['t_ep']:.3f}s，读专家权重 {p4['t_we']*1e3:.2f} ms，拉 prefix {p4['t_pull']*1e3:.1f} ms，合计 {p4['t']:.3f}s。"
@@ -1388,7 +1395,7 @@ def main():
     ttft_rows = [
         ["部分", "公式", "注释"],
         ["Attention", "拉 prefix + max(HBM，Attention 计算) + AR", "整段拉取在前；AR 不与 kernel 重叠"],
-        ["拉 prefix", f"⌈BS/16⌉ × K({PREFIX_HIT:g}S) / (8 × 40 GB/s)", "K(x)=4939.5x+滑窗；远端 KV → HBM"],
+        ["拉 prefix", f"⌈BS/16⌉ × K({PREFIX_HIT:g}S) / (8 × 20 GB/s)", "物理 50 GB/s 的 40%；存储服务整个 Prefill 集群"],
         ["计算上下文", f"C = {MISS:g}S × {PREFIX_HIT:g}S + {MISS:g}S × ({MISS:g}S + 1) / 2", f"新 token 平均看到约 {AVG_LABEL} 的完整上下文"],
         ["融合 kernel", "max(Attention HBM，Attention FLOP / 405.0 T)", "HBM 含权重、prefix KV、新 KV 和激活"],
         ["MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "每层各加 5 微秒；带宽项字节 1 与 2"],

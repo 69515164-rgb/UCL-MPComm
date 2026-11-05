@@ -73,7 +73,8 @@ BS = 10497 时 TPOT = 30.046506 毫秒
 | `HBM_BW` | 单卡有效 HBM 带宽 | 3.20 × 10^12 字节/s |
 | `D2D` | 单卡有效 D2D 带宽，承载 MoE 的 dispatch / combine | 320 × 10^9 字节/s |
 | `P2P` | 单卡 fullmesh 聚合后的有效 AllReduce 带宽 | 280 × 10^9 字节/s |
-| `PARAM` | 单卡有效参数面带宽，承载 prefix 拉取和 P→D | 40 × 10^9 字节/s |
+| `PARAM` | 单卡 P→D 带宽，参数面物理带宽的 80% | 40 × 10^9 字节/s |
+| `PREFIX_PULL` | 单卡拉 prefix 带宽，参数面物理带宽的 40% | 20 × 10^9 字节/s |
 | `H2D` | 单卡有效 Host-to-Device 带宽 | 51.2 × 10^9 字节/s |
 | `POOL` | Decode 从 DDR 池换入 HBM 的有效带宽。本档等于 `H2D` | 51.2 × 10^9 字节/s |
 | `ROOM` | 128 卡合计可放 KV 的 HBM 字节 | 5.719964 × 10^12 |
@@ -132,13 +133,16 @@ P2P = 350 × 10^9 × 0.80
           = 50 × 10^9 字节/s
 
 PARAM = 50 × 10^9 × 0.80
-      = 40 × 10^9 字节/s              # prefix 拉取、P→D。不是 fullmesh
+      = 40 × 10^9 字节/s              # P→D。不是 fullmesh
+
+PREFIX_PULL = 50 × 10^9 × 0.40
+            = 20 × 10^9 字节/s        # prefix 拉取。存储服务整个 Prefill 集群，按物理带宽的 40%，不叠乘 80%
 
 H2D = 64 × 10^9 × 0.80
     = 51.2 × 10^9 字节/s
 ```
 
-每条 fullmesh 链路是 400 Gb/s，不是每卡聚合 400 Gb/s。8 卡里每卡连另外 7 卡，所以 AllReduce 用 280 GB/s。参数面仍是每卡一条 400 Gb/s，有效 40 GB/s。
+每条 fullmesh 链路是 400 Gb/s，不是每卡聚合 400 Gb/s。8 卡里每卡连另外 7 卡，所以 AllReduce 用 280 GB/s。参数面仍是每卡一条 400 Gb/s。P→D 取 80%，有效 40 GB/s。prefix 拉取取物理带宽的 40%，有效 20 GB/s，因为存储同时服务整个 Prefill 集群。
 
 ### 3.3 DDR5 与 Decode 换入
 

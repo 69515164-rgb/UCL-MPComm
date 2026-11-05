@@ -74,9 +74,25 @@ precision:
   routed_expert_bytes_per_param: 0.5
   shared_expert: fp8
   attention: fp8
-  # TP AllReduce 的 hidden。
+  # 只用于 TP AllReduce 的 hidden。不是 MoE 的 dispatch / combine。
   collective_hidden: bf16
   collective_hidden_bytes: 2
+
+# MoE 的 EP 通信。按 V4-Pro 论文的实际部署：FP8 dispatch + BF16 combine。
+# 每个 token、每个被选中的专家、每一层是 3 × hidden 字节，不是两边同宽。
+# 同一指派次数、同一层数、同一单向带宽下，T_combine = 2 × T_dispatch。
+# 计时不得把两段都写成 BF16，也不得令两段时间相等。
+# FP8 scale 不计入这 3h；按 128 元素一块、每块 1 字节，dispatch 大约只多 0.8%。
+moe_ep:
+  dispatch_dtype: fp8
+  dispatch_bytes_per_element: 1
+  combine_dtype: bf16
+  combine_bytes_per_element: 2
+  # 1 × 7168 + 2 × 7168
+  bytes_per_token_expert_per_layer: 21504
+  # 6 × 3 × 7168 × 61。单 token、TopK=6、61 层的结构量。
+  # 秒数乘最忙卡的 hot，不直接乘 6 × token 数。
+  bytes_per_token_all_layers: 7870464
 
 # 计时模型直接使用的权重字节。FP8 权重的字节数等于参数个数。
 timing_weights:

@@ -383,11 +383,14 @@ K(262144) = 1,299,357,696 字节
 ## 6. 并行切分
 
 ```
-TP = 8
-DP = 16
+# Prefill。TP=4 留在 8 卡机器内，AllReduce 用 3 条链路，有效 120 GB/s。
+TP = 4
+DP = 32
+# Decode 仍是 TP=8、DP=16，7 条链路，有效 280 GB/s。
 EP = 128
 
-n = ceil(BS / 16)          # 最忙 TP 组的请求数
+n_prefill = ceil(BS / 32)  # Prefill 最忙 TP 组的请求数
+n_decode  = ceil(BS / 16)  # Decode 最忙 TP 组的请求数
 每卡条数 = BS / 128         # 展示用平均条数；KV 和 AR 不用这个平均数
 ```
 

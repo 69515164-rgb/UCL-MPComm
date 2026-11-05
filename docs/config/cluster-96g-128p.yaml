@@ -11,13 +11,14 @@ model: deepseek-10t
 
 gpu:
   count_per_replica: 128
-  # 张量算力。Attention 与专家 GEMM 仍共用这一档。
+  # 非张量算力，标称 486 T。原计时模型的 Attention 与专家 GEMM 仍用这一档。
+  non_tensor_peak_flops: 4.86e14
   peak_flops: 4.86e14
   hbm_bytes: 96000000000
-  # HBM 带宽不变。
+  # HBM 标称带宽不变，仍是 4 TB/s。
   hbm_bandwidth_Bps: 4.0e12
-  incremental_core:
-    # 增量计算 core，算力按 FP8。
+  tensor_core:
+    # 新增张量计算核。
     dtype: fp8
     peak_flops: 1.08e14
     compute_efficiency: 0.60
@@ -42,20 +43,24 @@ fabric:
   ddr_pool_capacity: unlimited
 
 efficiency:
-  # 张量计算沿用原计时模型。
-  compute: 0.70
-  # 非张量计算效率改为 0.7。
+  # 非张量计算效率。原统一的 0.70 现在只落在 486 T 这一档。
   non_tensor_compute: 0.70
-  # 带宽利用率 80%。HBM 标称带宽不改，有效带宽仍是标称 × 0.80。
+  compute: 0.70
+  # 张量计算核效率。
+  tensor_compute: 0.60
+  # 带宽利用率 80%。通信与访存都用这个数。HBM 标称带宽不改。
+  bandwidth_utilization: 0.80
   memory: 0.80
   communication: 0.80
 
 # 计时实际使用的有效速率。
 effective:
+  # 486 × 10^12 × 0.70
+  non_tensor_flops: 3.402e14
   peak_flops: 3.402e14
   # 108 × 10^12 × 0.60
-  incremental_core_flops: 6.48e13
-  # 4 TB/s × 80%。HBM 带宽未改。
+  tensor_core_flops: 6.48e13
+  # 4 TB/s × 80%。HBM 标称带宽未改。
   hbm_bandwidth_Bps: 3.2e12
   # 3.2 Tb/s / 8 × 0.80
   d2d_Bps: 320000000000

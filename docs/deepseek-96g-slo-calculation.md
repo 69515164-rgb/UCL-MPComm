@@ -4,7 +4,9 @@
 
 公式全部写在 Markdown 代码块里，不用 LaTeX。代码块中 `#` 后面是符号注释。容量按十进制：`1 GB = 10^9 字节`，`1 TB = 10^12 字节`。幻灯片上的「秒 / 毫秒」是四舍五入后的展示值，正文同时给出未舍入的代入结果。
 
-这是数据面理论上限。调度、kernel 启动、collective 启动、RMSNorm、RoPE、Router、残差、logits、sampling 和 P/D 控制面没有实测值，不并进 10 秒或 10/30 毫秒。
+集合通信按 Hockney 计算：每一层的 AllReduce、dispatch、combine 各付 10 微秒启动，再加字节/带宽。10 微秒是这套 8 卡 fullmesh 与 128 卡 D2D 上的规划值，不是实测。调度、kernel 启动、RMSNorm、RoPE、Router、残差、logits、sampling 和 P/D 控制面没有实测值，不并进 10 秒或 10/30 毫秒。KV 换入仍整段计入 TPOT。
+
+下文第 8 节以后的代入表仍是未加启动项、按 98% 命中写出的旧数。当前幻灯片以 `docs/build_deepseek_96g_slo_ppt.py` 为准。
 
 ---
 
@@ -400,10 +402,10 @@ Attention 的 KV、AllReduce、投影都先落在这 `n` 条上，再除以 `TP 
 8 卡 fullmesh 的通信量仍按 ring 的 `2 × (TP − 1) / TP` 计，带宽用 7 链路聚合后的 280 GB/s。每个 token 的 hidden 是 BF16，2 字节。61 层各做一次。
 
 ```
-字节 = 61 × 2 × (8 − 1) / 8 × (行数 × 7168 × 2)
-     = 61 × 1.75 × 行数 × 14,336
+每层字节 = 2 × (8 − 1) / 8 × (行数 × 7168 × 2)
+         = 1.75 × 行数 × 14,336
 
-T_AR = 字节 / 280 × 10^9
+T_AR = 61 × (10 × 10^-6 + 每层字节 / 280 × 10^9)
 ```
 
 Prefill 的「行数」是最忙 TP 组的现算 token 行 `n × q`。Decode 的「行数」是 `n`，因为一步只生成 1 个 token。
@@ -501,11 +503,11 @@ F_gemm = (routed_rows + shared_rows) × 6 × 7168 × 3072 × 61
 T_gemm = F_gemm / PEAK
 ```
 
-EP 通信按最忙卡的 `hot` 次指派。dispatch 是 FP8，每元素 1 字节；combine 是 BF16，每元素 2 字节。两段都不能和 GEMM 重叠，彼此也不能重叠。同一 `hot`、同一 320 GB/s 下，combine 时间是 dispatch 的 2 倍：
+EP 通信按最忙卡的 `hot` 次指派。dispatch 是 FP8，每元素 1 字节；combine 是 BF16，每元素 2 字节。两段都不能和 GEMM 重叠，彼此也不能重叠。带宽项里 combine 的字节是 dispatch 的 2 倍；每一层两边还各加 10 微秒，所以两段时间不再是 2 倍关系：
 
 ```
-T_dispatch = hot × 7168 × 1 × 61 / 320 × 10^9
-T_combine  = hot × 7168 × 2 × 61 / 320 × 10^9
+T_dispatch = 61 × (10 × 10^-6 + hot × 7168 × 1 / 320 × 10^9)
+T_combine  = 61 × (10 × 10^-6 + hot × 7168 × 2 / 320 × 10^9)
 ```
 
 融合 kernel 里读权重和 GEMM 取最大。kernel 前后各加一次 EP：
@@ -892,7 +894,6 @@ P:D(30 毫秒) = 5,492.8 / 683.333 = 8.04
 ```
 固定开销 = 调度
          + kernel 启动
-         + collective 启动
          + RMSNorm / RoPE / Router / 激活 / 残差
          + logits / sampling
          + P/D 控制
@@ -917,6 +918,8 @@ TPOT Attention = SWAP + max(HBM, Attention 计算) + AR
 TPOT MoE       = dispatch(FP8) + max(读专家权重, GEMM) + combine(BF16)
 TPOT           = TPOT Attention + TPOT MoE
 ```
+
+`AR`、`dispatch`、`combine` 都是 `61 × (10 微秒 + 该层字节 / 带宽)`。10 微秒不参与取最大之前的抵消：Decode 里它加在 kernel 外面；Prefill 里它先加进 `AR`、`dispatch`、`combine`，再进入原有的取最大或相加。
 
 允许取最大的只有两类：
 

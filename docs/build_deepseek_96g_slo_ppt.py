@@ -69,6 +69,9 @@ D2D_PEAK = 3.2e12 / 8
 D2D = D2D_PEAK * 0.80
 P2P_LINK = 400e9 / 8
 P2P = min(D2D_PEAK, (NODE - 1) * P2P_LINK) * 0.80
+# Empty-collective completion, paid once per layer. Planning value for this
+# fullmesh and the 128-GPU D2D domain, not a measured NCCL ping.
+COLL_ALPHA = 10e-6
 PARAM = 400e9 / 8 * 0.80
 H2D = 64e9 * 0.80
 DDR_NODE_BW = 1288.8e9 * 0.80
@@ -343,6 +346,17 @@ def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0):
     textbox(slide, x, 5.72, 3.86, 0.28, pool_text, 11, pool > 0, GOLD if pool > 0 else MUTED, PP_ALIGN.CENTER)
 
 
+def allreduce_time(rows):
+    """TP allreduce over `rows` tokens, summed across all layers.
+
+    Ring volume stays 2*(TP-1)/TP on the fullmesh aggregate. Each layer also
+    pays COLL_ALPHA, so a decode step cannot collapse to a sub-microsecond
+    collective when the payload is only a few tokens.
+    """
+    per_layer = 2 * (TP - 1) / TP * rows * H * 2
+    return L * (COLL_ALPHA + per_layer / P2P)
+
+
 def align(m):
     if m <= 0:
         return 1.0
@@ -373,9 +387,10 @@ def expert_stage(tokens):
     shared_rows = math.ceil(shared_tokens / 16) * 16
     t_weight = (e_hot * W_ONE * 0.5 + SHARED) / HBM_BW
     t_gemm = (routed_rows + shared_rows) * 6 * H * DFF * L / PEAK_FP4
-    # Deployment widths: FP8 dispatch, BF16 combine. Times are not equal.
-    t_dispatch = hot_assign * H * 1 * L / D2D
-    t_combine = hot_assign * H * 2 * L / D2D
+    # Deployment widths: FP8 dispatch, BF16 combine. Bandwidth terms are not
+    # equal, and each collective also pays one startup per layer.
+    t_dispatch = L * (COLL_ALPHA + hot_assign * H * 1 / D2D)
+    t_combine = L * (COLL_ALPHA + hot_assign * H * 2 / D2D)
     return {
         "t": t_dispatch + max(t_weight, t_gemm) + t_combine,
         "tw": t_weight,
@@ -427,7 +442,7 @@ def prefill_batch(bs, s, hit=PREFIX_HIT):
     # Ideal fused-kernel reuse: read the context once and write new KV once.
     hbm_bytes = ATTN / TP + n * (store_seq(s) + q * BPT) / TP
     t_hbm = hbm_bytes / HBM_BW
-    t_ar = 2 * (TP - 1) / TP * (rows * H * 2) * L / P2P
+    t_ar = allreduce_time(rows)
     t_attention = max(t_pull, t_hbm, t_compute, t_ar)
     moe = expert_stage(bs * q)
     prefill = t_attention + moe["t"]
@@ -507,7 +522,7 @@ def decode(bs, s):
     t_pool = read_gpu * spill / POOL
     t_hbm = (read_gpu + ATTN / TP) / HBM_BW
     t_ca = n * (score + PROJ) / (TP * PEAK_FP8 * align(n))
-    t_ar = 2 * (TP - 1) / TP * (n * H * 2) * L / P2P
+    t_ar = allreduce_time(n)
     t_attn = t_pool + max(t_ca, t_hbm) + t_ar
     moe = expert_stage(bs)
     return {
@@ -847,7 +862,7 @@ def main():
         ["现算 token", f"批 × 输入 × {MISS_LABEL}", fmt_tok(p4["Q"]), fmt_tok(p1m["Q"])],
         [
             "机内 allreduce",
-            "每组现算 token × 7168 × 2 字节\n61 层 × 2×7/8 / 280 GB/s",
+            "61 层 ×（10 微秒 + 字节 / 280 GB/s）\n字节 = 2×7/8 × token × 7168 × 2",
             sec(p4["t_ar"]),
             sec(p1m["t_ar"]),
         ],
@@ -976,7 +991,7 @@ def main():
         "Attention = SWAP + max(HBM, compute) + AR。MoE = dispatch + max(weight, GEMM) + combine。两段相加。"
         f"命中率 = 1 − exp(−6×{bs10} / 2469) = {d10['frac']:.4f}。最忙卡激活专家 {d10['e_hot']:.3f}。"
         f"读权重 ({d10['e_hot']:.3f}×{EXPERT_GB:.3f} GB + {SHARED/1e9:.3f} GB) / 3.20 TB/s = {d10['tw']*1e3:.3f} ms。"
-        f"机内 allreduce：ceil({bs10}/16) = {d10['toks']} 条，每条7168×2字节，每层通信量2×7/8，61层除以280 GB/s = {d10['t_ar']*1e3:.3f} ms。"
+        f"机内 allreduce：ceil({bs10}/16) = {d10['toks']} 条，每层 10 微秒 + 2×7/8×字节/280 GB/s，61 层合计 {d10['t_ar']*1e3:.3f} ms。"
         f"Attention {d10['t_attn']*1e3:.3f} ms，MoE {d10['t_moe']*1e3:.3f} ms，合计 {d10['t']*1e3:.3f} ms。{bs10+1} 条是 {decode(bs10+1, 4096)['t']*1e3:.3f} ms。"
         f"专家计算 {d10['t_cm']*1e3:.3f} ms，EP 双向 {d10['t_ep']*1e3:.3f} ms。注意力计算 {d10['t_ca']*1e3:.3f} ms，HBM {d10['t_hbm']*1e3:.3f} ms。"
         f"{span10} 的全局批都是 {bs10}，KV 全在 HBM。"
@@ -1036,7 +1051,7 @@ def main():
         "30 毫秒用的切分与 10 毫秒相同：TP=8，DP=16，EP=128，128 卡一份副本。"
         f"BS={bs30} 时命中率 {d30['frac']:.4f}，最忙卡激活 {d30['e_hot']:.3f} 个专家。"
         f"读权重 ({ROUTED/N/1e9:.2f} GB + {SHARED/1e9:.2f} GB) / 3.20 TB/s = {d30['tw']*1e3:.3f} ms。"
-        f"机内 allreduce：ceil({bs30}/16) = {d30['toks']} 条，每层通信量2×7/8，61层，除以280 GB/s = {d30['t_ar']*1e3:.3f} ms。"
+        f"机内 allreduce：ceil({bs30}/16) = {d30['toks']} 条，每层 10 微秒 + 2×7/8×字节/280 GB/s，61 层合计 {d30['t_ar']*1e3:.3f} ms。"
         f"Attention {d30['t_attn']*1e3:.3f} ms，MoE {d30['t_moe']*1e3:.3f} ms，合计 {d30['t']*1e3:.3f} ms。{bs30+1} 条是 {decode(bs30+1, 4096)['t']*1e3:.3f} ms。"
         f"EP 双向 {d30['t_ep']*1e3:.3f} ms，专家计算 {d30['t_cm']*1e3:.3f} ms，效率 {d30['ue']:.3f}。注意力计算 {d30['t_ca']*1e3:.3f} ms。"
         f"显存：每卡 96 − {ROUTED/N/1e9:.2f} − {SHARED/1e9:.2f} − {ATTN/TP/1e9:.2f} − 6 = {(HBM_CAP - ROUTED/N - SHARED - ATTN/TP - RESERVE)/1e9:.2f} GB，128 卡共 {ROOM/1e12:.2f} TB。"
@@ -1351,8 +1366,7 @@ def main():
     solid(note, GOLD_BG)
     textbox(
         s9, 0.58, 6.28, 12.18, 0.70,
-        "固定开销 = 调度 + kernel 启动 + collective 启动 + RMSNorm / RoPE / Router / 激活 / residual + logits / sampling + P/D 控制。"
-        "当前没有实测值，不并入 BS 摸高；生产 SLO 必须从 10/30 毫秒预算里另留余量。",
+        "集合通信启动已计入：AllReduce、dispatch、combine 每层各 10 微秒，再加字节/带宽。其余固定开销 = 调度 + kernel 启动 + RMSNorm / RoPE / Router / 激活 / residual + logits / sampling + P/D 控制，仍不并入摸高。",
         12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s9.notes_slide.notes_text_frame.text = (
@@ -1376,7 +1390,7 @@ def main():
         ["拉 prefix", f"⌈BS/16⌉ × K({PREFIX_HIT:g}S) / (8 × 40 GB/s)", "K(x)=4939.5x+滑窗；远端 KV → HBM"],
         ["计算上下文", f"C = {MISS:g}S × {PREFIX_HIT:g}S + {MISS:g}S × ({MISS:g}S + 1) / 2", f"新 token 平均看到约 {AVG_LABEL} 的完整上下文"],
         ["融合 kernel", "max(Attention HBM，Attention FLOP / 405.0 T)", "HBM 含权重、prefix KV、新 KV 和激活"],
-        ["MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "hot×7168×1×61 与 ×2；两段不相等"],
+        ["MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "每层各加 10 微秒；带宽项字节 1 与 2"],
         ["P→D 总量", "⌈BS/16⌉ × K(S) / (8 × 40 GB/s)", "K(S)=4939.5S+4.50 MB；发送完整 KV"],
         ["P→D 尾巴", "max(0，P→D 总量 − 可重叠计算时间)", "layer-wise 发送；只加最后没隐藏的部分"],
         ["最终", "TTFT = Attention + MoE + P→D 尾巴 + fixed", "本档计算中 P→D 尾巴为 0"],
@@ -1418,9 +1432,9 @@ def main():
         ["溢出比例", "f = max(0，(BS × KV 存量 − 5.72 TB) / (BS × KV 存量))", "池容量不设上限"],
         ["SWAP", "f × 每卡 KV 读量 / 51.2 GB/s", "DDR池 → H2D → HBM；必须先完成"],
         ["Attention kernel", "max((全部 KV + 2.42 GB 权重) / 3.20 TB/s，FLOP / 405.0 T)", "换入 KV 仍从 HBM 再读；kernel 内访存/计算重叠"],
-        ["AR", "61 × 2×7/8 × n×7168×2 / 280 GB/s", "8卡fullmesh七链路并发；单独加在kernel后"],
+        ["AR", "61 ×（10 微秒 + 2×7/8 × n×7168×2 / 280 GB/s）", "8卡fullmesh；启动与带宽都加在kernel后"],
         ["Decode Attention", "SWAP + Attention kernel + AR", "三段存在业务依赖"],
-        ["Decode MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "单请求串行相加；combine = 2 × dispatch"],
+        ["Decode MoE", "61×（10 微秒 + hot×7168×1 / 320 GB/s）+ max(权重，GEMM) + 61×（10 微秒 + hot×7168×2 / 320 GB/s）", "带宽项字节 1 与 2；两段都不与 GEMM 重叠"],
         ["最终", "TPOT = Decode Attention + Decode MoE + fixed", "固定开销未计入，结果是数据面理论上限"],
     ]
     add_table(

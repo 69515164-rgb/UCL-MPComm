@@ -125,12 +125,12 @@ timing_presentation:
 collective_latency:
   per_collective_per_layer_s: 5.0e-6
 
-# 存储同时服务整个 Prefill 集群。并发拉取只按参数面物理带宽的 40%，
-# 不再叠乘通信效率 80%。400 Gb/s = 50 GB/s，40% 为每卡 20 GB/s。
-# P→D 不走这套存储，仍按参数面 80%，每卡 40 GB/s。
+# 存储同时服务整个 Prefill 集群。并发拉取只按参数面物理带宽的 25%，
+# 不再叠乘通信效率 80%。400 Gb/s = 50 GB/s，25% 为每卡 12.5 GB/s。
+# P→D 不走这套存储，仍按参数面 80%，每卡 40 GB/s。Prefill 与 Decode 都是 TP=8。
 prefix_fetch:
-  physical_fraction: 0.40
-  per_gpu_Bps: 20000000000
+  physical_fraction: 0.25
+  per_gpu_Bps: 12500000000
 
 # 已固化进 96 GB / 486 T、128 卡幻灯片的负载口径。冷请求与 99.5% 命中共用同一套模型。
 workload:

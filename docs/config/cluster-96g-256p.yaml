@@ -63,8 +63,8 @@ effective:
   # min(D2D 口 400 GB/s, 7 × 50 GB/s) × 0.80。聚合峰值 350 GB/s，不再被 D2D 口截断。
   fullmesh_Bps: 280000000000
   parameter_plane_Bps: 40000000000
-  # 存储同时服务整个 Prefill 集群。物理 50 GB/s × 40%，不叠乘 80%。
-  prefix_fetch_Bps: 20000000000
+  # 存储同时服务整个 Prefill 集群。物理 50 GB/s × 25%，不叠乘 80%。
+  prefix_fetch_Bps: 12500000000
   h2d_Bps: 51200000000
   # 1288.8 GB/s × 0.80，再除以 8 卡。
   ddr5_bandwidth_Bps: 1031040000000

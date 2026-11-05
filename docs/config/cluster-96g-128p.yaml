@@ -62,8 +62,8 @@ effective:
   # min(D2D 口 400 GB/s, 7 × 50 GB/s) × 0.80。聚合峰值 350 GB/s，不再被 D2D 口截断。
   fullmesh_Bps: 280000000000
   parameter_plane_Bps: 40000000000
-  # 存储同时服务整个 Prefill 集群。物理 50 GB/s × 40%，不叠乘 80%。
-  prefix_fetch_Bps: 20000000000
+  # 存储同时服务整个 Prefill 集群。物理 50 GB/s × 25%，不叠乘 80%。
+  prefix_fetch_Bps: 12500000000
   h2d_Bps: 51200000000
   # 1288.8 GB/s × 0.80，再除以 8 卡。
   ddr5_bandwidth_Bps: 1031040000000
@@ -78,11 +78,6 @@ placement:
   # 一条请求不跨副本。加减 Prefill / Decode 副本不改变单条 TTFT、TPOT。
   attention_tp: 8
   attention_dp: 16
-  # Prefill 的 HBM 没有被 KV 占满，注意力改为 TP=4。一组 4 卡留在 8 卡机器内，
-  # 用 3 条 fullmesh 链路，有效 AllReduce 120 GB/s。DP=32。Decode 仍是 TP=8。
-  prefill_attention_tp: 4
-  prefill_attention_dp: 32
-  prefill_allreduce_Bps: 120000000000
   moe_ep: 128
   experts_per_gpu: 19.2890625
   # 系统预留，覆盖 runtime、碎片和未单列的临时区。

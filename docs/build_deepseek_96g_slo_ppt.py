@@ -9,9 +9,9 @@ but TopK, norm and RoPE are not given a separate FLOP term.
 H2D is 64 GB/s per GPU: 51.2 GB/s effective.  It carries prefill
 host input and every decode-side DDR/KV swap into GPU HBM.
 DDR5 is 1288.8 GB/s and 768 GB per 8-GPU machine.
-Prefix-cache hits use 40% of the physical parameter-plane rate, 20 GB/s,
+Prefix-cache hits use 25% of the physical parameter-plane rate, 12.5 GB/s,
 because that storage serves the whole prefill cluster at once. P-to-D
-stays at 80% of the same link, 40 GB/s.
+stays at 80% of the same link, 40 GB/s. Prefill and decode both use TP=8.
 
 D2D is 3.2 Tb/s per GPU: 400 GB/s peak, 320 GB/s effective.
 Each link in the 8-GPU fullmesh is 400 Gb/s.  Seven links run in
@@ -59,11 +59,8 @@ GOLD_BG = "F8F1E4"
 GOLD = "7A541C"
 
 N, NODE = 128, 8
-# Decode keeps the 8-GPU fullmesh. Prefill drops to TP=4 because the
-# attention shard still fits: two groups share one 8-GPU machine.
 TP, DP = 8, 16
-TP_P = 4
-DP_P = N // TP_P
+TP_P, DP_P = TP, DP
 PEAK_BASE = 486e12 * 0.70
 PEAK_EXTRA = 108e12 * 0.60
 PEAK_TENSOR = PEAK_BASE + PEAK_EXTRA
@@ -75,17 +72,16 @@ D2D_PEAK = 3.2e12 / 8
 D2D = D2D_PEAK * 0.80
 P2P_LINK = 400e9 / 8
 P2P = min(D2D_PEAK, (NODE - 1) * P2P_LINK) * 0.80
-# Prefill TP=4 uses 3 of the 7 fullmesh links. 3 × 50 GB/s × 0.80 = 120 GB/s.
-P2P_P = min(D2D_PEAK, (TP_P - 1) * P2P_LINK) * 0.80
+P2P_P = P2P
 # Empty-collective completion, paid once per layer. Planning value for this
 # fullmesh and the 128-GPU D2D domain, not a measured NCCL ping.
 COLL_ALPHA = 5e-6
 PARAM_PEAK = 400e9 / 8
 PARAM = PARAM_PEAK * 0.80
 # Storage is shared by the whole prefill cluster, so a concurrent prefix
-# fetch gets 40% of the physical parameter-plane rate, not the 80% used
+# fetch gets 25% of the physical parameter-plane rate, not the 80% used
 # for a dedicated P-to-D transfer.
-PREFIX_PULL = PARAM_PEAK * 0.40
+PREFIX_PULL = PARAM_PEAK * 0.25
 H2D = 64e9 * 0.80
 DDR_NODE_BW = 1288.8e9 * 0.80
 DDR_SHARE = DDR_NODE_BW / NODE
@@ -771,7 +767,7 @@ def main():
         "外推式：总参数 = 专家数 × 4.030×10^9 + 5.260×10^10。单个专家 = 3 × 7168 × 3072 × 61。\n"
         "本档：96 GB HBM，4 TB/s取80%为3.20 TB/s。张量算力 486 T×70% 再加 108 T×60%，有效 405.0 T。H2D每卡64 GB/s取80%为51.2 GB/s，用于Prefill主机输入及全部Decode DDR换入。机内DDR5每机1288.8 GB/s、768 GB。\n"
         "D2D每卡3.2 Tb/s取80%为320 GB/s，只承载MoE EP等GPU间通信。DDR池标称480 GB/s，但Decode访存统一经H2D进入GPU，因此换入有效带宽为51.2 GB/s。"
-        "8卡fullmesh每条链路400 Gb/s，7链路并发后取80%为280 GB/s。参数面物理50 GB/s：P→D取80%为40 GB/s，prefix拉取因存储服务整个Prefill集群只取40%为20 GB/s。",
+        "8卡fullmesh每条链路400 Gb/s，7链路并发后取80%为280 GB/s。参数面物理50 GB/s：P→D取80%为40 GB/s，prefix拉取因存储服务整个Prefill集群只取25%为12.5 GB/s。",
         13,
         False,
         GOLD,
@@ -787,11 +783,11 @@ def main():
         "后面几页是 96 GB、486 T 加 108 T 这一档。张量有效算力 405.0×10^12。注意力和专家 GEMM 用同一个峰值。Indexer 打分也走这档。非张量的 TopK、Norm 不单列 FLOP。"
         "HBM 96 GB，带宽 4 TB/s，计时取 80% 即 3.20 TB/s。"
         "H2D是64 GB/s（字节），80%后51.2 GB/s。Prefill主机输入和Decode的外部DDR/KV换入都走这条链路；HBM内权重与KV仍按3.20 TB/s读取。"
-        "D2D 3.2 Tb/s：换算400 GB/s峰值，80%后320 GB/s。8卡fullmesh每卡有7条400 Gb/s链路：聚合350 GB/s峰值，受D2D口约束前已较低，80%后AllReduce按280 GB/s。参数面400 Gb/s，物理50 GB/s。P→D取80%为40 GB/s。prefix拉取取物理带宽的40%，每卡20 GB/s。"
+        "D2D 3.2 Tb/s：换算400 GB/s峰值，80%后320 GB/s。8卡fullmesh每卡有7条400 Gb/s链路：聚合350 GB/s峰值，受D2D口约束前已较低，80%后AllReduce按280 GB/s。参数面400 Gb/s，物理50 GB/s。P→D取80%为40 GB/s。prefix拉取取物理带宽的25%，每卡12.5 GB/s。"
         "DDR5 的 1288.8 GB/s 和 768 GB 按一台 8 卡机器记。有效 1031 GB/s，每卡分到 128.9 GB/s 和 96 GB。H2D 只有 51.2 GB/s，主机路径被 H2D 卡住。"
         "DDR池容量不设上限、标称480 GB/s，但Decode外部访存必须经过每卡H2D：min(480×80%, 64×80%, 128.9)=51.2 GB/s。MoE dispatch/combine仍走独立D2D平面320 GB/s。"
         "本页的池带宽按每卡，不把 480 GB/s 理解成 128 卡共享。"
-        "Prefill 注意力 TP=4，留在机内 fullmesh，用其中 3 条链路，AllReduce 有效 120 GB/s，DP=32。Decode 注意力仍是 TP=8、DP=16，7 条链路 280 GB/s。MoE EP=128 走 D2D。"
+        "注意力 TP=8 留在机内 fullmesh，16 台机器做 DP=16，7 条链路 AllReduce 有效 280 GB/s。MoE EP=128 走 D2D。"
         f"每卡扣掉路由 {ROUTED/N/1e9:.2f} GB、共享 {SHARED/1e9:.2f} GB、注意力 {ATTN/TP/1e9:.2f} GB 和 6 GB 预留后，128 卡 KV 余量 {ROOM/1e12:.2f} TB。"
         "Prefill 与 Decode 的副本数可以按吞吐配，副本个数不改变单副本的 TTFT 和 TPOT。"
     )
@@ -808,11 +804,11 @@ def main():
     textbox(s2, 0.42, 1.46, 6.2, 0.24, "并行策略", 13, True, ACCENT)
     par_rows = [
         ["", "Attention", "MoE"],
-        ["并行", "机内 TP=4\n一台机器两组，DP=32", "超节点 EP=128\n一份模型铺满 128 卡"],
-        ["通信域", "TP=4 用 3 条链路\nAllReduce 有效 120 GB/s", "128卡 D2D，有效320 GB/s\n拉 KV 每卡 20 GB/s；P→D 40 GB/s"],
+        ["并行", "机内 TP=8\n16 台机器做 DP=16", "超节点 EP=128\n一份模型铺满 128 卡"],
+        ["通信域", "8卡 fullmesh，7链路并发\nAllReduce 有效 280 GB/s", "128卡 D2D，有效320 GB/s\n拉 KV 每卡 12.5 GB/s；P→D 40 GB/s"],
         [
             "每卡权重",
-            f"注意力 19.35 GB / 4\n= {ATTN / TP_P / 1e9:.2f} GB FP8",
+            f"注意力 19.35 GB / 8\n= {ATTN / TP / 1e9:.2f} GB FP8",
             f"路由专家 {E / N:.1f} 个，{ROUTED / N / 1e9:.1f} GB FP4\n共享专家 {SHARED / 1e9:.2f} GB，每卡一份",
         ],
         ["本阶段角色", "先 max(计算, HBM)，再加 AR\n拉 prefix 在冷请求中为 0", f"dispatch + 融合专家 kernel + combine\n到这个长度合计 {sec(p['moe'])}"],
@@ -829,10 +825,10 @@ def main():
     textbox(s2, 0.42, 4.26, 12.5, 0.22, "10 秒怎么落到这个输入长度", 13, True, ACCENT)
     calc_rows = [
         ["这一笔", "算法", f"S = {s_show / 1e6:.2f}×10^6 时"],
-        ["CSA indexer", "30 层 × 2048 × S²；TP=4，按 16 行砖", sec(p["idx"])],
+        ["CSA indexer", "30 层 × 2048 × S²；TP=8，按 16 行砖", sec(p["idx"])],
         ["HCA", "31 层 × 1024 × S²；同一个融合 kernel", sec(p["hca"])],
         ["MoE", "dispatch + max(专家权重, GEMM) + combine", sec(p["moe"])],
-        ["投影", "每 token 3.87×10^10 FLOP；按 TP=4 分担", sec(p["proj"])],
+        ["投影", "每 token 3.87×10^10 FLOP；按 TP=8 分担", sec(p["proj"])],
         ["稀疏注意力", "每 token 看 1024 条压缩 KV + 128 滑窗", sec(p["core"])],
         [
             "AR + P→D",
@@ -866,7 +862,7 @@ def main():
     banner(
         s3,
         0.92,
-        f"{HIT_LABEL} prefix 按每卡 20 GB/s 整段先拉完，只现算 {MISS_LABEL}。再串行加融合 kernel、AR 和 MoE。",
+        f"{HIT_LABEL} prefix 按每卡 12.5 GB/s 整段先拉完，只现算 {MISS_LABEL}。再串行加融合 kernel、AR 和 MoE。",
         size=14,
     )
     textbox(s3, 0.42, 1.44, 12.5, 0.22, "10 秒在两个端点上怎么加完", 13, True, ACCENT)
@@ -875,7 +871,7 @@ def main():
         ["现算 token", f"批 × 输入 × {MISS_LABEL}", fmt_tok(p4["Q"]), fmt_tok(p1m["Q"])],
         [
             "机内 allreduce",
-            "61 层 ×（5 微秒 + 字节 / 120 GB/s）\n字节 = 2×3/4 × token × 7168 × 2",
+            "61 层 ×（5 微秒 + 字节 / 280 GB/s）\n字节 = 2×7/8 × token × 7168 × 2",
             sec(p4["t_ar"]),
             sec(p1m["t_ar"]),
         ],
@@ -940,8 +936,8 @@ def main():
         anchor=MSO_ANCHOR.MIDDLE,
     )
     s3.notes_slide.notes_text_frame.text = (
-        "这一页的批是 128 卡副本上的全局批，每卡条数 = 全局批 / 128。切分与上一页相同：注意力 TP=4、DP=32，MoE EP=128。"
-        f"KV 命中 {HIT_LABEL}，命中部分按每卡 20 GB/s 从共享存储拉到 HBM。这个 20 GB/s 是参数面物理 50 GB/s 的 40%。每条只现算 {MISS_LABEL}，这些 query 的平均上下文约为 {AVG_LABEL}S。"
+        "这一页的批是 128 卡副本上的全局批，每卡条数 = 全局批 / 128。切分与上一页相同：注意力 TP=8、DP=16，MoE EP=128。"
+        f"KV 命中 {HIT_LABEL}，命中部分按每卡 12.5 GB/s 从共享存储拉到 HBM。这个 12.5 GB/s 是参数面物理 50 GB/s 的 25%。每条只现算 {MISS_LABEL}，这些 query 的平均上下文约为 {AVG_LABEL}S。"
         "Attention = prefix pull + max(HBM, compute) + AR。MoE = dispatch + max(weight, GEMM) + combine。Attention 与 MoE 相加。"
         f"4K 全局批 {p4['bs']}：现算 {p4['Q']:.4e} token，allreduce {p4['t_ar']:.3f}s，注意力计算 {p4['t_attn']:.3f}s，专家计算 {p4['t_moe']:.3f}s，"
         f"EP 双向 {p4['t_ep']:.3f}s，读专家权重 {p4['t_we']*1e3:.2f} ms，拉 prefix {p4['t_pull']*1e3:.1f} ms，合计 {p4['t']:.3f}s。"
@@ -1361,12 +1357,12 @@ def main():
     )
     assumptions = [
         ["项目", "TTFT", "TPOT"],
-        ["并行域", "Attention TP=4、DP=32；MoE EP=128", "Attention TP=8、DP=16；MoE EP=128"],
+        ["并行域", "Attention TP=8、DP=16；MoE EP=128", "同左；最忙 TP 组 n=⌈BS/16⌉"],
         ["Attention", "先整段拉 prefix，再 max(HBM, 计算)，再加 AR", "SWAP 在前；融合 kernel 后再加 AR"],
         ["MoE", "dispatch(FP8) + max(权重, GEMM) + combine(BF16)", "同左；combine 字节是 dispatch 的 2 倍"],
         ["KV 位置", f"{HIT_LABEL} prefix 在远端 KV 缓存，经参数面拉取；Decode 没有副本", "HBM 放不下先从 DDR 池写回 HBM"],
         ["P→D", "完整 KV 按层发送；只加未被后续计算隐藏的尾巴", "不进入单步 TPOT"],
-        ["负载", "Attention 按 TP=4；MoE 取最忙 EP 卡，逐专家 16 行 padding", "Attention 按 TP=8；MoE 同左"],
+        ["负载", "Attention 按 TP=8；MoE 取最忙 EP 卡，逐专家 16 行 padding", "同左"],
         ["固定开销", "不伪造数值；单列为未计入项", "不伪造数值；SLO 结果是数据面理论上限"],
     ]
     add_table(
@@ -1400,11 +1396,11 @@ def main():
     ttft_rows = [
         ["部分", "公式", "注释"],
         ["Attention", "拉 prefix + max(HBM，Attention 计算) + AR", "整段拉取在前；AR 不与 kernel 重叠"],
-        ["拉 prefix", f"⌈BS/32⌉ × K({PREFIX_HIT:g}S) / (4 × 20 GB/s)", "TP=4；物理 50 GB/s 的 40%"],
+        ["拉 prefix", f"⌈BS/16⌉ × K({PREFIX_HIT:g}S) / (8 × 12.5 GB/s)", "物理 50 GB/s 的 25%；存储服务整个 Prefill 集群"],
         ["计算上下文", f"C = {MISS:g}S × {PREFIX_HIT:g}S + {MISS:g}S × ({MISS:g}S + 1) / 2", f"新 token 平均看到约 {AVG_LABEL} 的完整上下文"],
         ["融合 kernel", "max(Attention HBM，Attention FLOP / 405.0 T)", "HBM 含权重、prefix KV、新 KV 和激活"],
         ["MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "每层各加 5 微秒；带宽项字节 1 与 2"],
-        ["P→D 总量", "⌈BS/32⌉ × K(S) / (4 × 40 GB/s)", "K(S)=4939.5S+4.50 MB；发送完整 KV"],
+        ["P→D 总量", "⌈BS/16⌉ × K(S) / (8 × 40 GB/s)", "K(S)=4939.5S+4.50 MB；发送完整 KV"],
         ["P→D 尾巴", "max(0，P→D 总量 − 可重叠计算时间)", "layer-wise 发送；只加最后没隐藏的部分"],
         ["最终", "TTFT = Attention + MoE + P→D 尾巴 + fixed", "本档计算中 P→D 尾巴为 0"],
     ]
@@ -1488,7 +1484,7 @@ def main():
     banner(
         s12,
         0.92,
-        f"每个饼是最忙活跃卡的 96 GB HBM。Prefill 用 TP=4，注意力权重 {ATTN / TP_P / 1e9:.2f} GB，模型权重 {(ROUTED / N + SHARED + ATTN / TP_P) / 1e9:.2f} GB，系统预留 6 GB。",
+        f"每个饼是最忙活跃卡的 96 GB HBM。模型权重 {(ROUTED / N + SHARED + ATTN / TP) / 1e9:.2f} GB，系统预留 6 GB；prefix 按每卡 12.5 GB/s 拉入 HBM。",
         size=13,
     )
     pf_pies = [
@@ -1511,8 +1507,8 @@ def main():
         12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s12.notes_slide.notes_text_frame.text = (
-        "饼图按最忙活跃 GPU，不按 128 卡平均。Prefill TP=4。每卡固定：路由专家 38.864 GB，共享专家 4.030 GB，"
-        f"Attention {ATTN / TP_P / 1e9:.3f} GB，系统预留 6 GB。KV = ceil(BS/{DP_P}) × store_seq(S) / {TP_P}。"
+        "饼图按最忙活跃 GPU，不按 128 卡平均。每卡固定：路由专家 38.864 GB，共享专家 4.030 GB，"
+        f"Attention {ATTN / TP / 1e9:.3f} GB，系统预留 6 GB。KV = ceil(BS/16) × store_seq(S) / 8。"
         + " ".join(
             f"{label}: BS={bs}, kv={hbm_pie_values(bs, s, TP_P, DP_P)[0]:.3f}GB, free={hbm_pie_values(bs, s, TP_P, DP_P)[1]:.3f}GB."
             for s, bs, label in pf_pies

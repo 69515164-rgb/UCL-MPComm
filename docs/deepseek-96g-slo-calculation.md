@@ -955,7 +955,7 @@ python3 docs/build_deepseek_96g_slo_ppt.py cases
 
 `docs/deepseek-96g-slo-uc1-kv100.pptx`：prefix 拉取改为物理带宽的 100%，每卡 50 GB/s，不叠乘 80%。Decode SWAP 仍是 51.2 GB/s。最后一页对照 25%。
 
-`docs/deepseek-96g-slo-uc1-ttft-tps.pptx` 是这一档的单页对照。系统 Prefill TPS = 全局批 × 输入长度 / 该批实际 TTFT，按 128 卡一份副本、完整输入 token 计，不是只算 0.5% 现算 token。TTFT 展开为拉 KV、计算、AR、MoE。计算 = max(HBM, Attention FLOP)。
+`docs/deepseek-96g-slo-uc1-ttft-tps.pptx` 是这一档的单页对照。系统 Prefill TPS = 全局批 × 输入长度 / 该批实际 TTFT，按 128 卡一份副本、完整输入 token 计，不是只算 0.5% 现算 token。TTFT 展开为拉 KV、计算、AR、MoE。计算 = max(HBM, Attention FLOP)。最右列是相对同长度 25% 行的 TPS 提升，25% 行标为基线。
 
 `docs/deepseek-96g-slo-uc2-swap400.pptx`：在用例 1 上，把 Decode KV SWAP 从 51.2 GB/s 改为 400 GB/s。最后一页同时对照 25% 拉 KV 和 51.2 GB/s 换入。
 

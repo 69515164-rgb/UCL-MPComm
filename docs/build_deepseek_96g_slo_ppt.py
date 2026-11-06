@@ -1964,12 +1964,13 @@ def build_uc1_tps_page(out_path):
     banner(
         slide,
         0.90,
-        "系统 Prefill TPS = 全局批 × 输入长度 / 该批实际 TTFT。按 128 卡一份副本、完整输入 token 计。TTFT = 拉 KV + 计算 + AR + MoE。",
+        "系统 Prefill TPS = 全局批 × 输入长度 / 该批实际 TTFT。按 128 卡一份副本、完整输入 token 计。最右列以 25% 为基线。",
         size=13,
     )
-    head = ["输入", "带宽", "全局批", "系统 TPS", "拉 KV", "计算", "AR", "MoE", "TTFT", "拉KV占比"]
+    head = ["输入", "带宽", "全局批", "系统 TPS", "拉 KV", "计算", "AR", "MoE", "TTFT", "拉KV占比", "TPS提升"]
     body, kinds = [], ["head"]
     for s in lengths:
+        base = cases[(s, "25%")]
         for label in ("25%", "100%"):
             item = cases[(s, label)]
             kinds.append("body" if label == "25%" else "key")
@@ -1984,12 +1985,13 @@ def build_uc1_tps_page(out_path):
                 f"{item['moe']:.2f} 秒",
                 f"{item['t']:.2f} 秒",
                 f"{item['share'] * 100:.1f}%",
+                "基线" if label == "25%" else signed_pct(item["tps"], base["tps"]),
             ])
     add_table(
         slide,
         0.42,
         1.42,
-        [0.72, 0.72, 1.22, 1.52, 1.20, 1.20, 1.12, 1.20, 1.18, 1.22],
+        [0.68, 0.68, 1.22, 1.55, 1.17, 1.17, 1.09, 1.17, 1.14, 1.18, 1.45],
         [head] + body,
         [0.32] + [0.30] * len(body),
         kinds,
@@ -2010,7 +2012,7 @@ def build_uc1_tps_page(out_path):
         f"TPS {fmt_tok(a4['tps'])} → {fmt_tok(b4['tps'])}（{signed_pct(b4['tps'], a4['tps'])}），"
         f"拉 KV 占比 {a4['share']*100:.1f}% → {b4['share']*100:.1f}%。"
         f"1M：批量 {signed_pct(b1['bs'], a1['bs'])}，TPS {signed_pct(b1['tps'], a1['tps'])}。"
-        "1M 实际 TTFT 低于 10 秒，是因为再加一条会让最忙组跳一档并超过 10 秒。",
+        "TPS 提升以同长度的 25% 行为基线。1M 实际 TTFT 低于 10 秒，是因为再加一条会让最忙组跳一档并超过 10 秒。",
         12,
         False,
         GOLD,

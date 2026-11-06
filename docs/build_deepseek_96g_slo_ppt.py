@@ -145,6 +145,9 @@ MOE = TOPK * L * 6 * H * DFF + L * 6 * H * DFF
 PROJ = ATTN * 2
 BPT = N_CSA * (576 / 4 + 64 / 4) + N_HCA * (576 / 128)
 FIXED = L * 128 * 576
+S_1M = 1048576
+S_2M = 2 * S_1M
+S_4M = 4 * S_1M
 PREFIX_HIT = 0.995
 HIT_LABEL = f"{PREFIX_HIT * 100:g}%"
 MISS = 1.0 - PREFIX_HIT
@@ -730,7 +733,7 @@ def add_compare_slide(prs, blank, pb, bs10, bs30):
         saved_pool = POOL
         try:
             POOL = HOST
-            for s in (4096, 131072, 262144, 524288, 1048576):
+            for s in (262144, 524288, S_1M, S_2M, S_4M):
                 b = search_bs(s, 0.030)
                 decode_cmp.append((s, b, decode(b, s)))
         finally:
@@ -766,7 +769,7 @@ def add_compare_slide(prs, blank, pb, bs10, bs30):
     body, kinds = [], ["head"]
     for row in pb:
         old = base_by[row["S"]]
-        kinds.append("key" if row["S"] in (4096, 1048576) else "body")
+        kinds.append("key" if row["S"] in (4096, S_1M, S_4M) else "body")
         body.append([
             fmt_len(row["S"]),
             str(old["bs"]),
@@ -777,21 +780,22 @@ def add_compare_slide(prs, blank, pb, bs10, bs30):
             sec(old["t"]),
             sec(row["t"]),
         ])
-    table_y = 1.46
-    row_h = 0.25 if decode_cmp else 0.27
+    table_y = 1.40
+    head_h = 0.26
+    row_h = 0.26 if len(body) > 7 else (0.25 if decode_cmp else 0.27)
     add_table(
         slide,
         0.42,
         table_y,
         [1.00, 1.35, 1.45, 1.15, 1.70, 1.75, 1.95, 2.15],
         [head] + body,
-        [0.28] + [row_h] * len(body),
+        [head_h] + [row_h] * len(body),
         kinds,
         size=11,
     )
-    table_bottom = table_y + 0.28 + row_h * len(body)
+    table_bottom = table_y + head_h + row_h * len(body)
     if decode_cmp:
-        textbox(slide, 0.42, table_bottom + 0.08, 12.5, 0.22, "Decode 30 毫秒：SWAP 51.2 GB/s 对照本用例 400 GB/s", 13, True, ACCENT)
+        textbox(slide, 0.42, table_bottom + 0.08, 12.5, 0.20, "Decode 30 毫秒，从进池的 256K 起：SWAP 51.2 GB/s 对照本用例 400 GB/s", 12, True, ACCENT)
         dhead = ["输入", "51.2 批", "400 批", "变化", "51.2 换入", "400 换入", "51.2 溢出", "400 溢出"]
         dbody, dkinds = [], ["head"]
         for s, old_bs, old_d, new_bs, new_d in decode_cmp:
@@ -806,18 +810,20 @@ def add_compare_slide(prs, blank, pb, bs10, bs30):
                 f"{old_d['spill'] * 100:.1f}%",
                 f"{new_d['spill'] * 100:.1f}%",
             ])
-        dy = table_bottom + 0.32
+        dy = table_bottom + 0.36
+        d_head_h = 0.26
+        d_row_h = 0.26
         add_table(
             slide,
             0.42,
             dy,
             [1.00, 1.25, 1.25, 1.15, 1.70, 1.70, 2.20, 2.25],
             [dhead] + dbody,
-            [0.28] + [0.30] * len(dbody),
+            [d_head_h] + [d_row_h] * len(dbody),
             dkinds,
-            size=12,
+            size=11 if len(dbody) > 5 else 12,
         )
-        note_y = dy + 0.28 + 0.30 * len(dbody) + 0.08
+        note_y = dy + d_head_h + d_row_h * len(dbody) + 0.06
         note_h = 7.08 - note_y
         note = (
             f"Prefill 与用例1相同。4K 全局批 {c4['bs']}（相对 25% 的 {b4['bs']}，{signed_pct(c4['bs'], b4['bs'])}），"
@@ -882,7 +888,7 @@ def main(out_path=None):
     d10 = decode(bs10, 4096)
     d30 = decode(bs30, 4096)
 
-    lengths = (4096, 8192, 32768, 131072, 262144, 524288, 1048576)
+    lengths = (4096, 8192, 32768, 131072, 262144, 524288, S_1M, S_2M, S_4M)
     sweep = []
     for s in lengths:
         b10 = search_bs(s, 0.010)
@@ -897,7 +903,7 @@ def main(out_path=None):
             "d30": decode(b30, s),
         })
     extra = {}
-    for s in (2_000_000, 4_000_000, s_show):
+    for s in (s_show,):
         b10 = search_bs(s, 0.010)
         b30 = search_bs(s, 0.030)
         extra[s] = {
@@ -1099,7 +1105,7 @@ def main(out_path=None):
         f"{HIT_LABEL} prefix 按每卡 {gbps(PREFIX_PULL)} 整段先拉完，只现算 {MISS_LABEL}。再串行加融合 kernel、AR 和 MoE。",
         size=14,
     )
-    textbox(s3, 0.42, 1.44, 12.5, 0.22, "10 秒在两个端点上怎么加完", 13, True, ACCENT)
+    textbox(s3, 0.42, 1.36, 12.5, 0.20, "10 秒在两个端点上怎么加完", 12, True, ACCENT)
     walk = [
         ["笔", "算法", f"4K，全局批 {p4['bs']}", f"1M，全局批 {p1m['bs']}"],
         ["现算 token", f"批 × 输入 × {MISS_LABEL}", fmt_tok(p4["Q"]), fmt_tok(p1m["Q"])],
@@ -1126,17 +1132,18 @@ def main(out_path=None):
     add_table(
         s3,
         0.42,
-        1.68,
+        1.56,
         [1.70, 5.15, 2.85, 2.80],
         walk,
-        [0.26, 0.30, 0.50, 0.48, 0.50, 0.32],
+        [0.24, 0.26, 0.48, 0.46, 0.40, 0.28],
         ["head", "body", "key", "body", "body", "sum"],
+        size=11,
     )
-    textbox(s3, 0.42, 4.18, 12.5, 0.22, "同一条 10 秒，输入从 4K 到 1M", 13, True, ACCENT)
+    textbox(s3, 0.42, 3.78, 12.5, 0.20, "同一条 10 秒，输入从 4K 到 4M", 12, True, ACCENT)
     sweep_head = ["输入", "10 秒全局批", "每卡", "现算 token", "allreduce", "MoE", "注意力计算", "拉 prefix"]
     sweep_body, sweep_kinds = [], ["head"]
     for row in pb:
-        sweep_kinds.append("key" if row["S"] in (4096, 1048576) else "body")
+        sweep_kinds.append("key" if row["S"] in (4096, S_1M, S_4M) else "body")
         sweep_body.append([
             fmt_len(row["S"]),
             f"{row['bs']}",
@@ -1147,24 +1154,31 @@ def main(out_path=None):
             sec(row["t_attn"]),
             ms(row["tkv"]),
         ])
+    sweep_head_h = 0.26
+    sweep_row_h = 0.26 if len(sweep_body) > 7 else 0.24
+    sweep_y = 4.00 if len(sweep_body) > 7 else 4.50
     add_table(
         s3,
         0.42,
-        4.50,
+        sweep_y,
         [1.05, 1.55, 0.95, 1.70, 1.55, 1.55, 1.85, 2.30],
         [sweep_head] + sweep_body,
-        [0.24] + [0.24] * len(sweep_body),
+        [sweep_head_h] + [sweep_row_h] * len(sweep_body),
         sweep_kinds,
         size=11,
     )
+    p2m = by_s[S_2M]
+    p4m = by_s[S_4M]
+    foot_y = sweep_y + sweep_head_h + sweep_row_h * len(sweep_body) + 0.04
     textbox(
         s3,
         0.42,
-        6.66,
+        foot_y,
         12.5,
-        0.28,
-        f"{HIT_LABEL} prefix 整段先拉完，加在 kernel 之前：4K 这一批 {ms(p4['t_pull'])}，1M 这一批 {ms(p1m['t_pull'])}。",
-        13,
+        0.36,
+        f"{HIT_LABEL} prefix 整段先拉完，加在 kernel 之前：4K {ms(p4['t_pull'])}，1M {ms(p1m['t_pull'])}，"
+        f"2M {ms(p2m['t_pull'])}，4M {ms(p4m['t_pull'])}。",
+        12,
         False,
         MUTED,
         anchor=MSO_ANCHOR.MIDDLE,
@@ -1238,7 +1252,8 @@ def main(out_path=None):
         f"Attention {d10['t_attn']*1e3:.3f} ms，MoE {d10['t_moe']*1e3:.3f} ms，合计 {d10['t']*1e3:.3f} ms。{bs10+1} 条是 {decode(bs10+1, 4096)['t']*1e3:.3f} ms。"
         f"专家计算 {d10['t_cm']*1e3:.3f} ms，EP 双向 {d10['t_ep']*1e3:.3f} ms。注意力计算 {d10['t_ca']*1e3:.3f} ms，HBM {d10['t_hbm']*1e3:.3f} ms。"
         f"{span10} 的全局批都是 {bs10}，KV 全在 HBM。"
-        f"2M 降到 {extra[2_000_000]['b10']}，池上KV换入 {extra[2_000_000]['d10']['t_pool']*1e3:.2f} ms。"
+        f"2M 降到 {by_len[S_2M]['b10']}，池上KV换入 {by_len[S_2M]['d10']['t_pool']*1e3:.2f} ms。"
+        f"4M 降到 {by_len[S_4M]['b10']}，池上KV换入 {by_len[S_4M]['d10']['t_pool']*1e3:.2f} ms。"
         f"1M 降到 {by_len[1048576]['b10']}，{s_label} 降到 {extra[s_show]['b10']}。HBM放不下的Decode KV统一走{gbps(POOL)}"
         + (" H2D。" if pool_is_h2d() else "。")
     )
@@ -1337,33 +1352,39 @@ def main(out_path=None):
             per_card(row["b30"]),
             where(spill),
         ])
+    s6_head_h = 0.30 if len(body) > 7 else 0.36
+    s6_row_h = 0.32 if len(body) > 7 else 0.42
+    s6_y = 1.46
     add_table(
         s6,
         0.42,
-        1.50,
+        s6_y,
         [1.15, 1.35, 1.35, 1.70, 1.00, 1.75, 1.00, 3.20],
         [head] + body,
-        [0.36] + [0.42] * len(body),
+        [s6_head_h] + [s6_row_h] * len(body),
         kinds,
-        size=12,
+        size=11 if len(body) > 7 else 12,
     )
     d1m = by_len[1048576]["d30"]
-    note = s6.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.02), Inches(12.5), Inches(1.84))
+    s6_note_y = s6_y + s6_head_h + s6_row_h * len(body) + 0.10
+    s6_note_h = 7.05 - s6_note_y
+    note = s6.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(s6_note_y), Inches(12.5), Inches(s6_note_h))
     solid(note, GOLD_BG)
     textbox(
         s6,
         0.58,
-        5.08,
+        s6_note_y + 0.06,
         12.18,
-        1.72,
+        s6_note_h - 0.12,
         f"10 毫秒在 {span10} 都是 {bs10}，全在 HBM。短输入 Attention {d10['t_attn']*1e3:.2f} 毫秒，MoE {d10['t_moe']*1e3:.2f} 毫秒。"
-        f"1M 降到 {by_len[1048576]['b10']}，{s_label} 是 {extra[s_show]['b10']}，仍然全在 HBM。\n"
+        f"1M / 2M / 4M 降到 {by_len[S_1M]['b10']} / {by_len[S_2M]['b10']} / {by_len[S_4M]['b10']}，都还在 HBM。\n"
         f"30 毫秒短输入为 {bs30}。256K 为 {by_len[262144]['b30']}，已有 {by_len[262144]['d30']['spill']*100:.1f}% KV 在池中；"
         f"Attention {by_len[262144]['d30']['t_attn']*1e3:.1f} 毫秒，MoE {by_len[262144]['d30']['t_moe']*1e3:.1f} 毫秒。"
-        f"512K 降到 {by_len[524288]['b30']}，1M 为 {by_len[1048576]['b30']}，{s_label} 为 {extra[s_show]['b30']}。\n"
+        f"512K 降到 {by_len[524288]['b30']}，1M 为 {by_len[1048576]['b30']}，"
+        f"2M 为 {by_len[S_2M]['b30']}，4M 为 {by_len[S_4M]['b30']}，{s_label} 为 {extra[s_show]['b30']}。\n"
         f"Prefill 的 10 秒全局批在第 3 页：4K 为 {p4['bs']}，1M 为 {p1m['bs']}。"
         f"4K 进、512 出、{HIT_LABEL} 命中时，P:D 在 10 毫秒约 1:{pd10:.1f}，在 30 毫秒约 1:{pd30:.1f}。",
-        14,
+        13,
         False,
         GOLD,
         anchor=MSO_ANCHOR.MIDDLE,
@@ -1387,8 +1408,8 @@ def main(out_path=None):
         )
         + "Decode Attention = SWAP + max(HBM, compute) + AR；再加完整 MoE。"
         + " ".join(lines)
-        + f" 2M 的 10 毫秒批 {extra[2_000_000]['b10']}，池上读 {extra[2_000_000]['d10']['t_pool']*1e3:.2f} ms。"
-        f"4×10^6 的 10 毫秒批 {extra[4_000_000]['b10']}，30 毫秒批 {extra[4_000_000]['b30']}。"
+        + f" 2M 的 10 毫秒批 {by_len[S_2M]['b10']}，池上读 {by_len[S_2M]['d10']['t_pool']*1e3:.2f} ms，30 毫秒批 {by_len[S_2M]['b30']}。"
+        f"4M 的 10 毫秒批 {by_len[S_4M]['b10']}，池上读 {by_len[S_4M]['d10']['t_pool']*1e3:.2f} ms，30 毫秒批 {by_len[S_4M]['b30']}。"
         f"{s_label} 的 10 毫秒批 {extra[s_show]['b10']}，30 毫秒批 {extra[s_show]['b30']}。"
         f"单条 1M、{HIT_LABEL} 命中的 TTFT 是 {one_1m['t']:.4f} 秒。冷的 1M 单条是 {prefill_one(1048576)['t']:.3f} 秒。"
         "第 3 页 Prefill："
@@ -1545,15 +1566,20 @@ def main(out_path=None):
         size=14,
     )
     census_head = ["输入", "30 毫秒批", "每卡", "溢出", "每卡换入", "128 卡合计", "换入耗时", "kernel 瓶颈"]
+    n_swap = len(swap_pts)
+    census_y = 1.40
+    census_head_h = 0.28 if n_swap > 4 else 0.38
+    census_row_h = 0.28 if n_swap > 4 else 0.42
     add_table(
-        s8, 0.42, 1.48,
+        s8, 0.42, census_y,
         [1.35, 1.25, 0.90, 1.05, 1.50, 1.65, 1.45, 3.15],
         [census_head] + [census_row(pt) for pt in swap_pts],
-        [0.38] + [0.42] * len(swap_pts),
+        [census_head_h] + [census_row_h] * n_swap,
         ["head"] + ["key" if pt is hold or attn_name(pt["d30"])[0] == "换入" else "body" for pt in swap_pts],
-        size=12,
+        size=11 if n_swap > 4 else 12,
     )
-    textbox(s8, 0.42, 3.70, 12.5, 0.22, "同一批长度上，换入和另外几笔的耗时", 13, True, ACCENT)
+    time_title_y = census_y + census_head_h + census_row_h * n_swap + 0.06
+    textbox(s8, 0.42, time_title_y, 12.5, 0.20, "同一批长度上，换入和另外几笔的耗时", 12, True, ACCENT)
     time_head = ["输入", "换入", "allreduce", "注意力计算", "HBM KV+权重", "读专家", "一步"]
     time_body = []
     time_kinds = ["head"]
@@ -1569,21 +1595,28 @@ def main(out_path=None):
             ms2(d["t"]),
         ])
         time_kinds.append("key" if attn_name(d)[0] == "换入" else "body")
+    time_y = time_title_y + 0.22
+    time_head_h = 0.26 if n_swap > 4 else 0.36
+    time_row_h = 0.26 if n_swap > 4 else 0.36
     add_table(
-        s8, 0.42, 4.06,
+        s8, 0.42, time_y,
         [1.45, 1.70, 1.80, 1.90, 1.80, 1.70, 1.95],
         [time_head] + time_body,
-        [0.36] + [0.36] * len(swap_pts),
+        [time_head_h] + [time_row_h] * len(swap_pts),
         time_kinds,
-        size=12,
+        size=11 if n_swap > 4 else 12,
     )
-    note = s8.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.04), Inches(12.5), Inches(1.00))
+    s8_note_y = time_y + time_head_h + time_row_h * n_swap + 0.08
+    s8_note_h = 7.05 - s8_note_y
+    note = s8.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(s8_note_y), Inches(12.5), Inches(s8_note_h))
     solid(note, GOLD_BG)
+    ten_clean = all(row["d10"]["spill"] < 0.005 for row in sweep)
+    ten_line = "10 毫秒从 4K 到 4M 都全在 HBM。" if ten_clean else "10 毫秒里已经有长度进池，见上表。"
     textbox(
-        s8, 0.58, 6.08, 12.18, 0.92,
+        s8, 0.58, s8_note_y + 0.04, 12.18, s8_note_h - 0.08,
         f"稀疏读不是整段存量：30层压缩indexer、31层HCA、最多1024条完整latent，再加4.50 MB。换入带宽{gbps(POOL)}。\n"
-        f"10 毫秒到 {s_label} 仍全在 HBM，128K 也全在 HBM。这两页只保留溢出大于 0 的长度，后面的分析沿用这个口径。",
-        13, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
+        f"{ten_line}这两页只保留溢出大于 0 的长度，后面的分析沿用这个口径。",
+        12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s8.notes_slide.notes_text_frame.text = (
         f"池上字节=spill×bs×n_csa_read(S)/128。换入带宽{gbps(POOL)}。"
@@ -1830,24 +1863,29 @@ def main(out_path=None):
             sec(row["t_combine"]),
             sec(row["t_moe"]),
         ])
+    moe_head_h = 0.30 if len(moe_rows) > 7 else 0.38
+    moe_row_h = 0.34 if len(moe_rows) > 7 else 0.43
+    moe_y = 1.46
     add_table(
         s14,
         0.42,
-        1.50,
+        moe_y,
         [0.90, 1.25, 1.45, 1.45, 1.55, 1.55, 1.45, 1.90],
         [moe_head] + moe_rows,
-        [0.38] + [0.43] * len(moe_rows),
-        ["head"] + ["key" if row["S"] in (4096, 1048576) else "body" for row in pb],
-        size=12,
+        [moe_head_h] + [moe_row_h] * len(moe_rows),
+        ["head"] + ["key" if row["S"] in (4096, S_1M, S_4M) else "body" for row in pb],
+        size=11 if len(moe_rows) > 7 else 12,
     )
-    note = s14.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.30), Inches(12.5), Inches(1.56))
+    s14_note_y = moe_y + moe_head_h + moe_row_h * len(moe_rows) + 0.10
+    s14_note_h = 7.05 - s14_note_y
+    note = s14.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(s14_note_y), Inches(12.5), Inches(s14_note_h))
     solid(note, GOLD_BG)
     textbox(
         s14,
         0.58,
-        5.36,
+        s14_note_y + 0.06,
         12.18,
-        1.44,
+        s14_note_h - 0.12,
         f"4K：dispatch {p4['t_dispatch']:.2f} 秒 + max(权重 {p4['t_we']*1e3:.1f} 毫秒，GEMM {p4['t_gemm']:.2f} 秒) "
         f"+ combine {p4['t_combine']:.2f} 秒 = {p4['t_moe']:.2f} 秒。\n"
         f"1M：dispatch {p1m['t_dispatch']:.2f} 秒 + max(权重 {p1m['t_we']*1e3:.1f} 毫秒，GEMM {p1m['t_gemm']:.2f} 秒) "

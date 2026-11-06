@@ -1,10 +1,12 @@
 # 10T DeepSeek 在 96 GB / 486 T、128 卡上的计算过程
 
-本文对应 `docs/deepseek-96g-slo.pptx` 的 14 页。数字来自生成该文件的计时模型，并与幻灯片、备注中的边界值对齐。
+本文对应 `docs/deepseek-96g-slo.pptx` 的 14 页。数字来自生成该文件的计时模型，并与幻灯片、备注中的边界值对齐。另有两份场景稿，不替换本档 25% 口径，见第 18 节。
 
 公式全部写在 Markdown 代码块里，不用 LaTeX。代码块中 `#` 后面是符号注释。容量按十进制：`1 GB = 10^9 字节`，`1 TB = 10^12 字节`。幻灯片上的「秒 / 毫秒」是四舍五入后的展示值，正文同时给出未舍入的代入结果。
 
-这是数据面理论上限。调度、kernel 启动、collective 启动、RMSNorm、RoPE、Router、残差、logits、sampling 和 P/D 控制面没有实测值，不并进 10 秒或 10/30 毫秒。
+集合通信按 Hockney 计算：每一层的 AllReduce、dispatch、combine 各付 5 微秒启动，再加字节/带宽。5 微秒是这套 8 卡 fullmesh 与 128 卡 D2D 上的规划值，不是实测。调度、kernel 启动、RMSNorm、RoPE、Router、残差、logits、sampling 和 P/D 控制面没有实测值，不并进 10 秒或 10/30 毫秒。KV 换入仍整段计入 TPOT。Prefill 的拉 prefix、融合 kernel、AllReduce 串行相加，只在融合 kernel 内部对 HBM 和 FLOP 取最大。
+
+下文第 8 节以后的代入表仍是未加启动项、按 98% 命中写出的旧数。当前幻灯片以 `docs/build_deepseek_96g_slo_ppt.py` 为准。
 
 ---
 
@@ -71,7 +73,8 @@ BS = 10497 时 TPOT = 30.046506 毫秒
 | `HBM_BW` | 单卡有效 HBM 带宽 | 3.20 × 10^12 字节/s |
 | `D2D` | 单卡有效 D2D 带宽，承载 MoE 的 dispatch / combine | 320 × 10^9 字节/s |
 | `P2P` | 单卡 fullmesh 聚合后的有效 AllReduce 带宽 | 280 × 10^9 字节/s |
-| `PARAM` | 单卡有效参数面带宽，承载 prefix 拉取和 P→D | 40 × 10^9 字节/s |
+| `PARAM` | 单卡 P→D 带宽，参数面物理带宽的 80% | 40 × 10^9 字节/s |
+| `PREFIX_PULL` | 单卡拉 prefix 带宽，参数面物理带宽的 25% | 12.5 × 10^9 字节/s |
 | `H2D` | 单卡有效 Host-to-Device 带宽 | 51.2 × 10^9 字节/s |
 | `POOL` | Decode 从 DDR 池换入 HBM 的有效带宽。本档等于 `H2D` | 51.2 × 10^9 字节/s |
 | `ROOM` | 128 卡合计可放 KV 的 HBM 字节 | 5.719964 × 10^12 |
@@ -130,13 +133,16 @@ P2P = 350 × 10^9 × 0.80
           = 50 × 10^9 字节/s
 
 PARAM = 50 × 10^9 × 0.80
-      = 40 × 10^9 字节/s              # prefix 拉取、P→D。不是 fullmesh
+      = 40 × 10^9 字节/s              # P→D。不是 fullmesh
+
+PREFIX_PULL = 50 × 10^9 × 0.25
+            = 12.5 × 10^9 字节/s      # prefix 拉取。存储服务整个 Prefill 集群，按物理带宽的 25%，不叠乘 80%
 
 H2D = 64 × 10^9 × 0.80
     = 51.2 × 10^9 字节/s
 ```
 
-每条 fullmesh 链路是 400 Gb/s，不是每卡聚合 400 Gb/s。8 卡里每卡连另外 7 卡，所以 AllReduce 用 280 GB/s。参数面仍是每卡一条 400 Gb/s，有效 40 GB/s。
+每条 fullmesh 链路是 400 Gb/s，不是每卡聚合 400 Gb/s。8 卡里每卡连另外 7 卡，所以 AllReduce 用 280 GB/s。参数面仍是每卡一条 400 Gb/s。P→D 取 80%，有效 40 GB/s。prefix 拉取取物理带宽的 25%，有效 12.5 GB/s，因为存储同时服务整个 Prefill 集群。Prefill 与 Decode 都是 TP=8、DP=16。
 
 ### 3.3 DDR5 与 Decode 换入
 
@@ -381,7 +387,7 @@ TP = 8
 DP = 16
 EP = 128
 
-n = ceil(BS / 16)          # 最忙 TP 组的请求数
+n = ceil(BS / 16)          # 最忙 TP 组的请求数。Prefill 与 Decode 相同
 每卡条数 = BS / 128         # 展示用平均条数；KV 和 AR 不用这个平均数
 ```
 
@@ -400,15 +406,15 @@ Attention 的 KV、AllReduce、投影都先落在这 `n` 条上，再除以 `TP 
 8 卡 fullmesh 的通信量仍按 ring 的 `2 × (TP − 1) / TP` 计，带宽用 7 链路聚合后的 280 GB/s。每个 token 的 hidden 是 BF16，2 字节。61 层各做一次。
 
 ```
-字节 = 61 × 2 × (8 − 1) / 8 × (行数 × 7168 × 2)
-     = 61 × 1.75 × 行数 × 14,336
+每层字节 = 2 × (8 − 1) / 8 × (行数 × 7168 × 2)
+         = 1.75 × 行数 × 14,336
 
-T_AR = 字节 / 280 × 10^9
+T_AR = 61 × (5 × 10^-6 + 每层字节 / 280 × 10^9)
 ```
 
 Prefill 的「行数」是最忙 TP 组的现算 token 行 `n × q`。Decode 的「行数」是 `n`，因为一步只生成 1 个 token。
 
-AR 不和 GEMM 重叠：Decode 把它加在 Attention kernel 后面；Prefill 把它放进 query chunk 流水，和拉取、HBM、计算四者取最大。
+AR 不和 GEMM 重叠。Decode 把它加在 Attention kernel 后面。Prefill 先把 prefix 整段拉完，融合 kernel 内部只对 HBM 和计算取最大，AR 再加在 kernel 后面。
 
 ### 7.2 Attention FLOP
 
@@ -501,11 +507,11 @@ F_gemm = (routed_rows + shared_rows) × 6 × 7168 × 3072 × 61
 T_gemm = F_gemm / PEAK
 ```
 
-EP 通信按最忙卡的 `hot` 次指派。dispatch 是 FP8，每元素 1 字节；combine 是 BF16，每元素 2 字节。两段都不能和 GEMM 重叠，彼此也不能重叠。同一 `hot`、同一 320 GB/s 下，combine 时间是 dispatch 的 2 倍：
+EP 通信按最忙卡的 `hot` 次指派。dispatch 是 FP8，每元素 1 字节；combine 是 BF16，每元素 2 字节。两段都不能和 GEMM 重叠，彼此也不能重叠。带宽项里 combine 的字节是 dispatch 的 2 倍；每一层两边还各加 5 微秒，所以两段时间不再是 2 倍关系：
 
 ```
-T_dispatch = hot × 7168 × 1 × 61 / 320 × 10^9
-T_combine  = hot × 7168 × 2 × 61 / 320 × 10^9
+T_dispatch = 61 × (5 × 10^-6 + hot × 7168 × 1 / 320 × 10^9)
+T_combine  = 61 × (5 × 10^-6 + hot × 7168 × 2 / 320 × 10^9)
 ```
 
 融合 kernel 里读权重和 GEMM 取最大。kernel 前后各加一次 EP：
@@ -892,7 +898,6 @@ P:D(30 毫秒) = 5,492.8 / 683.333 = 8.04
 ```
 固定开销 = 调度
          + kernel 启动
-         + collective 启动
          + RMSNorm / RoPE / Router / 激活 / 残差
          + logits / sampling
          + P/D 控制
@@ -902,14 +907,14 @@ P:D(30 毫秒) = 5,492.8 / 683.333 = 8.04
 
 - 10 秒、10 毫秒、30 毫秒都是数据面预算被算满后的上限。
 - 生产上要先从这些预算里扣掉测得的固定开销，再重跑 `BS` 和最大 `S` 的搜索。
-- Prefill 的 query chunk 流水没有单列 fill / drain 气泡，气泡也放在未计入项。
+- Prefill 不再做跨 query chunk 流水。拉 prefix、融合 kernel、AllReduce 按顺序相加。
 
 ---
 
 ## 17. 计时规则一览
 
 ```
-TTFT Attention = max(拉 prefix, HBM, Attention 计算, AR)
+TTFT Attention = 拉 prefix + max(HBM, Attention 计算) + AR
 TTFT MoE       = dispatch(FP8) + max(读专家权重, GEMM) + combine(BF16)
 TTFT           = TTFT Attention + TTFT MoE + P→D 尾巴
 
@@ -918,13 +923,16 @@ TPOT MoE       = dispatch(FP8) + max(读专家权重, GEMM) + combine(BF16)
 TPOT           = TPOT Attention + TPOT MoE
 ```
 
-允许取最大的只有两类：
+`AR`、`dispatch`、`combine` 都是 `61 × (5 微秒 + 该层字节 / 带宽)`。5 微秒加在对应集合通信上，不和 kernel 取最大。
 
-- Prefill 的 prefix 拉取、HBM、Attention 计算、AR，被看成跨 query chunk 的流水。
-- 同一个融合 kernel 内部的权重读取和 GEMM，以及 Decode Attention kernel 内部的 HBM 读取和计算。
+允许取最大的只有融合 kernel 内部：
+
+- Prefill 与 Decode 的 Attention kernel：HBM 读取和 FLOP。
+- MoE 的专家 kernel：读权重和 GEMM。
 
 必须相加的是：
 
+- Prefill 的拉 prefix、Attention kernel、AR。prefix 整段先拉完，AR 不和 kernel 重叠。
 - Attention 整段和 MoE 整段。
 - dispatch 与 combine 两个方向。dispatch 每元素 1 字节，combine 每元素 2 字节，时间不相等。
 - Decode 的 SWAP、Attention kernel、AR。SWAP 先把 KV 写进 HBM，kernel 再读 HBM，AR 不假设已经和投影融合。
@@ -934,3 +942,68 @@ KV 的分工：
 - 容量和饼图用 `K(S) = 4939.5 × S + 4,497,408`，再按 `n / 8` 放到最忙卡。
 - Decode 的 HBM 时间和 H2D 换入用 `R_KV(S)`，CSA 完整 latent 最多 1024 条。
 - 溢出比例 `f` 用 128 卡合计存量对 `ROOM = 5.720 TB` 计算，然后乘到最忙卡的稀疏读上。
+
+---
+
+## 18. 两份场景稿
+
+`docs/deepseek-96g-slo.pptx` 仍是 prefix 拉取 = 物理带宽 25%（12.5 GB/s）、Decode SWAP = H2D 51.2 GB/s。下面两份不改集群配置文件，只改这一处或两处带宽，其余公式不变。TP 仍是 8。生成命令：
+
+```
+python3 docs/build_deepseek_96g_slo_ppt.py cases
+```
+
+`docs/deepseek-96g-slo-uc1-kv100.pptx`：prefix 拉取改为物理带宽的 100%，每卡 50 GB/s，不叠乘 80%。Decode SWAP 仍是 51.2 GB/s。最后一页对照 25%。
+
+`docs/deepseek-96g-slo-uc1-ttft-tps.pptx` 是这一档的单页对照。系统 Prefill TPS = 全局批 × 输入长度 / 该批实际 TTFT，按 128 卡一份副本、完整输入 token 计，不是只算 0.5% 现算 token。TTFT 展开为拉 KV、计算、AR、MoE。计算 = max(HBM, Attention FLOP)。最右列是相对同长度 25% 行的 TPS 提升，25% 行标为基线。
+
+`docs/deepseek-96g-slo-uc2-swap400.pptx`：在用例 1 上，把 Decode KV SWAP 从 51.2 GB/s 改为 400 GB/s。输入长度收到 2M 和 4M，这里的 1M、2M、4M 是 1 048 576 的整数倍。最后一页同时对照 25% 拉 KV 和 51.2 GB/s 换入。
+
+99.5% 命中、TTFT ≤ 10 秒的 Prefill 全局批。100% 物理带宽不是把批量乘 4：拉 KV、AllReduce、MoE 都随批量变长。
+
+```
+输入     25% 批     100% 批    25% 拉 KV    100% 拉 KV
+4K      147184     177392     2.266 秒      0.683 秒
+8K       74834      88783     2.094 秒      0.621 秒
+32K      18496      21594     1.914 秒      0.559 秒
+128K      4192       4800     1.700 秒      0.486 秒
+256K      1856       2088     1.500 秒      0.423 秒
+512K       752        831     1.213 秒      0.336 秒
+1M         272        288     0.877 秒      0.232 秒
+2M          80         80     0.52 秒       0.13 秒
+4M          16         16     0.21 秒       0.05 秒
+```
+
+4K 的 100% 合计仍贴 10.000 秒。1M 的 100% 合计 9.771 秒；289 条时最忙组从 18 条跳到 19 条，TTFT 超过 10 秒。2M 两边都是 80，4M 两边都是 16：再加一条会让最忙组跳一档并超过 10 秒，所以批量不再上升，拉 KV 时间仍然下降。冷请求不拉 prefix，最大输入仍是 324,144。
+
+用例 1 的 Decode 与 25% 版相同：4K 的 10 毫秒批 179，30 毫秒批 10,198。
+
+用例 2 只改变进池之后的 30 毫秒批。KV 还在 HBM 里时，400 GB/s 不改变批量。
+
+```
+输入    51.2 GB/s 批    400 GB/s 批    51.2 换入    400 换入    51.2 溢出    400 溢出
+4K           10198          10198      0            0           0%           0%
+128K          7936           7936      0            0           0%           0%
+256K          4562           5168      4.52 毫秒    2.76 毫秒   3.5%        14.8%
+512K          2339           2992      7.14 毫秒    5.33 毫秒   5.7%        26.3%
+1M            1190           1584      8.95 毫秒    6.31 毫秒   7.3%        30.3%
+2M             597            800      9.25 毫秒    6.40 毫秒   7.5%        31.0%
+4M             301            445     10.08 毫秒    8.71 毫秒   8.3%        38.0%
+```
+
+溢出比例上升，是因为更大的批把更多 KV 挤出 5.72 TB HBM。单次换入时间仍然下降。
+
+用例 2 最后一页把 H2D 内存池（51.2 GB/s）和 D2D 内存池（400 GB/s，D2D 峰值，不是 MoE 的 320 GB/s）换成系统 Decode TPS。系统 Decode TPS = 全局批 / 该批实际 TPOT，按 128 卡一份副本、每步每条请求 1 个新 token。
+
+10 毫秒从 4K 到 4M 都全在 HBM，两条池的批和 TPS 相同，收益为 0。30 毫秒在 4K 到 128K 也不进池。进池之后：
+
+```
+输入    H2D TPS      D2D TPS      TPS 提升
+256K    15.2 万      17.2 万      +13.3%
+512K     7.80 万      9.98 万     +28.0%
+1M       3.97 万      5.29 万     +33.2%
+2M       1.99 万      2.68 万     +34.3%
+4M       1.01 万      1.48 万     +46.4%
+```
+
+4M 的批量是 301 → 445（+47.8%），TPS 提升低于批量提升：H2D 这批实际 29.71 毫秒，D2D 贴着 29.99 毫秒。

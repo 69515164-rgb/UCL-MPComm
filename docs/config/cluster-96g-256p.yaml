@@ -63,6 +63,8 @@ effective:
   # min(D2D 口 400 GB/s, 7 × 50 GB/s) × 0.80。聚合峰值 350 GB/s，不再被 D2D 口截断。
   fullmesh_Bps: 280000000000
   parameter_plane_Bps: 40000000000
+  # 存储同时服务整个 Prefill 集群。物理 50 GB/s × 25%，不叠乘 80%。
+  prefix_fetch_Bps: 12500000000
   h2d_Bps: 51200000000
   # 1288.8 GB/s × 0.80，再除以 8 卡。
   ddr5_bandwidth_Bps: 1031040000000
@@ -91,6 +93,7 @@ traffic:
   moe_dispatch_combine: d2d
   attention_allreduce: fullmesh
   # AllReduce 字节仍按 ring 的 2×(TP-1)/TP 计，带宽用上面的 fullmesh 聚合。
+  # 并发拉取按 prefix_fetch_Bps，不是 parameter_plane 的 80%。
   prefix_fetch: parameter_plane
   prefill_to_decode: parameter_plane
   prefill_host_input: h2d

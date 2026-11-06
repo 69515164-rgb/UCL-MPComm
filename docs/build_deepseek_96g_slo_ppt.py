@@ -9,7 +9,12 @@ but TopK, norm and RoPE are not given a separate FLOP term.
 H2D is 64 GB/s per GPU: 51.2 GB/s effective.  It carries prefill
 host input and every decode-side DDR/KV swap into GPU HBM.
 DDR5 is 1288.8 GB/s and 768 GB per 8-GPU machine.
-Prefix-cache hits use the 40 GB/s effective parameter plane, not H2D.
+Prefix-cache hits use 25% of the physical parameter-plane rate, 12.5 GB/s,
+because that storage serves the whole prefill cluster at once. P-to-D
+stays at 80% of the same link, 40 GB/s. Prefill and decode both use TP=8.
+`python3 docs/build_deepseek_96g_slo_ppt.py cases` also writes two scenario
+decks: prefix pull at 100% of line rate, then that deck with decode KV
+swap set to 400 GB/s. Those files do not replace the 25% deck.
 
 D2D is 3.2 Tb/s per GPU: 400 GB/s peak, 320 GB/s effective.
 Each link in the 8-GPU fullmesh is 400 Gb/s.  Seven links run in
@@ -56,8 +61,9 @@ PALE = "E7F3F2"
 GOLD_BG = "F8F1E4"
 GOLD = "7A541C"
 
-N, TP, NODE = 128, 8, 8
-DP = N // TP
+N, NODE = 128, 8
+TP, DP = 8, 16
+TP_P, DP_P = TP, DP
 PEAK_BASE = 486e12 * 0.70
 PEAK_EXTRA = 108e12 * 0.60
 PEAK_TENSOR = PEAK_BASE + PEAK_EXTRA
@@ -69,13 +75,72 @@ D2D_PEAK = 3.2e12 / 8
 D2D = D2D_PEAK * 0.80
 P2P_LINK = 400e9 / 8
 P2P = min(D2D_PEAK, (NODE - 1) * P2P_LINK) * 0.80
-PARAM = 400e9 / 8 * 0.80
+P2P_P = P2P
+# Empty-collective completion, paid once per layer. Planning value for this
+# fullmesh and the 128-GPU D2D domain, not a measured NCCL ping.
+COLL_ALPHA = 5e-6
+PARAM_PEAK = 400e9 / 8
+PARAM = PARAM_PEAK * 0.80
+# Storage is shared by the whole prefill cluster, so the recorded deck
+# fetches prefix KV at 25% of the physical parameter-plane rate, not the
+# 80% used for a dedicated P-to-D transfer. Scenario decks override this.
+PREFIX_FRAC = 0.25
+PREFIX_PULL = PARAM_PEAK * PREFIX_FRAC
 H2D = 64e9 * 0.80
 DDR_NODE_BW = 1288.8e9 * 0.80
 DDR_SHARE = DDR_NODE_BW / NODE
 HOST = min(H2D, DDR_SHARE)
 POOL = HOST
 DDR_PER_GPU_CAP = 768e9 / NODE
+SLIDE_TOTAL = 14
+CASE_FOOTER = (
+    "10T 为外推    ·    96 GB / 486 T + 108 T、一份 128 卡副本    ·    访存与通信 80%    ·    张量 405 T"
+)
+DECK_TITLE = "10T DeepSeek：96 GB / 486 T 上的 TTFT / TPOT"
+COMPARE_BASELINE = False
+
+
+def gbps(v):
+    x = v / 1e9
+    if abs(x - round(x)) < 1e-9:
+        return f"{x:.0f} GB/s"
+    return f"{x:.1f} GB/s"
+
+
+def prefix_pct():
+    p = PREFIX_FRAC * 100
+    if abs(p - round(p)) < 1e-9:
+        return f"{p:.0f}%"
+    return f"{p:g}%"
+
+
+def pool_is_h2d():
+    return abs(POOL - HOST) < 1.0
+
+
+def prefix_why():
+    if abs(PREFIX_FRAC - 0.25) < 1e-9:
+        return "物理 50 GB/s 的 25%；存储服务整个 Prefill 集群"
+    return f"物理 50 GB/s 的 {prefix_pct()}；本用例不再按 25% 打折"
+
+
+def swap_comment():
+    if pool_is_h2d():
+        return "DDR池 → H2D → HBM；必须先完成"
+    return f"本用例按 {gbps(POOL)} 换入；必须先完成"
+
+
+def signed_pct(new, old):
+    if old == 0:
+        return "—"
+    return f"{(new - old) / old * 100:+.1f}%"
+
+
+def fmt_tps(v):
+    x = v / 1e4
+    if x >= 10:
+        return f"{x:.1f} 万"
+    return f"{x:.2f} 万"
 
 E, L, H, DFF, TOPK = 2469, 61, 7168, 3072, 6
 N_CSA, N_HCA = 30, 31
@@ -87,7 +152,16 @@ MOE = TOPK * L * 6 * H * DFF + L * 6 * H * DFF
 PROJ = ATTN * 2
 BPT = N_CSA * (576 / 4 + 64 / 4) + N_HCA * (576 / 128)
 FIXED = L * 128 * 576
-PREFIX_HIT = 0.98
+S_1M = 1048576
+S_2M = 2 * S_1M
+S_4M = 4 * S_1M
+PREFIX_HIT = 0.995
+HIT_LABEL = f"{PREFIX_HIT * 100:g}%"
+MISS = 1.0 - PREFIX_HIT
+MISS_LABEL = f"{MISS * 100:g}%"
+# Average context a new token sees: the prefix plus half the causal triangle.
+AVG_CTX = PREFIX_HIT + MISS / 2.0
+AVG_LABEL = f"{AVG_CTX * 100:g}%"
 RESERVE = 6e9
 ROOM = N * (HBM_CAP - ROUTED / N - SHARED - ATTN / TP - RESERVE)
 EXPERT_GB = W_ONE * 0.5 / 1e9
@@ -253,7 +327,7 @@ def chrome(slide, page, title, kicker, total=14):
     solid(bar, ACCENT)
     textbox(slide, 0.42, 0.16, 10.6, 0.28, kicker, 12, True, ACCENT, anchor=MSO_ANCHOR.MIDDLE)
     textbox(slide, 0.42, 0.42, 12.5, 0.42, title, 26, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
-    textbox(slide, 11.4, 0.18, 1.5, 0.26, f"{page}  /  {total}", 12, False, MUTED, PP_ALIGN.RIGHT)
+    textbox(slide, 11.4, 0.18, 1.5, 0.26, f"{page}  /  {SLIDE_TOTAL}", 12, False, MUTED, PP_ALIGN.RIGHT)
     rule = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.42), Inches(7.18), Inches(12.5), Inches(0.01))
     solid(rule, LINE)
     textbox(
@@ -262,7 +336,7 @@ def chrome(slide, page, title, kicker, total=14):
         7.20,
         12.5,
         0.24,
-        "10T 为外推    ·    96 GB / 486 T + 108 T、一份 128 卡副本    ·    访存与通信 80%    ·    张量 405 T",
+        CASE_FOOTER,
         11,
         False,
         MUTED,
@@ -286,9 +360,9 @@ def chips(slide, items, number_size=28):
         textbox(slide, x + 0.16, 6.26, 2.75, 0.64, sub, 13, False, INK)
 
 
-def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0):
+def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0, tp=TP):
     """Add one per-busiest-GPU 96 GB HBM pie."""
-    weights = (ROUTED / N + SHARED + ATTN / TP) / 1e9
+    weights = (ROUTED / N + SHARED + ATTN / tp) / 1e9
     reserve = RESERVE / 1e9
     data = ChartData()
     data.categories = ["模型权重", "系统预留", "KV cache", "空闲"]
@@ -337,6 +411,16 @@ def add_hbm_pie(slide, x, title, bs, kv_hbm, free, pool=0.0):
     textbox(slide, x, 5.72, 3.86, 0.28, pool_text, 11, pool > 0, GOLD if pool > 0 else MUTED, PP_ALIGN.CENTER)
 
 
+def allreduce_time(rows, tp=TP, bw=P2P):
+    """TP allreduce over `rows` tokens, summed across all layers.
+
+    Ring volume stays 2*(tp-1)/tp on the links that group actually uses.
+    Each layer also pays COLL_ALPHA.
+    """
+    per_layer = 2 * (tp - 1) / tp * rows * H * 2
+    return L * (COLL_ALPHA + per_layer / bw)
+
+
 def align(m):
     if m <= 0:
         return 1.0
@@ -367,9 +451,10 @@ def expert_stage(tokens):
     shared_rows = math.ceil(shared_tokens / 16) * 16
     t_weight = (e_hot * W_ONE * 0.5 + SHARED) / HBM_BW
     t_gemm = (routed_rows + shared_rows) * 6 * H * DFF * L / PEAK_FP4
-    # Deployment widths: FP8 dispatch, BF16 combine. Times are not equal.
-    t_dispatch = hot_assign * H * 1 * L / D2D
-    t_combine = hot_assign * H * 2 * L / D2D
+    # Deployment widths: FP8 dispatch, BF16 combine. Bandwidth terms are not
+    # equal, and each collective also pays one startup per layer.
+    t_dispatch = L * (COLL_ALPHA + hot_assign * H * 1 / D2D)
+    t_combine = L * (COLL_ALPHA + hot_assign * H * 2 / D2D)
     return {
         "t": t_dispatch + max(t_weight, t_gemm) + t_combine,
         "tw": t_weight,
@@ -398,18 +483,19 @@ def prefill_flops(p, q):
 def prefill_batch(bs, s, hit=PREFIX_HIT):
     """TTFT data-plane model.
 
-    Prefix pull, fused attention and TP allreduce form a chunk pipeline, so
-    attention keeps the longest complete-model lane.  Attention and MoE stay
-    serialized.  P-to-D sends the full KV layer by layer; only an exposed tail
-    enters TTFT.  Fixed software/small-op latency is disclosed, not invented.
-    Prefill attention assumes ideal tile reuse: each KV byte is read once.
+    Prefix KV is loaded in bulk before the forward, then attention compute
+    and the TP allreduce run in series.  Only HBM and FLOPs overlap, inside
+    the fused kernel.  Attention and MoE stay serialized.  P-to-D sends the
+    full KV layer by layer; only an exposed tail enters TTFT.  Fixed
+    software/small-op latency is disclosed, not invented.  Prefill attention
+    assumes ideal tile reuse: each KV byte is read once.
     """
-    n = math.ceil(bs / DP)
+    n = math.ceil(bs / DP_P)
     p, q = hit * s, (1 - hit) * s
     rows = n * q
     idx, hca, core, proj = prefill_flops(p, q)
     row_eff = align(rows)
-    denom = TP * PEAK_FP8 * row_eff
+    denom = TP_P * PEAK_FP8 * row_eff
     t_idx = n * idx / denom
     t_hca = n * hca / denom
     t_core = n * core / denom
@@ -417,15 +503,15 @@ def prefill_batch(bs, s, hit=PREFIX_HIT):
     t_compute = t_idx + t_hca + t_core + t_proj
     # Prefix hits reside behind the parameter plane, not in host DDR.
     prefix_bytes = p * BPT + L * min(p, 128) * 576
-    t_pull = n * prefix_bytes / (TP * PARAM)
+    t_pull = n * prefix_bytes / (TP_P * PREFIX_PULL)
     # Ideal fused-kernel reuse: read the context once and write new KV once.
-    hbm_bytes = ATTN / TP + n * (store_seq(s) + q * BPT) / TP
+    hbm_bytes = ATTN / TP_P + n * (store_seq(s) + q * BPT) / TP_P
     t_hbm = hbm_bytes / HBM_BW
-    t_ar = 2 * (TP - 1) / TP * (rows * H * 2) * L / P2P
-    t_attention = max(t_pull, t_hbm, t_compute, t_ar)
+    t_ar = allreduce_time(rows, TP_P, P2P_P)
+    t_attention = t_pull + max(t_hbm, t_compute) + t_ar
     moe = expert_stage(bs * q)
     prefill = t_attention + moe["t"]
-    t_pd = n * store_seq(s) / (TP * PARAM)
+    t_pd = n * store_seq(s) / (TP_P * PARAM)
     # First layer releases early.  At this scale the full P-to-D transfer is
     # hidden; retain a conservative one-layer startup before overlap begins.
     overlap = prefill * (L - 1) / L
@@ -501,7 +587,7 @@ def decode(bs, s):
     t_pool = read_gpu * spill / POOL
     t_hbm = (read_gpu + ATTN / TP) / HBM_BW
     t_ca = n * (score + PROJ) / (TP * PEAK_FP8 * align(n))
-    t_ar = 2 * (TP - 1) / TP * (n * H * 2) * L / P2P
+    t_ar = allreduce_time(n)
     t_attn = t_pool + max(t_ca, t_hbm) + t_ar
     moe = expert_stage(bs)
     return {
@@ -609,7 +695,9 @@ def sec(v):
 def where(spill):
     if spill < 0.005:
         return "全在 HBM"
-    return f"{spill * 100:.1f}% 在 DDR 池（H2D）"
+    if pool_is_h2d():
+        return f"{spill * 100:.1f}% 在 DDR 池（H2D）"
+    return f"{spill * 100:.1f}% 在 DDR 池"
 
 
 def hbm_span(rows, batch_key, dec_key, bs):
@@ -626,7 +714,270 @@ def hbm_span(rows, batch_key, dec_key, bs):
     return f"{labels[0]} – {labels[-1]}"
 
 
-def main():
+def add_compare_slide(prs, blank, pb, bs10, bs30):
+    """Last page: this deck's 100% physical prefix pull versus the 25% deck."""
+    global PREFIX_PULL, POOL
+    saved_pull = PREFIX_PULL
+    PREFIX_PULL = PARAM_PEAK * 0.25
+    base = []
+    try:
+        for row in pb:
+            bs = max_prefill_bs(row["S"])
+            item = prefill_batch(bs, row["S"])
+            item["S"] = row["S"]
+            item["bs"] = bs
+            base.append(item)
+    finally:
+        PREFIX_PULL = saved_pull
+    base_by = {row["S"]: row for row in base}
+    cur_by = {row["S"]: row for row in pb}
+    b4, c4 = base_by[4096], cur_by[4096]
+    b1, c1 = base_by[1048576], cur_by[1048576]
+    nxt = prefill_batch(c1["bs"] + 1, 1048576)
+
+    decode_cmp = []
+    if not pool_is_h2d():
+        saved_pool = POOL
+        try:
+            POOL = HOST
+            for s in (262144, 524288, S_1M, S_2M, S_4M):
+                b = search_bs(s, 0.030)
+                decode_cmp.append((s, b, decode(b, s)))
+        finally:
+            POOL = saved_pool
+        paired = []
+        for s, old_bs, old_d in decode_cmp:
+            new_bs = search_bs(s, 0.030)
+            paired.append((s, old_bs, old_d, new_bs, decode(new_bs, s)))
+        decode_cmp = paired
+
+    slide = prs.slides.add_slide(blank)
+    chrome(
+        slide,
+        SLIDE_TOTAL if pool_is_h2d() else SLIDE_TOTAL - 1,
+        "拉 KV 从 25% 物理带宽改到 100%，批量上升但不是 4 倍",
+        "对照    ·    12.5 GB/s → 50 GB/s    ·    TP=8",
+    )
+    if pool_is_h2d():
+        banner(
+            slide,
+            0.92,
+            f"对照档每卡 {gbps(PARAM_PEAK * 0.25)}。本用例每卡 {gbps(PREFIX_PULL)}。冷请求不拉 KV。Decode 仍走 H2D {gbps(HOST)}，批量与对照档相同。",
+            size=13,
+        )
+    else:
+        banner(
+            slide,
+            0.92,
+            f"Prefill 与用例1相同，每卡 {gbps(PREFIX_PULL)}。第一张表对照 25% 物理带宽。Decode SWAP 本用例为 {gbps(POOL)}，第二张表对照 {gbps(HOST)}。",
+            size=13,
+        )
+    head = ["输入", "25% 批", "100% 批", "变化", "25% 拉 KV", "100% 拉 KV", "25% TTFT", "100% TTFT"]
+    body, kinds = [], ["head"]
+    for row in pb:
+        old = base_by[row["S"]]
+        kinds.append("key" if row["S"] in (4096, S_1M, S_4M) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            str(old["bs"]),
+            str(row["bs"]),
+            signed_pct(row["bs"], old["bs"]),
+            sec(old["t_pull"]),
+            sec(row["t_pull"]),
+            sec(old["t"]),
+            sec(row["t"]),
+        ])
+    table_y = 1.40
+    head_h = 0.26
+    row_h = 0.26 if len(body) > 7 else (0.25 if decode_cmp else 0.27)
+    add_table(
+        slide,
+        0.42,
+        table_y,
+        [1.00, 1.35, 1.45, 1.15, 1.70, 1.75, 1.95, 2.15],
+        [head] + body,
+        [head_h] + [row_h] * len(body),
+        kinds,
+        size=11,
+    )
+    table_bottom = table_y + head_h + row_h * len(body)
+    if decode_cmp:
+        textbox(slide, 0.42, table_bottom + 0.08, 12.5, 0.20, "Decode 30 毫秒，从进池的 256K 起：SWAP 51.2 GB/s 对照本用例 400 GB/s", 12, True, ACCENT)
+        dhead = ["输入", "51.2 批", "400 批", "变化", "51.2 换入", "400 换入", "51.2 溢出", "400 溢出"]
+        dbody, dkinds = [], ["head"]
+        for s, old_bs, old_d, new_bs, new_d in decode_cmp:
+            dkinds.append("key" if old_d["spill"] >= 0.005 or new_d["spill"] >= 0.005 else "body")
+            dbody.append([
+                fmt_len(s),
+                str(old_bs),
+                str(new_bs),
+                signed_pct(new_bs, old_bs),
+                ms2(old_d["t_pool"]),
+                ms2(new_d["t_pool"]),
+                f"{old_d['spill'] * 100:.1f}%",
+                f"{new_d['spill'] * 100:.1f}%",
+            ])
+        dy = table_bottom + 0.36
+        d_head_h = 0.26
+        d_row_h = 0.26
+        add_table(
+            slide,
+            0.42,
+            dy,
+            [1.00, 1.25, 1.25, 1.15, 1.70, 1.70, 2.20, 2.25],
+            [dhead] + dbody,
+            [d_head_h] + [d_row_h] * len(dbody),
+            dkinds,
+            size=11 if len(dbody) > 5 else 12,
+        )
+        note_y = dy + d_head_h + d_row_h * len(dbody) + 0.06
+        note_h = 7.08 - note_y
+        note = (
+            f"Prefill 与用例1相同。4K 全局批 {c4['bs']}（相对 25% 的 {b4['bs']}，{signed_pct(c4['bs'], b4['bs'])}），"
+            f"1M 为 {c1['bs']}（相对 {b1['bs']}，{signed_pct(c1['bs'], b1['bs'])}）。1M 再加一条是 {sec(nxt['t'])}。\n"
+            f"Decode 在 KV 还放得进 HBM 时，{gbps(POOL)} 不改变批量。4K 与 128K 的 30 毫秒批因此和 51.2 GB/s 相同。"
+            "256K 起批量上升，溢出比例也上升：更大的批把更多 KV 挤出 HBM，单次换入仍然更快。"
+        )
+    else:
+        note_y = table_bottom + 0.10
+        note_h = 1.48
+        note = (
+            f"4K：批 {b4['bs']} → {c4['bs']}（{signed_pct(c4['bs'], b4['bs'])}）。"
+            f"拉 KV {sec(b4['t_pull'])} → {sec(c4['t_pull'])}，"
+            f"AR {sec(b4['t_ar'])} → {sec(c4['t_ar'])}，"
+            f"MoE {sec(b4['t_moe'])} → {sec(c4['t_moe'])}，合计仍贴 {sec(c4['t'])}。\n"
+            f"带宽是 4 倍，批量只多 {signed_pct(c4['bs'], b4['bs'])}，因为拉 KV、AR、MoE 都随批量变长。"
+            f"1M：{b1['bs']} → {c1['bs']}，合计 {sec(b1['t'])} → {sec(c1['t'])}；再加一条是 {sec(nxt['t'])}。\n"
+            f"冷请求不拉 prefix，最大输入不变。Decode 仍走 H2D {gbps(HOST)}："
+            f"4K 的 10 毫秒批 {bs10}、30 毫秒批 {bs30}，与 25% 版相同。"
+        )
+    box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(note_y), Inches(12.5), Inches(note_h))
+    solid(box, GOLD_BG)
+    textbox(slide, 0.58, note_y + 0.04, 12.18, note_h - 0.08, note, 13, False, GOLD, anchor=MSO_ANCHOR.MIDDLE)
+    if not decode_cmp:
+        chips(
+            slide,
+            [
+                ("4K 全局批", str(c4["bs"]), f"{signed_pct(c4['bs'], b4['bs'])}\n25% 版 {b4['bs']}"),
+                ("1M 全局批", str(c1["bs"]), f"{signed_pct(c1['bs'], b1['bs'])}\n25% 版 {b1['bs']}"),
+                ("4K 拉 KV", sec(c4["t_pull"]), f"25% 版 {sec(b4['t_pull'])}\n物理带宽 ×4"),
+                ("冷请求 / Decode", "不变", f"不拉 prefix\n10 毫秒 {bs10}，30 毫秒 {bs30}"),
+            ],
+            number_size=26,
+        )
+    slide.notes_slide.notes_text_frame.text = (
+        "对照档 PREFIX_PULL = 50e9 × 0.25 = 12.5 GB/s。本页 100% 是 50 GB/s，不叠乘 80%。"
+        + " ".join(
+            f"{fmt_len(row['S'])}: {base_by[row['S']]['bs']} -> {row['bs']}, "
+            f"pull {base_by[row['S']]['t_pull']:.4f} -> {row['t_pull']:.4f}, "
+            f"ttft {base_by[row['S']]['t']:.4f} -> {row['t']:.4f}"
+            for row in pb
+        )
+        + (
+            " " + " ".join(
+                f"decode {fmt_len(s)}: {old_bs}/{old_d['t_pool']*1e3:.3f}ms/{old_d['spill']*100:.2f}% "
+                f"-> {new_bs}/{new_d['t_pool']*1e3:.3f}ms/{new_d['spill']*100:.2f}%"
+                for s, old_bs, old_d, new_bs, new_d in decode_cmp
+            )
+            if decode_cmp else " Decode SWAP unchanged at 51.2 GB/s."
+        )
+    )
+
+
+def add_pool_tps_slide(prs, blank):
+    """H2D pool at 51.2 GB/s versus this case's D2D pool, as system decode TPS."""
+    global POOL
+    lengths = (4096, 8192, 32768, 131072, 262144, 524288, S_1M, S_2M, S_4M)
+    d2d = POOL
+    rows = []
+    try:
+        for s in lengths:
+            item = {"S": s}
+            for limit, key in ((0.010, "10"), (0.030, "30")):
+                POOL = HOST
+                bh = search_bs(s, limit)
+                dh = decode(bh, s)
+                POOL = d2d
+                bd = search_bs(s, limit)
+                dd = decode(bd, s)
+                item[key] = {
+                    "bh": bh,
+                    "bd": bd,
+                    "th": bh / dh["t"],
+                    "td": bd / dd["t"],
+                    "th_t": dh["t"],
+                    "td_t": dd["t"],
+                }
+            rows.append(item)
+    finally:
+        POOL = d2d
+    by = {row["S"]: row for row in rows}
+    r4, r4m = by[4096], by[S_4M]
+    slide = prs.slides.add_slide(blank)
+    chrome(
+        slide,
+        SLIDE_TOTAL,
+        "10 毫秒换池无收益；30 毫秒从 256K 起 TPS 上升",
+        f"Decode    ·    H2D 池 {gbps(HOST)} 对照 D2D 池 {gbps(d2d)}    ·    系统 TPS",
+    )
+    banner(
+        slide,
+        0.92,
+        f"系统 Decode TPS = 全局批 / 该批实际 TPOT，单位万 token/s。H2D 内存池 {gbps(HOST)}，D2D 内存池 {gbps(d2d)}。提升以 H2D 为基线。",
+        size=13,
+    )
+    head = ["输入", "H2D·10毫秒", "D2D·10毫秒", "10毫秒提升", "H2D·30毫秒", "D2D·30毫秒", "30毫秒提升"]
+    body, kinds = [], ["head"]
+    for row in rows:
+        a, b = row["10"], row["30"]
+        kinds.append("key" if row["S"] >= 262144 else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_tps(a["th"]),
+            fmt_tps(a["td"]),
+            signed_pct(a["td"], a["th"]),
+            fmt_tps(b["th"]),
+            fmt_tps(b["td"]),
+            signed_pct(b["td"], b["th"]),
+        ])
+    table_y = 1.50
+    head_h, row_h = 0.34, 0.34
+    add_table(
+        slide,
+        0.42,
+        table_y,
+        [1.10, 1.85, 1.85, 1.55, 2.05, 2.05, 2.05],
+        [head] + body,
+        [head_h] + [row_h] * len(body),
+        kinds,
+        size=13,
+    )
+    note_y = table_y + head_h + row_h * len(body) + 0.12
+    note_h = 7.05 - note_y
+    note = (
+        f"10 毫秒从 4K 到 4M 都全在 HBM。两条池的批相同，TPS 相同：4K {fmt_tps(r4['10']['th'])}，4M {fmt_tps(r4m['10']['th'])}，提升都是 0%。\n"
+        "30 毫秒在 4K 到 128K 也不进池。256K 起 D2D 池把批量做大，右列就是相对 H2D 的 TPS 收益。\n"
+        f"4M 批量 {r4m['30']['bh']} → {r4m['30']['bd']}（{signed_pct(r4m['30']['bd'], r4m['30']['bh'])}），"
+        f"TPS 只到 {signed_pct(r4m['30']['td'], r4m['30']['th'])}："
+        f"H2D 这批实际 {ms2(r4m['30']['th_t'])}，D2D 贴着 {ms2(r4m['30']['td_t'])}。"
+        f"D2D 池是每卡 {gbps(d2d)}，不取 MoE 那条 {gbps(D2D)}。"
+    )
+    box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(note_y), Inches(12.5), Inches(note_h))
+    solid(box, GOLD_BG)
+    textbox(slide, 0.58, note_y + 0.06, 12.18, note_h - 0.12, note, 14, False, GOLD, anchor=MSO_ANCHOR.MIDDLE)
+    slide.notes_slide.notes_text_frame.text = (
+        "系统 Decode TPS = 全局批 / 实际 TPOT。H2D 池 = 51.2 GB/s，D2D 池 = 本用例 400 GB/s。"
+        + " ".join(
+            f"{fmt_len(row['S'])}: "
+            f"10ms {row['10']['bh']}->{row['10']['bd']} tps {row['10']['th']:.1f}->{row['10']['td']:.1f}; "
+            f"30ms {row['30']['bh']}->{row['30']['bd']} tps {row['30']['th']:.1f}->{row['30']['td']:.1f} "
+            f"t {row['30']['th_t']*1e3:.3f}->{row['30']['td_t']*1e3:.3f}ms"
+            for row in rows
+        )
+    )
+
+
+def main(out_path=None):
     s_max = max_input()
     s_show = int(s_max)
     p = prefill_one(s_show)
@@ -637,7 +988,7 @@ def main():
     d10 = decode(bs10, 4096)
     d30 = decode(bs30, 4096)
 
-    lengths = (4096, 8192, 32768, 131072, 262144, 524288, 1048576)
+    lengths = (4096, 8192, 32768, 131072, 262144, 524288, S_1M, S_2M, S_4M)
     sweep = []
     for s in lengths:
         b10 = search_bs(s, 0.010)
@@ -652,7 +1003,7 @@ def main():
             "d30": decode(b30, s),
         })
     extra = {}
-    for s in (2_000_000, 4_000_000, s_show):
+    for s in (s_show,):
         b10 = search_bs(s, 0.010)
         b30 = search_bs(s, 0.030)
         extra[s] = {
@@ -686,7 +1037,7 @@ def main():
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
-    prs.core_properties.title = "10T DeepSeek：96 GB / 486 T 上的 TTFT / TPOT"
+    prs.core_properties.title = DECK_TITLE
     blank = prs.slide_layouts[6]
 
     # ----- slide 1 -----
@@ -735,9 +1086,20 @@ def main():
         12.18,
         1.32,
         "外推式：总参数 = 专家数 × 4.030×10^9 + 5.260×10^10。单个专家 = 3 × 7168 × 3072 × 61。\n"
-        "本档：96 GB HBM，4 TB/s取80%为3.20 TB/s。张量算力 486 T×70% 再加 108 T×60%，有效 405.0 T。H2D每卡64 GB/s取80%为51.2 GB/s，用于Prefill主机输入及全部Decode DDR换入。机内DDR5每机1288.8 GB/s、768 GB。\n"
-        "D2D每卡3.2 Tb/s取80%为320 GB/s，只承载MoE EP等GPU间通信。DDR池标称480 GB/s，但Decode访存统一经H2D进入GPU，因此换入有效带宽为51.2 GB/s。"
-        "8卡fullmesh每条链路400 Gb/s，7链路并发后取80%为280 GB/s；参数面仍为40 GB/s。",
+        "本档：96 GB HBM，4 TB/s取80%为3.20 TB/s。张量算力 486 T×70% 再加 108 T×60%，有效 405.0 T。"
+        + (
+            "H2D每卡64 GB/s取80%为51.2 GB/s，用于Prefill主机输入及全部Decode DDR换入。"
+            if pool_is_h2d()
+            else f"H2D每卡64 GB/s取80%仍是51.2 GB/s，只承担Prefill主机输入。本用例Decode KV SWAP改为{gbps(POOL)}。"
+        )
+        + "机内DDR5每机1288.8 GB/s、768 GB。\n"
+        + "D2D每卡3.2 Tb/s取80%为320 GB/s，只承载MoE EP等GPU间通信。"
+        + (
+            "DDR池标称480 GB/s，但Decode访存统一经H2D进入GPU，因此换入有效带宽为51.2 GB/s。"
+            if pool_is_h2d()
+            else f"DDR池容量不设上限。本用例不按H2D截断，Decode换入直接取{gbps(POOL)}。"
+        )
+        + f"8卡fullmesh每条链路400 Gb/s，7链路并发后取80%为280 GB/s。参数面物理50 GB/s：P→D取80%为40 GB/s，prefix拉取取物理带宽的{prefix_pct()}，每卡{gbps(PREFIX_PULL)}。",
         13,
         False,
         GOLD,
@@ -752,12 +1114,20 @@ def main():
         "单 token 通信量 6×3×7168×61 = 7.87×10^6 字节。每 token 仍只派 6 个专家，通信量不随专家总数变。"
         "后面几页是 96 GB、486 T 加 108 T 这一档。张量有效算力 405.0×10^12。注意力和专家 GEMM 用同一个峰值。Indexer 打分也走这档。非张量的 TopK、Norm 不单列 FLOP。"
         "HBM 96 GB，带宽 4 TB/s，计时取 80% 即 3.20 TB/s。"
-        "H2D是64 GB/s（字节），80%后51.2 GB/s。Prefill主机输入和Decode的外部DDR/KV换入都走这条链路；HBM内权重与KV仍按3.20 TB/s读取。"
-        "D2D 3.2 Tb/s：换算400 GB/s峰值，80%后320 GB/s。8卡fullmesh每卡有7条400 Gb/s链路：聚合350 GB/s峰值，受D2D口约束前已较低，80%后AllReduce按280 GB/s。参数面400 Gb/s，80%后40 GB/s。"
-        "DDR5 的 1288.8 GB/s 和 768 GB 按一台 8 卡机器记。有效 1031 GB/s，每卡分到 128.9 GB/s 和 96 GB。H2D 只有 51.2 GB/s，主机路径被 H2D 卡住。"
-        "DDR池容量不设上限、标称480 GB/s，但Decode外部访存必须经过每卡H2D：min(480×80%, 64×80%, 128.9)=51.2 GB/s。MoE dispatch/combine仍走独立D2D平面320 GB/s。"
-        "本页的池带宽按每卡，不把 480 GB/s 理解成 128 卡共享。"
-        "注意力 TP=8 留在机内 fullmesh，16 台机器做 DP=16。MoE EP=128 走 D2D。"
+        + (
+            "H2D是64 GB/s（字节），80%后51.2 GB/s。Prefill主机输入和Decode的外部DDR/KV换入都走这条链路；HBM内权重与KV仍按3.20 TB/s读取。"
+            if pool_is_h2d()
+            else f"H2D是64 GB/s（字节），80%后51.2 GB/s，本用例只用于Prefill主机输入。Decode KV SWAP按{gbps(POOL)}。HBM内权重与KV仍按3.20 TB/s读取。"
+        )
+        + f"D2D 3.2 Tb/s：换算400 GB/s峰值，80%后320 GB/s。8卡fullmesh每卡有7条400 Gb/s链路：聚合350 GB/s峰值，受D2D口约束前已较低，80%后AllReduce按280 GB/s。参数面400 Gb/s，物理50 GB/s。P→D取80%为40 GB/s。prefix拉取取物理带宽的{prefix_pct()}，每卡{gbps(PREFIX_PULL)}。"
+        + "DDR5 的 1288.8 GB/s 和 768 GB 按一台 8 卡机器记。有效 1031 GB/s，每卡分到 128.9 GB/s 和 96 GB。H2D 只有 51.2 GB/s，主机路径被 H2D 卡住。"
+        + (
+            "DDR池容量不设上限、标称480 GB/s，但Decode外部访存必须经过每卡H2D：min(480×80%, 64×80%, 128.9)=51.2 GB/s。MoE dispatch/combine仍走独立D2D平面320 GB/s。"
+            if pool_is_h2d()
+            else f"DDR池容量不设上限。本用例Decode换入不走H2D截断，直接按{gbps(POOL)}。MoE dispatch/combine仍走独立D2D平面320 GB/s。"
+        )
+        + "本页的池带宽按每卡，不把 480 GB/s 理解成 128 卡共享。"
+        "注意力 TP=8 留在机内 fullmesh，16 台机器做 DP=16，7 条链路 AllReduce 有效 280 GB/s。MoE EP=128 走 D2D。"
         f"每卡扣掉路由 {ROUTED/N/1e9:.2f} GB、共享 {SHARED/1e9:.2f} GB、注意力 {ATTN/TP/1e9:.2f} GB 和 6 GB 预留后，128 卡 KV 余量 {ROOM/1e12:.2f} TB。"
         "Prefill 与 Decode 的副本数可以按吞吐配，副本个数不改变单副本的 TTFT 和 TPOT。"
     )
@@ -775,13 +1145,13 @@ def main():
     par_rows = [
         ["", "Attention", "MoE"],
         ["并行", "机内 TP=8\n16 台机器做 DP=16", "超节点 EP=128\n一份模型铺满 128 卡"],
-        ["通信域", "8卡 fullmesh，7链路并发\nAllReduce 有效 280 GB/s", "128卡 D2D，有效320 GB/s\nKV走参数面，有效40 GB/s"],
+        ["通信域", "8卡 fullmesh，7链路并发\nAllReduce 有效 280 GB/s", f"128卡 D2D，有效320 GB/s\n拉 KV 每卡 {gbps(PREFIX_PULL)}；P→D 40 GB/s"],
         [
             "每卡权重",
             f"注意力 19.35 GB / 8\n= {ATTN / TP / 1e9:.2f} GB FP8",
             f"路由专家 {E / N:.1f} 个，{ROUTED / N / 1e9:.1f} GB FP4\n共享专家 {SHARED / 1e9:.2f} GB，每卡一份",
         ],
-        ["本阶段角色", "Attention 取计算、HBM、AR 的瓶颈\n按实际最长通路决定", f"dispatch + 融合专家 kernel + combine\n到这个长度合计 {sec(p['moe'])}"],
+        ["本阶段角色", "先 max(计算, HBM)，再加 AR\n拉 prefix 在冷请求中为 0", f"dispatch + 融合专家 kernel + combine\n到这个长度合计 {sec(p['moe'])}"],
     ]
     add_table(
         s2,
@@ -802,7 +1172,7 @@ def main():
         ["稀疏注意力", "每 token 看 1024 条压缩 KV + 128 滑窗", sec(p["core"])],
         [
             "AR + P→D",
-            "AR 在 Attention 内取瓶颈；完整 KV 按层发送",
+            "AR 加在融合 kernel 之后；完整 KV 按层发送",
             f"{sec(p['t_ar'])} + {ms2(p['t_pd'])}",
         ],
         ["合计", f"Attention {p['t_attention']:.2f} 秒 + MoE {p['t_moe']:.2f} 秒；P→D 尾巴为 0", sec(p["t"])],
@@ -819,29 +1189,29 @@ def main():
     )
     s2.notes_slide.notes_text_frame.text = (
         "单请求不跨副本。增加 Prefill 节点是多放几份 128 卡副本，提高并发，单条 TTFT 不变。"
-        "冷请求没有 prefix 拉取。Attention = max(HBM, compute, AR)，MoE = dispatch + max(weight, GEMM) + combine，两段相加。"
+        "冷请求没有 prefix 拉取。Attention = max(HBM, compute) + AR，MoE = dispatch + max(weight, GEMM) + combine，两段相加。"
         f"在 S={s_show:.0f}：indexer {p['idx']:.4f}s，HCA {p['hca']:.4f}s，投影 {p['proj']:.4f}s，稀疏注意力 {p['core']:.4f}s，"
-        f"Attention 计算 {p['t_attn']:.4f}s，AR {p['t_ar']:.4f}s，所以 Attention 取 {p['t_attention']:.4f}s。"
+        f"Attention 计算 {p['t_attn']:.4f}s，HBM {p['t_hbm']:.4f}s，AR {p['t_ar']:.4f}s，拉取 {p['t_pull']:.4f}s，Attention 合计 {p['t_attention']:.4f}s。"
         f"MoE {p['t_moe']:.4f}s。完整 KV 的 P-D 传输 {p['t_pd']*1e3:.2f} ms，layer-wise 发送后尾巴 {p['t_tail']*1e3:.2f} ms。"
         f"数据面合计 {p['t']:.4f}s。固定开销没有实测，不计入；生产最大长度必须再留余量。"
     )
 
     # ----- slide 3 -----
     s3 = prs.slides.add_slide(blank)
-    chrome(s3, 3, f"4K 的 prefill 全局批是 {p4['bs']}，1M 是 {p1m['bs']}", "Prefill    ·    TTFT ≤ 10 秒    ·    KV 命中 98%")
+    chrome(s3, 3, f"4K 的 prefill 全局批是 {p4['bs']}，1M 是 {p1m['bs']}", f"Prefill    ·    TTFT ≤ 10 秒    ·    KV 命中 {HIT_LABEL}")
     banner(
         s3,
         0.92,
-        "98% prefix 经参数面 40 GB/s 拉入 HBM，只现算 2%。Attention 取拉取、融合 kernel、AR 的瓶颈，再加完整 MoE。",
+        f"{HIT_LABEL} prefix 按每卡 {gbps(PREFIX_PULL)} 整段先拉完，只现算 {MISS_LABEL}。再串行加融合 kernel、AR 和 MoE。",
         size=14,
     )
-    textbox(s3, 0.42, 1.44, 12.5, 0.22, "10 秒在两个端点上怎么加完", 13, True, ACCENT)
+    textbox(s3, 0.42, 1.36, 12.5, 0.20, "10 秒在两个端点上怎么加完", 12, True, ACCENT)
     walk = [
         ["笔", "算法", f"4K，全局批 {p4['bs']}", f"1M，全局批 {p1m['bs']}"],
-        ["现算 token", "批 × 输入 × 0.02", fmt_tok(p4["Q"]), fmt_tok(p1m["Q"])],
+        ["现算 token", f"批 × 输入 × {MISS_LABEL}", fmt_tok(p4["Q"]), fmt_tok(p1m["Q"])],
         [
             "机内 allreduce",
-            "每组现算 token × 7168 × 2 字节\n61 层 × 2×7/8 / 280 GB/s",
+            "61 层 ×（5 微秒 + 字节 / 280 GB/s）\n字节 = 2×7/8 × token × 7168 × 2",
             sec(p4["t_ar"]),
             sec(p1m["t_ar"]),
         ],
@@ -857,22 +1227,23 @@ def main():
             sec(p4["t_moe"]),
             sec(p1m["t_moe"]),
         ],
-        ["相加", "Attention 瓶颈 + 完整 MoE；P→D 尾巴为 0", sec(p4["t"]), sec(p1m["t"])],
+        ["相加", "拉 prefix + 融合 kernel + AR + MoE；P→D 尾巴为 0", sec(p4["t"]), sec(p1m["t"])],
     ]
     add_table(
         s3,
         0.42,
-        1.68,
+        1.56,
         [1.70, 5.15, 2.85, 2.80],
         walk,
-        [0.26, 0.30, 0.50, 0.48, 0.50, 0.32],
+        [0.24, 0.26, 0.48, 0.46, 0.40, 0.28],
         ["head", "body", "key", "body", "body", "sum"],
+        size=11,
     )
-    textbox(s3, 0.42, 4.18, 12.5, 0.22, "同一条 10 秒，输入从 4K 到 1M", 13, True, ACCENT)
+    textbox(s3, 0.42, 3.78, 12.5, 0.20, "同一条 10 秒，输入从 4K 到 4M", 12, True, ACCENT)
     sweep_head = ["输入", "10 秒全局批", "每卡", "现算 token", "allreduce", "MoE", "注意力计算", "拉 prefix"]
     sweep_body, sweep_kinds = [], ["head"]
     for row in pb:
-        sweep_kinds.append("key" if row["S"] in (4096, 1048576) else "body")
+        sweep_kinds.append("key" if row["S"] in (4096, S_1M, S_4M) else "body")
         sweep_body.append([
             fmt_len(row["S"]),
             f"{row['bs']}",
@@ -883,32 +1254,39 @@ def main():
             sec(row["t_attn"]),
             ms(row["tkv"]),
         ])
+    sweep_head_h = 0.26
+    sweep_row_h = 0.26 if len(sweep_body) > 7 else 0.24
+    sweep_y = 4.00 if len(sweep_body) > 7 else 4.50
     add_table(
         s3,
         0.42,
-        4.50,
+        sweep_y,
         [1.05, 1.55, 0.95, 1.70, 1.55, 1.55, 1.85, 2.30],
         [sweep_head] + sweep_body,
-        [0.24] + [0.24] * len(sweep_body),
+        [sweep_head_h] + [sweep_row_h] * len(sweep_body),
         sweep_kinds,
         size=11,
     )
+    p2m = by_s[S_2M]
+    p4m = by_s[S_4M]
+    foot_y = sweep_y + sweep_head_h + sweep_row_h * len(sweep_body) + 0.04
     textbox(
         s3,
         0.42,
-        6.66,
+        foot_y,
         12.5,
-        0.28,
-        f"98% prefix 走参数面：4K 这一批拉取 {ms(p4['t_pull'])}，1M 拉取 {ms(p1m['t_pull'])}；均短于 Attention 主瓶颈。",
-        13,
+        0.36,
+        f"{HIT_LABEL} prefix 整段先拉完，加在 kernel 之前：4K {ms(p4['t_pull'])}，1M {ms(p1m['t_pull'])}，"
+        f"2M {ms(p2m['t_pull'])}，4M {ms(p4m['t_pull'])}。",
+        12,
         False,
         MUTED,
         anchor=MSO_ANCHOR.MIDDLE,
     )
     s3.notes_slide.notes_text_frame.text = (
         "这一页的批是 128 卡副本上的全局批，每卡条数 = 全局批 / 128。切分与上一页相同：注意力 TP=8、DP=16，MoE EP=128。"
-        "KV 命中 98%，命中部分经每卡 40 GB/s 的参数面拉到 HBM。每条只现算 2%，这些 query 的平均上下文约为 99%S。"
-        "Attention = max(prefix pull, HBM, compute, AR)。MoE = dispatch + max(weight, GEMM) + combine。Attention 与 MoE 相加。"
+        f"KV 命中 {HIT_LABEL}，命中部分按每卡 {gbps(PREFIX_PULL)} 从共享存储拉到 HBM。{prefix_why()}。每条只现算 {MISS_LABEL}，这些 query 的平均上下文约为 {AVG_LABEL}S。"
+        "Attention = prefix pull + max(HBM, compute) + AR。MoE = dispatch + max(weight, GEMM) + combine。Attention 与 MoE 相加。"
         f"4K 全局批 {p4['bs']}：现算 {p4['Q']:.4e} token，allreduce {p4['t_ar']:.3f}s，注意力计算 {p4['t_attn']:.3f}s，专家计算 {p4['t_moe']:.3f}s，"
         f"EP 双向 {p4['t_ep']:.3f}s，读专家权重 {p4['t_we']*1e3:.2f} ms，拉 prefix {p4['t_pull']*1e3:.1f} ms，合计 {p4['t']:.3f}s。"
         f"再加一条是 {prefill_batch(p4['bs']+1, 4096)['t']:.3f}s。"
@@ -970,12 +1348,14 @@ def main():
         "Attention = SWAP + max(HBM, compute) + AR。MoE = dispatch + max(weight, GEMM) + combine。两段相加。"
         f"命中率 = 1 − exp(−6×{bs10} / 2469) = {d10['frac']:.4f}。最忙卡激活专家 {d10['e_hot']:.3f}。"
         f"读权重 ({d10['e_hot']:.3f}×{EXPERT_GB:.3f} GB + {SHARED/1e9:.3f} GB) / 3.20 TB/s = {d10['tw']*1e3:.3f} ms。"
-        f"机内 allreduce：ceil({bs10}/16) = {d10['toks']} 条，每条7168×2字节，每层通信量2×7/8，61层除以280 GB/s = {d10['t_ar']*1e3:.3f} ms。"
+        f"机内 allreduce：ceil({bs10}/16) = {d10['toks']} 条，每层 5 微秒 + 2×7/8×字节/280 GB/s，61 层合计 {d10['t_ar']*1e3:.3f} ms。"
         f"Attention {d10['t_attn']*1e3:.3f} ms，MoE {d10['t_moe']*1e3:.3f} ms，合计 {d10['t']*1e3:.3f} ms。{bs10+1} 条是 {decode(bs10+1, 4096)['t']*1e3:.3f} ms。"
         f"专家计算 {d10['t_cm']*1e3:.3f} ms，EP 双向 {d10['t_ep']*1e3:.3f} ms。注意力计算 {d10['t_ca']*1e3:.3f} ms，HBM {d10['t_hbm']*1e3:.3f} ms。"
         f"{span10} 的全局批都是 {bs10}，KV 全在 HBM。"
-        f"2M 降到 {extra[2_000_000]['b10']}，池上KV经H2D换入 {extra[2_000_000]['d10']['t_pool']*1e3:.2f} ms。"
-        f"1M 降到 {by_len[1048576]['b10']}，{s_label} 降到 {extra[s_show]['b10']}。HBM放不下的Decode KV统一走51.2 GB/s H2D。"
+        f"2M 降到 {by_len[S_2M]['b10']}，池上KV换入 {by_len[S_2M]['d10']['t_pool']*1e3:.2f} ms。"
+        f"4M 降到 {by_len[S_4M]['b10']}，池上KV换入 {by_len[S_4M]['d10']['t_pool']*1e3:.2f} ms。"
+        f"1M 降到 {by_len[1048576]['b10']}，{s_label} 降到 {extra[s_show]['b10']}。HBM放不下的Decode KV统一走{gbps(POOL)}"
+        + (" H2D。" if pool_is_h2d() else "。")
     )
 
     # ----- slide 5 -----
@@ -994,7 +1374,7 @@ def main():
         ["", "Attention", "MoE"],
         ["并行", f"仍是 TP=8，DP=16\n{bs30} / 16 = {d30['toks']} 条 / 组", "仍是 EP=128\n每卡 19.3 个专家全醒"],
         ["通信", "AR 在融合 kernel 后单独加\n这一档不能隐藏", f"dispatch + combine 走 320 GB/s\n合计 {ms2(d30['t_ep'])}"],
-        ["访存", "短输入全在 HBM\nDDR换入走H2D 51.2 GB/s", f"{ROUTED/N/1e9:.1f} GB 路由 + {SHARED/1e9:.2f} GB 共享\n/ 3.20 TB/s = {ms2(d30['tw'])}"],
+        ["访存", "短输入全在 HBM\n" + ("DDR换入走H2D 51.2 GB/s" if pool_is_h2d() else f"进池后 SWAP {gbps(POOL)}"), f"{ROUTED/N/1e9:.1f} GB 路由 + {SHARED/1e9:.2f} GB 共享\n/ 3.20 TB/s = {ms2(d30['tw'])}"],
         ["计算", f"注意力计算 {ms2(d30['t_ca'])}\n与HBM取大后再加AR", f"每专家约 {d30['tok']:.1f} token\n16 行砖，效率 {d30['ue']*100:.0f}%，{ms2(d30['t_cm'])}"],
     ]
     add_table(s5, 0.42, 1.78, [1.15, 2.55, 2.70], par5, [0.28, 0.58, 0.58, 0.62, 0.58], ["head", "body", "key", "body", "body"], size=12)
@@ -1030,14 +1410,18 @@ def main():
         "30 毫秒用的切分与 10 毫秒相同：TP=8，DP=16，EP=128，128 卡一份副本。"
         f"BS={bs30} 时命中率 {d30['frac']:.4f}，最忙卡激活 {d30['e_hot']:.3f} 个专家。"
         f"读权重 ({ROUTED/N/1e9:.2f} GB + {SHARED/1e9:.2f} GB) / 3.20 TB/s = {d30['tw']*1e3:.3f} ms。"
-        f"机内 allreduce：ceil({bs30}/16) = {d30['toks']} 条，每层通信量2×7/8，61层，除以280 GB/s = {d30['t_ar']*1e3:.3f} ms。"
+        f"机内 allreduce：ceil({bs30}/16) = {d30['toks']} 条，每层 5 微秒 + 2×7/8×字节/280 GB/s，61 层合计 {d30['t_ar']*1e3:.3f} ms。"
         f"Attention {d30['t_attn']*1e3:.3f} ms，MoE {d30['t_moe']*1e3:.3f} ms，合计 {d30['t']*1e3:.3f} ms。{bs30+1} 条是 {decode(bs30+1, 4096)['t']*1e3:.3f} ms。"
         f"EP 双向 {d30['t_ep']*1e3:.3f} ms，专家计算 {d30['t_cm']*1e3:.3f} ms，效率 {d30['ue']:.3f}。注意力计算 {d30['t_ca']*1e3:.3f} ms。"
         f"显存：每卡 96 − {ROUTED/N/1e9:.2f} − {SHARED/1e9:.2f} − {ATTN/TP/1e9:.2f} − 6 = {(HBM_CAP - ROUTED/N - SHARED - ATTN/TP - RESERVE)/1e9:.2f} GB，128 卡共 {ROOM/1e12:.2f} TB。"
-        "HBM放不下的Decode KV统一经每卡H2D换入。标称64 GB/s取80%为51.2 GB/s；DDR池容量不设上限。"
-        f"256K、全局批 {by_len[262144]['b30']} 时已有 {by_len[262144]['d30']['spill']*100:.1f}% KV 在池中，池上读 {by_len[262144]['d30']['t_pool']*1e3:.2f} ms。"
+        + (
+            "HBM放不下的Decode KV统一经每卡H2D换入。标称64 GB/s取80%为51.2 GB/s；DDR池容量不设上限。"
+            if pool_is_h2d()
+            else f"HBM放不下的Decode KV按每卡{gbps(POOL)}换入，不再用H2D 51.2 GB/s截断。DDR池容量不设上限。"
+        )
+        + f"256K、全局批 {by_len[262144]['b30']} 时已有 {by_len[262144]['d30']['spill']*100:.1f}% KV 在池中，池上读 {by_len[262144]['d30']['t_pool']*1e3:.2f} ms。"
         f"512K 降到 {by_len[524288]['b30']}，池上读 {by_len[524288]['d30']['t_pool']*1e3:.2f} ms。1M 降到 {by_len[1048576]['b30']}，{s_label} 降到 {extra[s_show]['b30']}。"
-        f"4K、输出 512、命中 98%：Prefill {prefill_rps:.1f} 请求/秒。10 毫秒 Decode {dec10_rps:.1f} 请求/秒，P:D ≈ 1:{pd10:.1f}。30 毫秒 Decode {dec30_rps:.1f} 请求/秒，P:D ≈ 1:{pd30:.1f}。"
+        f"4K、输出 512、命中 {HIT_LABEL}：Prefill {prefill_rps:.1f} 请求/秒。10 毫秒 Decode {dec10_rps:.1f} 请求/秒，P:D ≈ 1:{pd10:.1f}。30 毫秒 Decode {dec30_rps:.1f} 请求/秒，P:D ≈ 1:{pd30:.1f}。"
     )
 
     # ----- slide 6 -----
@@ -1046,7 +1430,11 @@ def main():
     banner(
         s6,
         0.92,
-        "全局批是128卡上的条数。放不下的Decode KV进入DDR池，并统一经每卡H2D以51.2 GB/s换回HBM。",
+        (
+            "全局批是128卡上的条数。放不下的Decode KV进入DDR池，并统一经每卡H2D以51.2 GB/s换回HBM。"
+            if pool_is_h2d()
+            else f"全局批是128卡上的条数。放不下的Decode KV进入DDR池，并按每卡{gbps(POOL)}换回HBM。"
+        ),
         size=13,
     )
     head = ["输入", "每条 KV", "HBM 能放", "10 毫秒全局批", "每卡", "30 毫秒全局批", "每卡", "30 毫秒的 KV 放哪"]
@@ -1064,33 +1452,39 @@ def main():
             per_card(row["b30"]),
             where(spill),
         ])
+    s6_head_h = 0.30 if len(body) > 7 else 0.36
+    s6_row_h = 0.32 if len(body) > 7 else 0.42
+    s6_y = 1.46
     add_table(
         s6,
         0.42,
-        1.50,
+        s6_y,
         [1.15, 1.35, 1.35, 1.70, 1.00, 1.75, 1.00, 3.20],
         [head] + body,
-        [0.36] + [0.42] * len(body),
+        [s6_head_h] + [s6_row_h] * len(body),
         kinds,
-        size=12,
+        size=11 if len(body) > 7 else 12,
     )
     d1m = by_len[1048576]["d30"]
-    note = s6.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.02), Inches(12.5), Inches(1.84))
+    s6_note_y = s6_y + s6_head_h + s6_row_h * len(body) + 0.10
+    s6_note_h = 7.05 - s6_note_y
+    note = s6.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(s6_note_y), Inches(12.5), Inches(s6_note_h))
     solid(note, GOLD_BG)
     textbox(
         s6,
         0.58,
-        5.08,
+        s6_note_y + 0.06,
         12.18,
-        1.72,
+        s6_note_h - 0.12,
         f"10 毫秒在 {span10} 都是 {bs10}，全在 HBM。短输入 Attention {d10['t_attn']*1e3:.2f} 毫秒，MoE {d10['t_moe']*1e3:.2f} 毫秒。"
-        f"1M 降到 {by_len[1048576]['b10']}，{s_label} 是 {extra[s_show]['b10']}，仍然全在 HBM。\n"
+        f"1M / 2M / 4M 降到 {by_len[S_1M]['b10']} / {by_len[S_2M]['b10']} / {by_len[S_4M]['b10']}，都还在 HBM。\n"
         f"30 毫秒短输入为 {bs30}。256K 为 {by_len[262144]['b30']}，已有 {by_len[262144]['d30']['spill']*100:.1f}% KV 在池中；"
         f"Attention {by_len[262144]['d30']['t_attn']*1e3:.1f} 毫秒，MoE {by_len[262144]['d30']['t_moe']*1e3:.1f} 毫秒。"
-        f"512K 降到 {by_len[524288]['b30']}，1M 为 {by_len[1048576]['b30']}，{s_label} 为 {extra[s_show]['b30']}。\n"
+        f"512K 降到 {by_len[524288]['b30']}，1M 为 {by_len[1048576]['b30']}，"
+        f"2M 为 {by_len[S_2M]['b30']}，4M 为 {by_len[S_4M]['b30']}，{s_label} 为 {extra[s_show]['b30']}。\n"
         f"Prefill 的 10 秒全局批在第 3 页：4K 为 {p4['bs']}，1M 为 {p1m['bs']}。"
-        f"4K 进、512 出、98% 命中时，P:D 在 10 毫秒约 1:{pd10:.1f}，在 30 毫秒约 1:{pd30:.1f}。",
-        14,
+        f"4K 进、512 出、{HIT_LABEL} 命中时，P:D 在 10 毫秒约 1:{pd10:.1f}，在 30 毫秒约 1:{pd30:.1f}。",
+        13,
         False,
         GOLD,
         anchor=MSO_ANCHOR.MIDDLE,
@@ -1106,17 +1500,21 @@ def main():
     s6.notes_slide.notes_text_frame.text = (
         "BS 一律是 128 卡副本的全局批。每卡条数 = 全局批 / 128。"
         "存量 = S×4939.5 字节 + 4.50 MB。一步真正读的是压缩 indexer、最多 1024 条完整 KV 和 HCA，所以溢出比例高时，池上的读时延仍可能短于 allreduce。"
-        f"HBM余量 {ROOM/1e12:.2f} TB。溢出KV经每卡H2D进入GPU，有效 {POOL/1e9:.1f} GB/s，DDR池容量不设上限。"
-        "换入带宽=min(DDR池480×80%, H2D 64×80%, 每卡DDR有效128.9)=51.2 GB/s。专家通信仍走独立D2D 320 GB/s。"
-        "Decode Attention = SWAP + max(HBM, compute) + AR；再加完整 MoE。"
+        f"HBM余量 {ROOM/1e12:.2f} TB。溢出KV按每卡 {gbps(POOL)} 换入，DDR池容量不设上限。"
+        + (
+            "换入带宽=min(DDR池480×80%, H2D 64×80%, 每卡DDR有效128.9)=51.2 GB/s。专家通信仍走独立D2D 320 GB/s。"
+            if pool_is_h2d()
+            else f"本用例换入带宽直接取 {gbps(POOL)}，不用 H2D 51.2 GB/s 截断。专家通信仍走独立D2D 320 GB/s。"
+        )
+        + "Decode Attention = SWAP + max(HBM, compute) + AR；再加完整 MoE。"
         + " ".join(lines)
-        + f" 2M 的 10 毫秒批 {extra[2_000_000]['b10']}，池上读 {extra[2_000_000]['d10']['t_pool']*1e3:.2f} ms。"
-        f"4×10^6 的 10 毫秒批 {extra[4_000_000]['b10']}，30 毫秒批 {extra[4_000_000]['b30']}。"
+        + f" 2M 的 10 毫秒批 {by_len[S_2M]['b10']}，池上读 {by_len[S_2M]['d10']['t_pool']*1e3:.2f} ms，30 毫秒批 {by_len[S_2M]['b30']}。"
+        f"4M 的 10 毫秒批 {by_len[S_4M]['b10']}，池上读 {by_len[S_4M]['d10']['t_pool']*1e3:.2f} ms，30 毫秒批 {by_len[S_4M]['b30']}。"
         f"{s_label} 的 10 毫秒批 {extra[s_show]['b10']}，30 毫秒批 {extra[s_show]['b30']}。"
-        f"单条 1M、98% 命中的 TTFT 是 {one_1m['t']:.4f} 秒。冷的 1M 单条是 {prefill_one(1048576)['t']:.3f} 秒。"
+        f"单条 1M、{HIT_LABEL} 命中的 TTFT 是 {one_1m['t']:.4f} 秒。冷的 1M 单条是 {prefill_one(1048576)['t']:.3f} 秒。"
         "第 3 页 Prefill："
         + "，".join(f"{fmt_len(row['S'])} {row['bs']}" for row in pb)
-        + f"。P:D 按 4K 进、512 出、98% 命中：Prefill {prefill_rps:.1f} 请求/秒，"
+        + f"。P:D 按 4K 进、512 出、{HIT_LABEL} 命中：Prefill {prefill_rps:.1f} 请求/秒，"
         f"10 毫秒 Decode {dec10_rps:.1f} 请求/秒（1:{pd10:.2f}），30 毫秒 Decode {dec30_rps:.1f} 请求/秒（1:{pd30:.2f}）。"
         "副本数按这个吞吐比配置，单副本时延不变。"
     )
@@ -1220,7 +1618,7 @@ def main():
     solid(note, GOLD_BG)
     textbox(
         s7, 0.58, 5.36, 12.18, 1.44,
-        f"字节按每卡。{len_name(hold['S'])} 溢出 {hold['d30']['spill']*100:.1f}%，换入 {qty(g_hold['pool'])} / 51.2 GB/s H2D = {hold['d30']['t_pool']*1e3:.2f} 毫秒，"
+        f"字节按每卡。{len_name(hold['S'])} 溢出 {hold['d30']['spill']*100:.1f}%，换入 {qty(g_hold['pool'])} / {gbps(POOL)} = {hold['d30']['t_pool']*1e3:.2f} 毫秒，"
         f"然后从 HBM 再读全部 KV；Attention {hold['d30']['t_attn']*1e3:.2f} 毫秒，MoE {hold['d30']['t_moe']*1e3:.2f} 毫秒。128 卡换入合计 {qty(g_hold['pool'] * N)}。\n"
         f"{len_name(bound['S'])} 换入 {qty(g_bound['pool'])}、{bound['d30']['t_pool']*1e3:.2f} 毫秒；"
         f"Attention {bound['d30']['t_attn']*1e3:.2f} 毫秒，MoE {bound['d30']['t_moe']*1e3:.2f} 毫秒，批 {bound['b30']}。128 卡换入合计 {qty(g_bound['pool'] * N)}。\n"
@@ -1260,19 +1658,28 @@ def main():
     )
     banner(
         s8, 0.92,
-        "只统计KV换进DDR池的输入。换入量=溢出比例×这一步的稀疏读；每卡统一走H2D，有效51.2 GB/s。",
+        (
+            "只统计KV换进DDR池的输入。换入量=溢出比例×这一步的稀疏读；每卡统一走H2D，有效51.2 GB/s。"
+            if pool_is_h2d()
+            else f"只统计KV换进DDR池的输入。换入量=溢出比例×这一步的稀疏读；每卡按{gbps(POOL)}换入。"
+        ),
         size=14,
     )
     census_head = ["输入", "30 毫秒批", "每卡", "溢出", "每卡换入", "128 卡合计", "换入耗时", "kernel 瓶颈"]
+    n_swap = len(swap_pts)
+    census_y = 1.40
+    census_head_h = 0.28 if n_swap > 4 else 0.38
+    census_row_h = 0.28 if n_swap > 4 else 0.42
     add_table(
-        s8, 0.42, 1.48,
+        s8, 0.42, census_y,
         [1.35, 1.25, 0.90, 1.05, 1.50, 1.65, 1.45, 3.15],
         [census_head] + [census_row(pt) for pt in swap_pts],
-        [0.38] + [0.42] * len(swap_pts),
+        [census_head_h] + [census_row_h] * n_swap,
         ["head"] + ["key" if pt is hold or attn_name(pt["d30"])[0] == "换入" else "body" for pt in swap_pts],
-        size=12,
+        size=11 if n_swap > 4 else 12,
     )
-    textbox(s8, 0.42, 3.70, 12.5, 0.22, "同一批长度上，换入和另外几笔的耗时", 13, True, ACCENT)
+    time_title_y = census_y + census_head_h + census_row_h * n_swap + 0.06
+    textbox(s8, 0.42, time_title_y, 12.5, 0.20, "同一批长度上，换入和另外几笔的耗时", 12, True, ACCENT)
     time_head = ["输入", "换入", "allreduce", "注意力计算", "HBM KV+权重", "读专家", "一步"]
     time_body = []
     time_kinds = ["head"]
@@ -1288,24 +1695,31 @@ def main():
             ms2(d["t"]),
         ])
         time_kinds.append("key" if attn_name(d)[0] == "换入" else "body")
+    time_y = time_title_y + 0.22
+    time_head_h = 0.26 if n_swap > 4 else 0.36
+    time_row_h = 0.26 if n_swap > 4 else 0.36
     add_table(
-        s8, 0.42, 4.06,
+        s8, 0.42, time_y,
         [1.45, 1.70, 1.80, 1.90, 1.80, 1.70, 1.95],
         [time_head] + time_body,
-        [0.36] + [0.36] * len(swap_pts),
+        [time_head_h] + [time_row_h] * len(swap_pts),
         time_kinds,
-        size=12,
+        size=11 if n_swap > 4 else 12,
     )
-    note = s8.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.04), Inches(12.5), Inches(1.00))
+    s8_note_y = time_y + time_head_h + time_row_h * n_swap + 0.08
+    s8_note_h = 7.05 - s8_note_y
+    note = s8.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(s8_note_y), Inches(12.5), Inches(s8_note_h))
     solid(note, GOLD_BG)
+    ten_clean = all(row["d10"]["spill"] < 0.005 for row in sweep)
+    ten_line = "10 毫秒从 4K 到 4M 都全在 HBM。" if ten_clean else "10 毫秒里已经有长度进池，见上表。"
     textbox(
-        s8, 0.58, 6.08, 12.18, 0.92,
-        "稀疏读不是整段存量：30层压缩indexer、31层HCA、最多1024条完整latent，再加4.50 MB。H2D带宽51.2 GB/s。\n"
-        f"10 毫秒到 {s_label} 仍全在 HBM，128K 也全在 HBM。这两页只保留溢出大于 0 的长度，后面的分析沿用这个口径。",
-        13, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
+        s8, 0.58, s8_note_y + 0.04, 12.18, s8_note_h - 0.08,
+        f"稀疏读不是整段存量：30层压缩indexer、31层HCA、最多1024条完整latent，再加4.50 MB。换入带宽{gbps(POOL)}。\n"
+        f"{ten_line}这两页只保留溢出大于 0 的长度，后面的分析沿用这个口径。",
+        12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s8.notes_slide.notes_text_frame.text = (
-        "池上字节=spill×bs×n_csa_read(S)/128。换入走H2D，有效51.2 GB/s。"
+        f"池上字节=spill×bs×n_csa_read(S)/128。换入带宽{gbps(POOL)}。"
         "n_csa_read = 30×(S/4)×64 + 31×(S/128)×576 + 30×min(1024,S/4)×576 + 61×128×576。"
         + " ".join(
             f"{len_name(pt['S'])} bs={pt['b30']} spill={pt['d30']['spill']*100:.2f}% "
@@ -1328,9 +1742,9 @@ def main():
     assumptions = [
         ["项目", "TTFT", "TPOT"],
         ["并行域", "Attention TP=8、DP=16；MoE EP=128", "同左；最忙 TP 组 n=⌈BS/16⌉"],
-        ["Attention", "拉 prefix、融合 kernel、AR 跨 query chunk 流水，取瓶颈", "SWAP 在前；融合 kernel 后再加 AR"],
+        ["Attention", "先整段拉 prefix，再 max(HBM, 计算)，再加 AR", "SWAP 在前；融合 kernel 后再加 AR"],
         ["MoE", "dispatch(FP8) + max(权重, GEMM) + combine(BF16)", "同左；combine 字节是 dispatch 的 2 倍"],
-        ["KV 位置", "98% prefix 在远端 KV 缓存，经参数面拉取；Decode 没有副本", "HBM 放不下先从 DDR 池写回 HBM"],
+        ["KV 位置", f"{HIT_LABEL} prefix 在远端 KV 缓存，经参数面拉取；Decode 没有副本", "HBM 放不下先从 DDR 池写回 HBM"],
         ["P→D", "完整 KV 按层发送；只加未被后续计算隐藏的尾巴", "不进入单步 TPOT"],
         ["负载", "Attention 按 TP=8；MoE 取最忙 EP 卡，逐专家 16 行 padding", "同左"],
         ["固定开销", "不伪造数值；单列为未计入项", "不伪造数值；SLO 结果是数据面理论上限"],
@@ -1345,12 +1759,11 @@ def main():
     solid(note, GOLD_BG)
     textbox(
         s9, 0.58, 6.28, 12.18, 0.70,
-        "固定开销 = 调度 + kernel 启动 + collective 启动 + RMSNorm / RoPE / Router / 激活 / residual + logits / sampling + P/D 控制。"
-        "当前没有实测值，不并入 BS 摸高；生产 SLO 必须从 10/30 毫秒预算里另留余量。",
+        "集合通信启动已计入：AllReduce、dispatch、combine 每层各 5 微秒，再加字节/带宽。其余固定开销 = 调度 + kernel 启动 + RMSNorm / RoPE / Router / 激活 / residual + logits / sampling + P/D 控制，仍不并入摸高。",
         12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s9.notes_slide.notes_text_frame.text = (
-        "这一页是后续固化口径。TTFT 的 chunk 流水忽略显式 fill/drain 气泡，气泡和软件固定开销都放在未计入项。"
+        "这一页是后续固化口径。Prefill 不做跨 query chunk 流水，拉 prefix、融合 kernel、AR 按顺序相加。软件固定开销仍放在未计入项。"
         "Prefill attention 假设融合 kernel 有理想 tile 复用，每个 KV 字节从 HBM 读一次；没有实测 IO 放大系数。"
         "Decode 不假设输出投影与 collective 融合，AR 单独加。"
     )
@@ -1361,16 +1774,16 @@ def main():
     banner(
         s10,
         0.92,
-        "本页所有时间已经包含完整 61 层。98% prefix 经参数面拉取，Decode 没有副本。",
+        f"本页所有时间已经包含完整 61 层。{HIT_LABEL} prefix 经参数面拉取，Decode 没有副本。",
         size=14,
     )
     ttft_rows = [
         ["部分", "公式", "注释"],
-        ["Attention", "max(拉 prefix，HBM，Attention 计算，AR)", "四条通路跨 query chunk 流水"],
-        ["拉 prefix", "⌈BS/16⌉ × K(0.98S) / (8 × 40 GB/s)", "K(x)=4939.5x+滑窗；远端 KV → HBM"],
-        ["计算上下文", "C = 0.02S × 0.98S + 0.02S × (0.02S + 1) / 2", "新 token 平均看到约 99% 的完整上下文"],
+        ["Attention", "拉 prefix + max(HBM，Attention 计算) + AR", "整段拉取在前；AR 不与 kernel 重叠"],
+        ["拉 prefix", f"⌈BS/16⌉ × K({PREFIX_HIT:g}S) / (8 × {gbps(PREFIX_PULL)})", prefix_why()],
+        ["计算上下文", f"C = {MISS:g}S × {PREFIX_HIT:g}S + {MISS:g}S × ({MISS:g}S + 1) / 2", f"新 token 平均看到约 {AVG_LABEL} 的完整上下文"],
         ["融合 kernel", "max(Attention HBM，Attention FLOP / 405.0 T)", "HBM 含权重、prefix KV、新 KV 和激活"],
-        ["MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "hot×7168×1×61 与 ×2；两段不相等"],
+        ["MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "每层各加 5 微秒；带宽项字节 1 与 2"],
         ["P→D 总量", "⌈BS/16⌉ × K(S) / (8 × 40 GB/s)", "K(S)=4939.5S+4.50 MB；发送完整 KV"],
         ["P→D 尾巴", "max(0，P→D 总量 − 可重叠计算时间)", "layer-wise 发送；只加最后没隐藏的部分"],
         ["最终", "TTFT = Attention + MoE + P→D 尾巴 + fixed", "本档计算中 P→D 尾巴为 0"],
@@ -1403,18 +1816,22 @@ def main():
     banner(
         s11,
         0.92,
-        "Decode外部DDR/KV访存统一走H2D。KV必须先写回HBM；HBM内读取仍按3.20 TB/s，且不假设GEMM与AR融合。",
+        (
+            "Decode外部DDR/KV访存统一走H2D。KV必须先写回HBM；HBM内读取仍按3.20 TB/s，且不假设GEMM与AR融合。"
+            if pool_is_h2d()
+            else f"本用例Decode KV SWAP按每卡{gbps(POOL)}。KV必须先写回HBM；HBM内读取仍按3.20 TB/s，且不假设GEMM与AR融合。"
+        ),
         size=13,
     )
     tpot_rows = [
         ["部分", "公式", "注释"],
         ["最忙 TP 组", "n = ⌈BS / 16⌉；每卡 KV 读量 = n × RKV(S) / 8", "不再按 BS/128 的平均值"],
         ["溢出比例", "f = max(0，(BS × KV 存量 − 5.72 TB) / (BS × KV 存量))", "池容量不设上限"],
-        ["SWAP", "f × 每卡 KV 读量 / 51.2 GB/s", "DDR池 → H2D → HBM；必须先完成"],
+        ["SWAP", f"f × 每卡 KV 读量 / {gbps(POOL)}", swap_comment()],
         ["Attention kernel", "max((全部 KV + 2.42 GB 权重) / 3.20 TB/s，FLOP / 405.0 T)", "换入 KV 仍从 HBM 再读；kernel 内访存/计算重叠"],
-        ["AR", "61 × 2×7/8 × n×7168×2 / 280 GB/s", "8卡fullmesh七链路并发；单独加在kernel后"],
+        ["AR", "61 ×（5 微秒 + 2×7/8 × n×7168×2 / 280 GB/s）", "8卡fullmesh；启动与带宽都加在kernel后"],
         ["Decode Attention", "SWAP + Attention kernel + AR", "三段存在业务依赖"],
-        ["Decode MoE", "dispatch(FP8) + max(专家权重，专家 GEMM) + combine(BF16)", "单请求串行相加；combine = 2 × dispatch"],
+        ["Decode MoE", "61×（5 微秒 + hot×7168×1 / 320 GB/s）+ max(权重，GEMM) + 61×（5 微秒 + hot×7168×2 / 320 GB/s）", "带宽项字节 1 与 2；两段都不与 GEMM 重叠"],
         ["最终", "TPOT = Decode Attention + Decode MoE + fixed", "固定开销未计入，结果是数据面理论上限"],
     ]
     add_table(
@@ -1438,24 +1855,24 @@ def main():
         "生产摸高需要先给 measured fixed overhead 预留预算，再重新搜索 BS。"
     )
 
-    def hbm_pie_values(bs, s):
+    def hbm_pie_values(bs, s, tp=TP, dp=DP):
         """Busiest active GPU, not the 128-GPU average."""
-        n = math.ceil(bs / DP)
-        raw_kv = n * store_seq(s) / TP / 1e9
-        room_gpu = ROOM / N / 1e9
-        kv_hbm = min(raw_kv, room_gpu)
+        n = math.ceil(bs / dp)
+        raw_kv = n * store_seq(s) / tp / 1e9
+        weights = (ROUTED / N + SHARED + ATTN / tp) / 1e9
+        room_gpu = HBM_CAP / 1e9 - weights - RESERVE / 1e9
+        kv_hbm = min(raw_kv, max(room_gpu, 0.0))
         pool_kv = max(raw_kv - room_gpu, 0.0)
-        weights = (ROUTED / N + SHARED + ATTN / TP) / 1e9
-        free = HBM_CAP / 1e9 - weights - RESERVE / 1e9 - kv_hbm
+        free = room_gpu - kv_hbm
         return kv_hbm, max(free, 0.0), pool_kv
 
     # ----- slide 12: Prefill HBM pies -----
     s12 = prs.slides.add_slide(blank)
-    chrome(s12, 12, "Prefill：输入变长后，时间摸高批下降，单卡 KV 占用仍小", "HBM 容量    ·    TTFT ≤ 10 秒    ·    98% prefix 命中")
+    chrome(s12, 12, "Prefill：输入变长后，时间摸高批下降，单卡 KV 占用仍小", f"HBM 容量    ·    TTFT ≤ 10 秒    ·    {HIT_LABEL} prefix 命中")
     banner(
         s12,
         0.92,
-        "每个饼是最忙活跃卡的 96 GB HBM。模型权重固定 45.31 GB，系统预留 6 GB；prefix 经参数面拉入 HBM。",
+        f"每个饼是最忙活跃卡的 96 GB HBM。模型权重 {(ROUTED / N + SHARED + ATTN / TP) / 1e9:.2f} GB，系统预留 6 GB；prefix 按每卡 {gbps(PREFIX_PULL)} 拉入 HBM。",
         size=13,
     )
     pf_pies = [
@@ -1464,24 +1881,24 @@ def main():
         (1048576, p1m["bs"], "1M"),
     ]
     for x, (s, bs, label) in zip((0.42, 4.72, 9.02), pf_pies):
-        kv_hbm, free, pool_kv = hbm_pie_values(bs, s)
-        add_hbm_pie(s12, x, label, bs, kv_hbm, free, pool_kv)
+        kv_hbm, free, pool_kv = hbm_pie_values(bs, s, TP_P, DP_P)
+        add_hbm_pie(s12, x, label, bs, kv_hbm, free, pool_kv, TP_P)
     note = s12.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.16), Inches(12.5), Inches(0.86))
     solid(note, GOLD_BG)
     textbox(
         s12, 0.58, 6.20, 12.18, 0.78,
         "Prefill 的长输入先被 TTFT 限制：4K / 256K / 1M 的最大批分别是 "
         f"{pf_pies[0][1]} / {pf_pies[1][1]} / {pf_pies[2][1]}，最忙卡 HBM KV 只有 "
-        f"{hbm_pie_values(pf_pies[0][1], pf_pies[0][0])[0]:.2f} / "
-        f"{hbm_pie_values(pf_pies[1][1], pf_pies[1][0])[0]:.2f} / "
-        f"{hbm_pie_values(pf_pies[2][1], pf_pies[2][0])[0]:.2f} GB，均不需要 DDR 池。",
+        f"{hbm_pie_values(pf_pies[0][1], pf_pies[0][0], TP_P, DP_P)[0]:.2f} / "
+        f"{hbm_pie_values(pf_pies[1][1], pf_pies[1][0], TP_P, DP_P)[0]:.2f} / "
+        f"{hbm_pie_values(pf_pies[2][1], pf_pies[2][0], TP_P, DP_P)[0]:.2f} GB，均不需要 DDR 池。",
         12, False, GOLD, anchor=MSO_ANCHOR.MIDDLE,
     )
     s12.notes_slide.notes_text_frame.text = (
         "饼图按最忙活跃 GPU，不按 128 卡平均。每卡固定：路由专家 38.864 GB，共享专家 4.030 GB，"
-        "Attention 2.419 GB，系统预留 6 GB。KV = ceil(BS/16) × store_seq(S) / 8。"
+        f"Attention {ATTN / TP / 1e9:.3f} GB，系统预留 6 GB。KV = ceil(BS/16) × store_seq(S) / 8。"
         + " ".join(
-            f"{label}: BS={bs}, kv={hbm_pie_values(bs, s)[0]:.3f}GB, free={hbm_pie_values(bs, s)[1]:.3f}GB."
+            f"{label}: BS={bs}, kv={hbm_pie_values(bs, s, TP_P, DP_P)[0]:.3f}GB, free={hbm_pie_values(bs, s, TP_P, DP_P)[1]:.3f}GB."
             for s, bs, label in pf_pies
         )
     )
@@ -1526,7 +1943,7 @@ def main():
 
     # ----- slide 14: Prefill MoE stage breakdown -----
     s14 = prs.slides.add_slide(blank)
-    chrome(s14, 14, "Prefill MoE：长输入的摸高批下降，MoE 耗时随总现算 token 下降", "Prefill    ·    MoE 分阶段    ·    KV 命中 98%")
+    chrome(s14, 14, "Prefill MoE：长输入的摸高批下降，MoE 耗时随总现算 token 下降", f"Prefill    ·    MoE 分阶段    ·    KV 命中 {HIT_LABEL}")
     banner(
         s14,
         0.92,
@@ -1546,24 +1963,29 @@ def main():
             sec(row["t_combine"]),
             sec(row["t_moe"]),
         ])
+    moe_head_h = 0.30 if len(moe_rows) > 7 else 0.38
+    moe_row_h = 0.34 if len(moe_rows) > 7 else 0.43
+    moe_y = 1.46
     add_table(
         s14,
         0.42,
-        1.50,
+        moe_y,
         [0.90, 1.25, 1.45, 1.45, 1.55, 1.55, 1.45, 1.90],
         [moe_head] + moe_rows,
-        [0.38] + [0.43] * len(moe_rows),
-        ["head"] + ["key" if row["S"] in (4096, 1048576) else "body" for row in pb],
-        size=12,
+        [moe_head_h] + [moe_row_h] * len(moe_rows),
+        ["head"] + ["key" if row["S"] in (4096, S_1M, S_4M) else "body" for row in pb],
+        size=11 if len(moe_rows) > 7 else 12,
     )
-    note = s14.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(5.30), Inches(12.5), Inches(1.56))
+    s14_note_y = moe_y + moe_head_h + moe_row_h * len(moe_rows) + 0.10
+    s14_note_h = 7.05 - s14_note_y
+    note = s14.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(s14_note_y), Inches(12.5), Inches(s14_note_h))
     solid(note, GOLD_BG)
     textbox(
         s14,
         0.58,
-        5.36,
+        s14_note_y + 0.06,
         12.18,
-        1.44,
+        s14_note_h - 0.12,
         f"4K：dispatch {p4['t_dispatch']:.2f} 秒 + max(权重 {p4['t_we']*1e3:.1f} 毫秒，GEMM {p4['t_gemm']:.2f} 秒) "
         f"+ combine {p4['t_combine']:.2f} 秒 = {p4['t_moe']:.2f} 秒。\n"
         f"1M：dispatch {p1m['t_dispatch']:.2f} 秒 + max(权重 {p1m['t_we']*1e3:.1f} 毫秒，GEMM {p1m['t_gemm']:.2f} 秒) "
@@ -1584,7 +2006,11 @@ def main():
         )
     )
 
-    out = "/agent/repos/ucl-mpcomm/docs/deepseek-96g-slo.pptx"
+    if COMPARE_BASELINE:
+        add_compare_slide(prs, blank, pb, bs10, bs30)
+    if not pool_is_h2d():
+        add_pool_tps_slide(prs, blank)
+    out = out_path or "/agent/repos/ucl-mpcomm/docs/deepseek-96g-slo.pptx"
     prs.save(out)
     print(out)
     print("ROOM_TB", round(ROOM / 1e12, 3))
@@ -1635,5 +2061,169 @@ def main():
         raise SystemExit("empty batch")
 
 
+def build_uc1_tps_page(out_path):
+    """One slide: 25% vs 100% prefix pull under the same 10 s TTFT cap."""
+    global PREFIX_FRAC, PREFIX_PULL, SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE
+    saved_frac, saved_pull = PREFIX_FRAC, PREFIX_PULL
+    lengths = (4096, 8192, 32768, 131072, 262144, 524288, 1048576)
+    saved_total, saved_footer, saved_title = SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE
+    SLIDE_TOTAL = 1
+    CASE_FOOTER = (
+        "10T 为外推    ·    用例1 对照 25% 与 100% 物理带宽    ·    "
+        "TPS = 全局批 × 输入长度 / 实际 TTFT    ·    128 卡"
+    )
+    DECK_TITLE = "用例1：10 秒 TTFT 下的批量、系统 Prefill TPS 与拉 KV 占比"
+    cases = {}
+    try:
+        for frac, label in ((0.25, "25%"), (1.0, "100%")):
+            PREFIX_FRAC = frac
+            PREFIX_PULL = PARAM_PEAK * frac
+            for s in lengths:
+                bs = max_prefill_bs(s)
+                row = prefill_batch(bs, s)
+                kernel = max(row["t_hbm"], row["t_attn"])
+                cases[(s, label)] = {
+                    "bs": bs,
+                    "tps": bs * s / row["t"],
+                    "pull": row["t_pull"],
+                    "kernel": kernel,
+                    "ar": row["t_ar"],
+                    "moe": row["t_moe"],
+                    "t": row["t"],
+                    "share": row["t_pull"] / row["t"],
+                }
+    finally:
+        PREFIX_FRAC, PREFIX_PULL = saved_frac, saved_pull
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    prs.core_properties.title = DECK_TITLE
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    chrome(slide, 1, "同一条 10 秒，25% 带宽的批量换到系统 TPS 后仍低于 100%", "用例1    ·    TTFT ≤ 10 秒    ·    99.5% 命中    ·    TP=8")
+    banner(
+        slide,
+        0.90,
+        "系统 Prefill TPS = 全局批 × 输入长度 / 该批实际 TTFT。按 128 卡一份副本、完整输入 token 计。最右列以 25% 为基线。",
+        size=13,
+    )
+    head = ["输入", "带宽", "全局批", "系统 TPS", "拉 KV", "计算", "AR", "MoE", "TTFT", "拉KV占比", "TPS提升"]
+    body, kinds = [], ["head"]
+    for s in lengths:
+        base = cases[(s, "25%")]
+        for label in ("25%", "100%"):
+            item = cases[(s, label)]
+            kinds.append("body" if label == "25%" else "key")
+            body.append([
+                fmt_len(s),
+                label,
+                str(item["bs"]),
+                fmt_tok(item["tps"]),
+                f"{item['pull']:.2f} 秒",
+                f"{item['kernel']:.2f} 秒",
+                f"{item['ar']:.2f} 秒",
+                f"{item['moe']:.2f} 秒",
+                f"{item['t']:.2f} 秒",
+                f"{item['share'] * 100:.1f}%",
+                "基线" if label == "25%" else signed_pct(item["tps"], base["tps"]),
+            ])
+    add_table(
+        slide,
+        0.42,
+        1.42,
+        [0.68, 0.68, 1.22, 1.55, 1.17, 1.17, 1.09, 1.17, 1.14, 1.18, 1.45],
+        [head] + body,
+        [0.32] + [0.30] * len(body),
+        kinds,
+        size=11,
+    )
+    note = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.04), Inches(12.5), Inches(1.02))
+    solid(note, GOLD_BG)
+    a4, b4 = cases[(4096, "25%")], cases[(4096, "100%")]
+    a1, b1 = cases[(1048576, "25%")], cases[(1048576, "100%")]
+    textbox(
+        slide,
+        0.58,
+        6.08,
+        12.18,
+        0.94,
+        "计算 = max(HBM, Attention FLOP)。这档 HBM 只有几毫秒到十几毫秒，所以计算列就是 FLOP 时间。P→D 尾巴为 0，不单列。\n"
+        f"4K：批量 {a4['bs']} → {b4['bs']}（{signed_pct(b4['bs'], a4['bs'])}），"
+        f"TPS {fmt_tok(a4['tps'])} → {fmt_tok(b4['tps'])}（{signed_pct(b4['tps'], a4['tps'])}），"
+        f"拉 KV 占比 {a4['share']*100:.1f}% → {b4['share']*100:.1f}%。"
+        f"1M：批量 {signed_pct(b1['bs'], a1['bs'])}，TPS {signed_pct(b1['tps'], a1['tps'])}。"
+        "TPS 提升以同长度的 25% 行为基线。1M 实际 TTFT 低于 10 秒，是因为再加一条会让最忙组跳一档并超过 10 秒。",
+        12,
+        False,
+        GOLD,
+        anchor=MSO_ANCHOR.MIDDLE,
+    )
+    lines = []
+    for s in lengths:
+        for label in ("25%", "100%"):
+            item = cases[(s, label)]
+            lines.append(
+                f"{fmt_len(s)} {label} bs={item['bs']} tps={item['tps']:.3f} "
+                f"pull={item['pull']:.6f} kernel={item['kernel']:.6f} ar={item['ar']:.6f} "
+                f"moe={item['moe']:.6f} ttft={item['t']:.6f} share={item['share']:.6f}"
+            )
+    slide.notes_slide.notes_text_frame.text = (
+        "系统 Prefill TPS = BS × S / TTFT，S 是用户输入长度，不是 0.5% 现算 token。"
+        "25% 为 12.5 GB/s，100% 为 50 GB/s。两者都取 TTFT≤10 秒的最大全局批。"
+        + " ".join(lines)
+    )
+    prs.save(out_path)
+    SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE = saved_total, saved_footer, saved_title
+    print(out_path)
+    for s in lengths:
+        a, b = cases[(s, "25%")], cases[(s, "100%")]
+        print(
+            fmt_len(s),
+            a["bs"], b["bs"], signed_pct(b["bs"], a["bs"]),
+            round(a["tps"]), round(b["tps"]), signed_pct(b["tps"], a["tps"]),
+            f"{a['share']*100:.1f}%", f"{b['share']*100:.1f}%",
+            round(a["t"], 3), round(b["t"], 3),
+        )
+
+
+def apply_case(prefix_frac, pool_bps, slides, footer, title, compare):
+    global PREFIX_FRAC, PREFIX_PULL, POOL, SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE, COMPARE_BASELINE
+    PREFIX_FRAC = prefix_frac
+    PREFIX_PULL = PARAM_PEAK * prefix_frac
+    POOL = HOST if pool_bps is None else float(pool_bps)
+    SLIDE_TOTAL = slides
+    CASE_FOOTER = footer
+    DECK_TITLE = title
+    COMPARE_BASELINE = compare
+
+
+def build_cases():
+    stem = "10T 为外推    ·    96 GB / 486 T + 108 T、一份 128 卡副本"
+    apply_case(
+        1.0,
+        None,
+        15,
+        stem + "    ·    用例1：拉 KV = 物理带宽 100%    ·    张量 405 T",
+        "用例1：拉 KV = 参数面物理带宽 100%",
+        True,
+    )
+    main("/agent/repos/ucl-mpcomm/docs/deepseek-96g-slo-uc1-kv100.pptx")
+    apply_case(
+        1.0,
+        400e9,
+        16,
+        stem + "    ·    用例2：拉 KV 100% 物理，SWAP 400 GB/s    ·    张量 405 T",
+        "用例2：拉 KV 100% 物理，Decode SWAP 400 GB/s",
+        True,
+    )
+    main("/agent/repos/ucl-mpcomm/docs/deepseek-96g-slo-uc2-swap400.pptx")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "cases":
+        build_cases()
+    elif len(sys.argv) > 1 and sys.argv[1] == "tps":
+        build_uc1_tps_page("/agent/repos/ucl-mpcomm/docs/deepseek-96g-slo-uc1-ttft-tps.pptx")
+    else:
+        main()

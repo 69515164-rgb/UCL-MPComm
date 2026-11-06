@@ -60,7 +60,7 @@ P2P_LINK = 1.6e12 / 8
 P2P = (NODE - 1) * P2P_LINK * 0.80
 H2D_PEAK = 1.6e12 / 8
 H2D = H2D_PEAK * 0.80
-DDR_NODE = 1288.8e9
+DDR_NODE = 2e12
 DDR_SHARE = DDR_NODE * 0.80 / NODE
 HOST = min(H2D, DDR_SHARE)
 DDR_CAP = 768e9 / NODE
@@ -535,7 +535,7 @@ def req_pair(bs_p, t_p, bs_d, t_d):
 def slide_conclusion(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     chrome(slide, 1, "10 秒和 10 毫秒都能摸高，冷的 4M 过线", "N+2    ·    20T DeepSeek    ·    640 GB / 48P FP4    ·    256 卡一份副本")
-    banner(slide, 0.92, f"99.5% 命中。参数面 800 Gb/s，拉 KV 取其 25%，每卡 {PREFIX_25/1e9:.0f} GB/s。Decode 换入走 H2D，实际被每机 DDR5 分到每卡 {HOST/1e9:.1f} GB/s。")
+    banner(slide, 0.92, f"99.5% 命中。参数面 800 Gb/s，拉 KV 基线每卡 {PREFIX_25/1e9:.0f} GB/s。Decode 换入取 min(H2D {H2D/1e9:.0f}, DDR 每卡 {DDR_SHARE/1e9:.0f}) = {HOST/1e9:.0f} GB/s。")
     r64, r4 = by_len(data, 65536), by_len(data, 4194304)
     head = ["约束", "64K 全局批", "64K 系统 TPS", "4M 全局批", "4M 系统 TPS", "4M 实际耗时"]
     body = [
@@ -598,8 +598,8 @@ def slide_hardware(prs, blank):
         ["FP4 算力", "每卡 48 P", "×70% = 33.60 P。注意力和专家 GEMM 共用"],
         ["HBM", "640 GB，33 TB/s", "带宽 ×80% = 26.40 TB/s"],
         ["H2D", "每卡单向 1.6 Tb/s", "200 GB/s ×80% = 160 GB/s"],
-        ["DDR5", "每机 1288.8 GB/s，768 GB", "×80% 后每卡 128.9 GB/s、96 GB"],
-        ["H2D 换入", "链路和 DDR5 取更小的", "128.9 GB/s。DDR5 比 160 GB/s 的 H2D 更窄"],
+        ["DDR5", "每机 2 TB/s，768 GB", f"×80% 后每卡 {DDR_SHARE/1e9:.0f} GB/s、{DDR_CAP/1e9:.0f} GB"],
+        ["H2D 换入", "链路和 DDR5 取更小的", f"{HOST/1e9:.0f} GB/s。H2D 比每卡 DDR {DDR_SHARE/1e9:.0f} GB/s 更窄"],
         ["D2D", "每卡单向 48 Tb/s，256 卡", f"{D2D_PEAK/1e12:.2f} TB/s ×80% = {D2D/1e12:.2f} TB/s"],
         ["机内 fullmesh", "两卡之间 P2P 1.6 Tb/s", "7 条并发，×80% = 1.12 TB/s"],
         ["参数面", "每卡 800 Gb/s", f"物理 {PARAM_PEAK/1e9:.0f} GB/s。P→D {PARAM/1e9:.0f}。拉 KV {PREFIX_25/1e9:.0f}"],
@@ -654,7 +654,7 @@ def slide_parallel(prs, blank, data):
 def slide_tps(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     chrome(slide, 5, "64K 到 4M，系统 TPS 随输入下降", "N+2    ·    TTFT ≤ 10 秒    ·    TPOT ≤ 10 / 30 毫秒")
-    banner(slide, 0.92, "基线：拉 KV 25%，Decode 换入 128.9 GB/s。Prefill TPS 用完整输入 token。Decode TPS 是这一步新 token 的吞吐。")
+    banner(slide, 0.92, f"基线：拉 KV 25%，Decode 换入 {HOST/1e9:.0f} GB/s。Prefill TPS 用完整输入 token。Decode TPS 是这一步新 token 的吞吐。")
     head = ["输入", "10 秒批", "Prefill TPS", "10 毫秒批", "10 毫秒 TPS", "30 毫秒批", "30 毫秒 TPS"]
     body, kinds = [], ["head"]
     for row in data["rows"]:
@@ -680,8 +680,8 @@ def slide_tps(prs, blank, data):
         f"4M 溢出 {r4m['d10']['spill'] * 100:.1f}%，每卡 {r4m['d10']['spill'] * r4m['d10']['store'] / N / 1e9:.1f} GB。\n"
         "30 毫秒从 128K 起进入主机 DDR。4M 每卡溢出约 "
         f"{r4m['d30']['spill'] * r4m['d30']['store'] / N / 1e9:.1f} GB，"
-        "低于每卡 96 GB 的 DDR5 空间。批量是被 128.9 GB/s 卡住的，768 GB 的机器空间还没用完。\n"
-        "Prefill 的 10 秒里，拉 KV 是大头，所以输入从 64K 加到 4M，系统 TPS 只从 5.35 亿降到 4.36 亿。",
+        f"低于每卡 {DDR_CAP/1e9:.0f} GB 的 DDR5 空间。批量是被 {HOST/1e9:.0f} GB/s 卡住的，768 GB 的机器空间还没用完。\n"
+        f"Prefill 的 10 秒里，拉 KV 是大头，所以输入从 64K 加到 4M，系统 TPS 从 {fmt_rate(by_len(data, 65536)['b25'] * 65536 / by_len(data, 65536)['p25']['t'])} 降到 {fmt_rate(r4m['b25'] * r4m['S'] / r4m['p25']['t'])}。",
         14,
     )
     slide.notes_slide.notes_text_frame.text = " ".join(
@@ -741,7 +741,7 @@ def slide_prefill(prs, blank, data):
 
 def slide_decode(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 7, "10 毫秒少换入，30 毫秒从 128K 起换入是大头", "N+2    ·    Decode    ·    TPOT 拆解    ·    H2D 128.9 GB/s")
+    chrome(slide, 7, "10 毫秒少换入，30 毫秒从 128K 起换入是大头", f"N+2    ·    Decode    ·    TPOT 拆解    ·    H2D {HOST/1e9:.0f} GB/s")
     head = ["输入", "批", "SWAP", "计算", "AR", "MoE", "TPOT", "溢出"]
 
     def rows_for(batch_key, dec_key):
@@ -771,7 +771,7 @@ def slide_decode(prs, blank, data):
         slide,
         6.12,
         0.92,
-        "TPOT = T_SWAP + max(T_HBM, T_compute) + T_AR + T_MoE。T_SWAP = 溢出比例 × 每卡稀疏读 / 128.9 GB/s。\n"
+        f"TPOT = T_SWAP + max(T_HBM, T_compute) + T_AR + T_MoE。T_SWAP = 溢出比例 × 每卡稀疏读 / {HOST/1e9:.0f} GB/s。\n"
         f"计算列是 max(HBM, Attention FLOP)。T_AR 用机内 {P2P/1e12:.2f} TB/s。MoE 的 dispatch 与 combine 走 {D2D/1e12:.2f} TB/s，加在 GEMM 外面。",
         13,
     )
@@ -785,9 +785,9 @@ def slide_decode(prs, blank, data):
 
 def slide_case1(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 8, "拉 KV 改到 100%，TPS 上升不到 4 倍", f"N+2 Case 1    ·    {PREFIX_25/1e9:.0f} GB/s 对照 {PREFIX_100/1e9:.0f} GB/s    ·    TTFT ≤ 10 秒")
-    banner(slide, 0.92, f"100% 是物理 {PREFIX_100/1e9:.0f} GB/s，不叠乘 80%。批量变大之后，计算、AR、MoE 一起变长。TPS 提升以 25% 为基线。")
-    head = ["输入", "25% 批", "100% 批", "25% TPS", "100% TPS", "TPS提升", "25%占比", "100%占比"]
+    chrome(slide, 8, "拉 KV 从基线改到 NEW，TPS 上升不到 4 倍", f"N+2 Case 1    ·    基线 {PREFIX_25/1e9:.0f} GB/s    ·    NEW {PREFIX_100/1e9:.0f} GB/s")
+    banner(slide, 0.92, f"基线是物理带宽的 25%，每卡 {PREFIX_25/1e9:.0f} GB/s。NEW 是物理 {PREFIX_100/1e9:.0f} GB/s，不叠乘 80%。TPS 提升以基线列计算。")
+    head = ["输入", "基线批", "NEW批", "基线 TPS", "NEW TPS", "TPS提升", "基线占比", "NEW占比"]
     body, kinds = [], ["head"]
     for row in data["rows"]:
         t25 = row["b25"] * row["S"] / row["p25"]["t"]
@@ -804,7 +804,7 @@ def slide_case1(prs, blank, data):
             f"{row['p100']['pull'] / row['p100']['t'] * 100:.1f}%",
         ])
     add_table(slide, 0.42, 1.46, [0.90, 1.40, 1.50, 1.70, 1.80, 1.45, 1.85, 1.90], [head] + body, [0.30] + [0.28] * len(body), kinds, size=12)
-    head2 = ["输入", "25%拉KV", "100%拉KV", "25%计算", "100%计算", "25% AR", "100% AR", "25% MoE", "100% MoE"]
+    head2 = ["输入", "基线拉KV", "NEW拉KV", "基线计算", "NEW计算", "基线 AR", "NEW AR", "基线 MoE", "NEW MoE"]
     body2, kinds2 = [], ["head"]
     for row in data["rows"]:
         a, b = row["p25"], row["p100"]
@@ -824,8 +824,8 @@ def slide_case1(prs, blank, data):
         slide,
         6.10,
         0.95,
-        f"64K：拉 KV {sec(r64['p25']['pull'])} → {sec(r64['p100']['pull'])}，占比 {r64['p25']['pull']/r64['p25']['t']*100:.1f}% → {r64['p100']['pull']/r64['p100']['t']*100:.1f}%，TPS {tps64}。\n"
-        f"4M：拉 KV {sec(r4['p25']['pull'])} → {sec(r4['p100']['pull'])}，占比 {r4['p25']['pull']/r4['p25']['t']*100:.1f}% → {r4['p100']['pull']/r4['p100']['t']*100:.1f}%，TPS {tps4}。带宽是 4 倍，AR 和 MoE 随批量变长，所以 TPS 不到 4 倍。",
+        f"64K：基线拉 KV {sec(r64['p25']['pull'])}，NEW {sec(r64['p100']['pull'])}，占比 {r64['p25']['pull']/r64['p25']['t']*100:.1f}% → {r64['p100']['pull']/r64['p100']['t']*100:.1f}%，TPS {tps64}。\n"
+        f"4M：基线拉 KV {sec(r4['p25']['pull'])}，NEW {sec(r4['p100']['pull'])}，占比 {r4['p25']['pull']/r4['p25']['t']*100:.1f}% → {r4['p100']['pull']/r4['p100']['t']*100:.1f}%，TPS {tps4}。NEW 带宽是基线的 4 倍，AR 和 MoE 随批量变长，所以 TPS 不到 4 倍。",
         13,
     )
     slide.notes_slide.notes_text_frame.text = " ".join(
@@ -840,7 +840,7 @@ def slide_case1(prs, blank, data):
 
 def slide_case2(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 9, "总线 DDR 池把长上下文的 30 毫秒 TPS 抬上去", f"N+2 Case 2    ·    H2D {HOST/1e9:.1f} GB/s 对照池 {POOL/1e12:.2f} TB/s")
+    chrome(slide, 9, "总线 DDR 池把长上下文的 30 毫秒 TPS 抬上去", f"N+2 Case 2    ·    H2D {HOST/1e9:.0f} GB/s 对照池 {POOL/1e12:.2f} TB/s")
     banner(slide, 0.92, f"池是每卡 51.2 Tb/s ×80% = {POOL/1e12:.2f} TB/s，容量不限，不经 H2D，也不用 48 Tb/s 的交换平面截断。提升以 H2D 为基线。")
     head = ["输入", "H2D·10毫秒", "池·10毫秒", "10毫秒提升", "H2D·30毫秒", "池·30毫秒", "30毫秒提升"]
     body, kinds = [], ["head"]
@@ -956,12 +956,12 @@ def write_md(path, data):
         "| --- | --- |",
         f"| 张量 | {PEAK/1e15:.2f} P，注意力与专家 GEMM 共用 |",
         f"| HBM | {HBM_BW/1e12:.2f} TB/s，容量 640 GB |",
-        f"| H2D 换入 | {HOST/1e9:.2f} GB/s，min(H2D 160, DDR5 每卡 {DDR_SHARE/1e9:.2f}) |",
-        f"| 主机 DDR 容量 | 每卡 {DDR_CAP/1e9:.0f} GB |",
+        f"| DDR5 | 每机 {DDR_NODE/1e12:.0f} TB/s ×80% / 8 = 每卡 {DDR_SHARE/1e9:.0f} GB/s，容量每卡 {DDR_CAP/1e9:.0f} GB |",
+        f"| H2D 换入 | {HOST/1e9:.0f} GB/s，min(H2D {H2D/1e9:.0f}, DDR 每卡 {DDR_SHARE/1e9:.0f}) |",
         f"| D2D | {D2D/1e12:.2f} TB/s，标称每卡单向 48 Tb/s |",
         f"| 总线 DDR 池 | {POOL/1e12:.2f} TB/s，标称每卡 51.2 Tb/s，容量不限 |",
         f"| AllReduce | {P2P/1e9:.0f} GB/s，两卡之间 1.6 Tb/s，7 条 × 80% |",
-        f"| P→D / 拉 KV 25% / 拉 KV 100% | {PARAM/1e9:.0f} / {PREFIX_25/1e9:.0f} / {PREFIX_100/1e9:.0f} GB/s |",
+        f"| P→D / 拉 KV 基线 / 拉 KV NEW | {PARAM/1e9:.0f} / {PREFIX_25/1e9:.0f} / {PREFIX_100/1e9:.0f} GB/s |",
         f"| 每卡 KV 房间 | {ROOM/N/1e9:.1f} GB，副本合计 {ROOM/1e12:.2f} TB |",
         "",
         "两卡之间的 P2P 是 1.6 Tb/s。7 条同时可用，聚合峰值 1.40 TB/s，低于 D2D 口 6.00 TB/s，AllReduce 用 1.12 TB/s。",
@@ -999,9 +999,9 @@ def write_md(path, data):
         "",
         "n = ceil(全局批 / 32)。q = 0.005×S。这些 Prefill 批的 T_tail 是 0。",
         "",
-        "## 5. Case 1：拉 KV 100%",
+        "## 5. Case 1：拉 KV 从基线改到 NEW",
         "",
-        "| 输入 | 25%批 | 100%批 | TPS提升 | 25%拉KV | 100%拉KV | 25%占比 | 100%占比 |",
+        "| 输入 | 基线批 | NEW批 | TPS提升 | 基线拉KV | NEW拉KV | 基线占比 | NEW占比 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in data["rows"]:
@@ -1016,7 +1016,7 @@ def write_md(path, data):
         "",
         "## 6. Case 2：总线 DDR 池",
         "",
-        f"池带宽每卡 {POOL/1e12:.2f} TB/s，容量不限。对照是 H2D 路径 {HOST/1e9:.1f} GB/s。D2D 交换平面是 {D2D/1e12:.2f} TB/s，不截断这条池。",
+        f"池带宽每卡 {POOL/1e12:.2f} TB/s，容量不限。对照是 H2D 路径 {HOST/1e9:.0f} GB/s。D2D 交换平面是 {D2D/1e12:.2f} TB/s，不截断这条池。",
         "",
         "| 输入 | 10ms H2D批 | 10ms 池批 | 10ms TPS提升 | 30ms H2D批 | 30ms 池批 | 30ms TPS提升 | 30ms 池 DDR/卡 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",

@@ -135,6 +135,13 @@ def signed_pct(new, old):
         return "—"
     return f"{(new - old) / old * 100:+.1f}%"
 
+
+def fmt_tps(v):
+    x = v / 1e4
+    if x >= 10:
+        return f"{x:.1f} 万"
+    return f"{x:.2f} 万"
+
 E, L, H, DFF, TOPK = 2469, 61, 7168, 3072, 6
 N_CSA, N_HCA = 30, 31
 W_ONE = 3 * H * DFF * L
@@ -747,7 +754,7 @@ def add_compare_slide(prs, blank, pb, bs10, bs30):
     slide = prs.slides.add_slide(blank)
     chrome(
         slide,
-        SLIDE_TOTAL,
+        SLIDE_TOTAL if pool_is_h2d() else SLIDE_TOTAL - 1,
         "拉 KV 从 25% 物理带宽改到 100%，批量上升但不是 4 倍",
         "对照    ·    12.5 GB/s → 50 GB/s    ·    TP=8",
     )
@@ -873,6 +880,99 @@ def add_compare_slide(prs, blank, pb, bs10, bs30):
                 for s, old_bs, old_d, new_bs, new_d in decode_cmp
             )
             if decode_cmp else " Decode SWAP unchanged at 51.2 GB/s."
+        )
+    )
+
+
+def add_pool_tps_slide(prs, blank):
+    """H2D pool at 51.2 GB/s versus this case's D2D pool, as system decode TPS."""
+    global POOL
+    lengths = (4096, 8192, 32768, 131072, 262144, 524288, S_1M, S_2M, S_4M)
+    d2d = POOL
+    rows = []
+    try:
+        for s in lengths:
+            item = {"S": s}
+            for limit, key in ((0.010, "10"), (0.030, "30")):
+                POOL = HOST
+                bh = search_bs(s, limit)
+                dh = decode(bh, s)
+                POOL = d2d
+                bd = search_bs(s, limit)
+                dd = decode(bd, s)
+                item[key] = {
+                    "bh": bh,
+                    "bd": bd,
+                    "th": bh / dh["t"],
+                    "td": bd / dd["t"],
+                    "th_t": dh["t"],
+                    "td_t": dd["t"],
+                }
+            rows.append(item)
+    finally:
+        POOL = d2d
+    by = {row["S"]: row for row in rows}
+    r4, r4m = by[4096], by[S_4M]
+    slide = prs.slides.add_slide(blank)
+    chrome(
+        slide,
+        SLIDE_TOTAL,
+        "10 毫秒换池无收益；30 毫秒从 256K 起 TPS 上升",
+        f"Decode    ·    H2D 池 {gbps(HOST)} 对照 D2D 池 {gbps(d2d)}    ·    系统 TPS",
+    )
+    banner(
+        slide,
+        0.92,
+        f"系统 Decode TPS = 全局批 / 该批实际 TPOT，单位万 token/s。H2D 内存池 {gbps(HOST)}，D2D 内存池 {gbps(d2d)}。提升以 H2D 为基线。",
+        size=13,
+    )
+    head = ["输入", "H2D·10毫秒", "D2D·10毫秒", "10毫秒提升", "H2D·30毫秒", "D2D·30毫秒", "30毫秒提升"]
+    body, kinds = [], ["head"]
+    for row in rows:
+        a, b = row["10"], row["30"]
+        kinds.append("key" if row["S"] >= 262144 else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_tps(a["th"]),
+            fmt_tps(a["td"]),
+            signed_pct(a["td"], a["th"]),
+            fmt_tps(b["th"]),
+            fmt_tps(b["td"]),
+            signed_pct(b["td"], b["th"]),
+        ])
+    table_y = 1.50
+    head_h, row_h = 0.34, 0.34
+    add_table(
+        slide,
+        0.42,
+        table_y,
+        [1.10, 1.85, 1.85, 1.55, 2.05, 2.05, 2.05],
+        [head] + body,
+        [head_h] + [row_h] * len(body),
+        kinds,
+        size=13,
+    )
+    note_y = table_y + head_h + row_h * len(body) + 0.12
+    note_h = 7.05 - note_y
+    note = (
+        f"10 毫秒从 4K 到 4M 都全在 HBM。两条池的批相同，TPS 相同：4K {fmt_tps(r4['10']['th'])}，4M {fmt_tps(r4m['10']['th'])}，提升都是 0%。\n"
+        "30 毫秒在 4K 到 128K 也不进池。256K 起 D2D 池把批量做大，右列就是相对 H2D 的 TPS 收益。\n"
+        f"4M 批量 {r4m['30']['bh']} → {r4m['30']['bd']}（{signed_pct(r4m['30']['bd'], r4m['30']['bh'])}），"
+        f"TPS 只到 {signed_pct(r4m['30']['td'], r4m['30']['th'])}："
+        f"H2D 这批实际 {ms2(r4m['30']['th_t'])}，D2D 贴着 {ms2(r4m['30']['td_t'])}。"
+        f"D2D 池是每卡 {gbps(d2d)}，不取 MoE 那条 {gbps(D2D)}。"
+    )
+    box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(note_y), Inches(12.5), Inches(note_h))
+    solid(box, GOLD_BG)
+    textbox(slide, 0.58, note_y + 0.06, 12.18, note_h - 0.12, note, 14, False, GOLD, anchor=MSO_ANCHOR.MIDDLE)
+    slide.notes_slide.notes_text_frame.text = (
+        "系统 Decode TPS = 全局批 / 实际 TPOT。H2D 池 = 51.2 GB/s，D2D 池 = 本用例 400 GB/s。"
+        + " ".join(
+            f"{fmt_len(row['S'])}: "
+            f"10ms {row['10']['bh']}->{row['10']['bd']} tps {row['10']['th']:.1f}->{row['10']['td']:.1f}; "
+            f"30ms {row['30']['bh']}->{row['30']['bd']} tps {row['30']['th']:.1f}->{row['30']['td']:.1f} "
+            f"t {row['30']['th_t']*1e3:.3f}->{row['30']['td_t']*1e3:.3f}ms"
+            for row in rows
         )
     )
 
@@ -1908,6 +2008,8 @@ def main(out_path=None):
 
     if COMPARE_BASELINE:
         add_compare_slide(prs, blank, pb, bs10, bs30)
+    if not pool_is_h2d():
+        add_pool_tps_slide(prs, blank)
     out = out_path or "/agent/repos/ucl-mpcomm/docs/deepseek-96g-slo.pptx"
     prs.save(out)
     print(out)
@@ -2109,7 +2211,7 @@ def build_cases():
     apply_case(
         1.0,
         400e9,
-        15,
+        16,
         stem + "    ·    用例2：拉 KV 100% 物理，SWAP 400 GB/s    ·    张量 405 T",
         "用例2：拉 KV 100% 物理，Decode SWAP 400 GB/s",
         True,

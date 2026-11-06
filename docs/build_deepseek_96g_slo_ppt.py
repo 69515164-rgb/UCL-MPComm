@@ -1921,6 +1921,129 @@ def main(out_path=None):
         raise SystemExit("empty batch")
 
 
+def build_uc1_tps_page(out_path):
+    """One slide: 25% vs 100% prefix pull under the same 10 s TTFT cap."""
+    global PREFIX_FRAC, PREFIX_PULL, SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE
+    saved_frac, saved_pull = PREFIX_FRAC, PREFIX_PULL
+    lengths = (4096, 8192, 32768, 131072, 262144, 524288, 1048576)
+    saved_total, saved_footer, saved_title = SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE
+    SLIDE_TOTAL = 1
+    CASE_FOOTER = (
+        "10T 为外推    ·    用例1 对照 25% 与 100% 物理带宽    ·    "
+        "TPS = 全局批 × 输入长度 / 实际 TTFT    ·    128 卡"
+    )
+    DECK_TITLE = "用例1：10 秒 TTFT 下的批量、系统 Prefill TPS 与拉 KV 占比"
+    cases = {}
+    try:
+        for frac, label in ((0.25, "25%"), (1.0, "100%")):
+            PREFIX_FRAC = frac
+            PREFIX_PULL = PARAM_PEAK * frac
+            for s in lengths:
+                bs = max_prefill_bs(s)
+                row = prefill_batch(bs, s)
+                kernel = max(row["t_hbm"], row["t_attn"])
+                cases[(s, label)] = {
+                    "bs": bs,
+                    "tps": bs * s / row["t"],
+                    "pull": row["t_pull"],
+                    "kernel": kernel,
+                    "ar": row["t_ar"],
+                    "moe": row["t_moe"],
+                    "t": row["t"],
+                    "share": row["t_pull"] / row["t"],
+                }
+    finally:
+        PREFIX_FRAC, PREFIX_PULL = saved_frac, saved_pull
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    prs.core_properties.title = DECK_TITLE
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    chrome(slide, 1, "同一条 10 秒，25% 带宽的批量换到系统 TPS 后仍低于 100%", "用例1    ·    TTFT ≤ 10 秒    ·    99.5% 命中    ·    TP=8")
+    banner(
+        slide,
+        0.90,
+        "系统 Prefill TPS = 全局批 × 输入长度 / 该批实际 TTFT。按 128 卡一份副本、完整输入 token 计。TTFT = 拉 KV + 计算 + AR + MoE。",
+        size=13,
+    )
+    head = ["输入", "带宽", "全局批", "系统 TPS", "拉 KV", "计算", "AR", "MoE", "TTFT", "拉KV占比"]
+    body, kinds = [], ["head"]
+    for s in lengths:
+        for label in ("25%", "100%"):
+            item = cases[(s, label)]
+            kinds.append("body" if label == "25%" else "key")
+            body.append([
+                fmt_len(s),
+                label,
+                str(item["bs"]),
+                fmt_tok(item["tps"]),
+                f"{item['pull']:.2f} 秒",
+                f"{item['kernel']:.2f} 秒",
+                f"{item['ar']:.2f} 秒",
+                f"{item['moe']:.2f} 秒",
+                f"{item['t']:.2f} 秒",
+                f"{item['share'] * 100:.1f}%",
+            ])
+    add_table(
+        slide,
+        0.42,
+        1.42,
+        [0.72, 0.72, 1.22, 1.52, 1.20, 1.20, 1.12, 1.20, 1.18, 1.22],
+        [head] + body,
+        [0.32] + [0.30] * len(body),
+        kinds,
+        size=11,
+    )
+    note = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.42), Inches(6.04), Inches(12.5), Inches(1.02))
+    solid(note, GOLD_BG)
+    a4, b4 = cases[(4096, "25%")], cases[(4096, "100%")]
+    a1, b1 = cases[(1048576, "25%")], cases[(1048576, "100%")]
+    textbox(
+        slide,
+        0.58,
+        6.08,
+        12.18,
+        0.94,
+        "计算 = max(HBM, Attention FLOP)。这档 HBM 只有几毫秒到十几毫秒，所以计算列就是 FLOP 时间。P→D 尾巴为 0，不单列。\n"
+        f"4K：批量 {a4['bs']} → {b4['bs']}（{signed_pct(b4['bs'], a4['bs'])}），"
+        f"TPS {fmt_tok(a4['tps'])} → {fmt_tok(b4['tps'])}（{signed_pct(b4['tps'], a4['tps'])}），"
+        f"拉 KV 占比 {a4['share']*100:.1f}% → {b4['share']*100:.1f}%。"
+        f"1M：批量 {signed_pct(b1['bs'], a1['bs'])}，TPS {signed_pct(b1['tps'], a1['tps'])}。"
+        "1M 实际 TTFT 低于 10 秒，是因为再加一条会让最忙组跳一档并超过 10 秒。",
+        12,
+        False,
+        GOLD,
+        anchor=MSO_ANCHOR.MIDDLE,
+    )
+    lines = []
+    for s in lengths:
+        for label in ("25%", "100%"):
+            item = cases[(s, label)]
+            lines.append(
+                f"{fmt_len(s)} {label} bs={item['bs']} tps={item['tps']:.3f} "
+                f"pull={item['pull']:.6f} kernel={item['kernel']:.6f} ar={item['ar']:.6f} "
+                f"moe={item['moe']:.6f} ttft={item['t']:.6f} share={item['share']:.6f}"
+            )
+    slide.notes_slide.notes_text_frame.text = (
+        "系统 Prefill TPS = BS × S / TTFT，S 是用户输入长度，不是 0.5% 现算 token。"
+        "25% 为 12.5 GB/s，100% 为 50 GB/s。两者都取 TTFT≤10 秒的最大全局批。"
+        + " ".join(lines)
+    )
+    prs.save(out_path)
+    SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE = saved_total, saved_footer, saved_title
+    print(out_path)
+    for s in lengths:
+        a, b = cases[(s, "25%")], cases[(s, "100%")]
+        print(
+            fmt_len(s),
+            a["bs"], b["bs"], signed_pct(b["bs"], a["bs"]),
+            round(a["tps"]), round(b["tps"]), signed_pct(b["tps"], a["tps"]),
+            f"{a['share']*100:.1f}%", f"{b['share']*100:.1f}%",
+            round(a["t"], 3), round(b["t"], 3),
+        )
+
+
 def apply_case(prefix_frac, pool_bps, slides, footer, title, compare):
     global PREFIX_FRAC, PREFIX_PULL, POOL, SLIDE_TOTAL, CASE_FOOTER, DECK_TITLE, COMPARE_BASELINE
     PREFIX_FRAC = prefix_frac
@@ -1958,5 +2081,7 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "cases":
         build_cases()
+    elif len(sys.argv) > 1 and sys.argv[1] == "tps":
+        build_uc1_tps_page("/agent/repos/ucl-mpcomm/docs/deepseek-96g-slo-uc1-ttft-tps.pptx")
     else:
         main()

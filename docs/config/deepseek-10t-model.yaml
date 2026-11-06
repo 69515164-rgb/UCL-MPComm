@@ -74,15 +74,48 @@ precision:
   routed_expert_bytes_per_param: 0.5
   shared_expert: fp8
   attention: fp8
-  # TP AllReduce 的 hidden。
+  # 只用于 TP AllReduce 的 hidden。不是 MoE 的 dispatch / combine。
   collective_hidden: bf16
   collective_hidden_bytes: 2
+
+# MoE 的 EP 通信。按 V4-Pro 论文的实际部署：FP8 dispatch + BF16 combine。
+# 每个 token、每个被选中的专家、每一层是 3 × hidden 字节，不是两边同宽。
+# 同一指派次数、同一层数、同一单向带宽下，T_combine = 2 × T_dispatch。
+# 计时不得把两段都写成 BF16，也不得令两段时间相等。
+# FP8 scale 不计入这 3h；按 128 元素一块、每块 1 字节，dispatch 大约只多 0.8%。
+moe_ep:
+  dispatch_dtype: fp8
+  dispatch_bytes_per_element: 1
+  combine_dtype: bf16
+  combine_bytes_per_element: 2
+  # 1 × 7168 + 2 × 7168
+  bytes_per_token_expert_per_layer: 21504
+  # 6 × 3 × 7168 × 61。单 token、TopK=6、61 层的结构量。
+  # 秒数乘最忙卡的 hot，不直接乘 6 × token 数。
+  bytes_per_token_all_layers: 7870464
 
 # 计时模型直接使用的权重字节。FP8 权重的字节数等于参数个数。
 timing_weights:
   routed_expert_table_bytes: 4974636957696
   shared_expert_bytes: 4029677568
   attention_bytes: 19350000000
+
+# 整理 TTFT 耗时表时，表格下面必须逐列标出公式和汇总方法。
+# 只看格子看不出这一列是相加、取最大，还是按哪种字节宽度除以带宽。
+# 公式写在该表正下方，不另指前面的章节。每一列一个式子，至少写明：
+#   分段有哪些
+#   哪些取最大，哪些相加
+#   字节宽度、层数和带宽
+# dispatch 与 combine 分开写：前者 FP8、每元素 1 字节，后者 BF16、每元素 2 字节。
+# 不得合并成一个相等的通信时间。
+# 例：
+#   T_Attention = max(T_pull, T_HBM, T_compute, T_AR)
+#   T_dispatch  = hot × 7168 × 1 × 61 / 单向带宽
+#   T_combine   = hot × 7168 × 2 × 61 / 单向带宽
+#   T_MoE       = T_dispatch + max(T_weight, T_gemm) + T_combine
+#   TTFT        = T_Attention + T_MoE + P→D 尾巴
+timing_presentation:
+  ttft_table_requires_formulas_below: true
 
 # 已固化进 96 GB / 486 T 两套幻灯片的负载口径。冷请求与 98% 命中共用同一套模型。
 workload:

@@ -92,6 +92,7 @@ placement:
   kv_bytes_per_replica: 16414565584896
 
 traffic:
+  # 链路走 D2D。字节宽度在模型配置：dispatch 为 FP8，combine 为 BF16，两段时间不相等。
   moe_dispatch_combine: d2d
   attention_allreduce: fullmesh
   # AllReduce 字节仍按 ring 的 2×(TP-1)/TP 计，带宽用上面的 fullmesh 聚合。

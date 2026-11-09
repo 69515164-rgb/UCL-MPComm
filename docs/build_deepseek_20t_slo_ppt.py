@@ -44,6 +44,9 @@ DDR_COLOR = "C46B2C"
 N, NODE = 256, 8
 TP = 8
 DP = N // TP
+# Prefill replica: smallest multiple of the 8-GPU node whose 10 s batch is still time-limited.
+PF_N = 24
+PF_DP = PF_N // TP
 L, H, DFF, TOPK = 61, 7168, 3072, 6
 N_CSA, N_HCA = 30, 31
 W_ONE = 3 * H * DFF * L
@@ -83,7 +86,7 @@ PROJ = ATTN * 2
 HIT = 0.995
 OUT_LEN = 512
 LENGTHS = (65536, 131072, 262144, 524288, 1048576, 2097152, 4194304)
-SLIDES = 10
+SLIDES = 13
 FOOTER = "N+2    ·    20T 为外推    ·    640 GB / 48P FP4、一份 256 卡副本    ·    参数面 800 Gb/s    ·    拉 KV 25%    ·    张量 33.60 P"
 
 
@@ -281,17 +284,23 @@ def allreduce(rows):
     return L * (COLL + per / P2P)
 
 
-def expert(tokens):
+def room_bytes(ngpu):
+    per = HBM_CAP - ROUTED / ngpu - SHARED - ATTN / TP - RESERVE
+    return per, ngpu * per
+
+
+def expert(tokens, ngpu=None):
+    gpu = N if ngpu is None else ngpu
     tokens = max(float(tokens), 0.0)
-    mean = tokens * TOPK / N
-    hot = min(tokens * TOPK, mean + 2 * math.sqrt(max(mean * (1 - 1 / N), 0.0)))
+    mean = tokens * TOPK / gpu
+    hot = min(tokens * TOPK, mean + 2 * math.sqrt(max(mean * (1 - 1 / gpu), 0.0)))
     frac = 1 - math.exp(-TOPK * tokens / E) if tokens > 0 else 0.0
-    experts = E / N
+    experts = E / gpu
     std = math.sqrt(max(experts * frac * (1 - frac), 0.0))
     e_hot = min(experts, experts * frac + 2 * std) if frac > 0 else 0.0
     tpe = hot / e_hot if e_hot else 0.0
     routed_rows = e_hot * math.ceil(tpe / 16) * 16 if e_hot else 0.0
-    shared_rows = math.ceil(max(1, math.ceil(tokens / N)) / 16) * 16
+    shared_rows = math.ceil(max(1, math.ceil(tokens / gpu)) / 16) * 16
     t_w = (e_hot * W_ONE * 0.5 + SHARED) / HBM_BW
     t_g = (routed_rows + shared_rows) * 6 * H * DFF * L / PEAK
     t_d = L * (COLL + hot * H * 1 / D2D)
@@ -316,8 +325,9 @@ def n_csa_read(s):
     return N_CSA * (s / 4.0) * 64 + N_HCA * (s / 128.0) * 576 + N_CSA * sel * 576 + FIXED
 
 
-def prefill(bs, s, hit=HIT, prefix=PREFIX_25):
-    n = math.ceil(bs / DP)
+def prefill(bs, s, hit=HIT, prefix=PREFIX_25, ngpu=None):
+    gpu = N if ngpu is None else ngpu
+    n = math.ceil(bs / (gpu // TP))
     p, q = hit * s, (1 - hit) * s
     rows = n * q
     context = q * p + q * (q + 1) / 2.0
@@ -332,7 +342,7 @@ def prefill(bs, s, hit=HIT, prefix=PREFIX_25):
     hbm_bytes = ATTN / TP + n * (store_seq(s) + q * BPT) / TP
     t_hbm = hbm_bytes / HBM_BW
     t_ar = allreduce(rows)
-    moe = expert(bs * q)
+    moe = expert(bs * q, gpu)
     body = t_pull + max(t_hbm, t_compute) + t_ar + moe["t"]
     t_pd = n * store_seq(s) / (TP * PARAM)
     tail = max(0.0, t_pd - body * (L - 1) / L)
@@ -383,24 +393,37 @@ def fits_ddr(row, cap):
     return row["spill"] * row["store"] / N <= cap + 1.0
 
 
-def search_prefill(s, prefix, limit=10.0):
-    def ok(bs):
-        return prefill(bs, s, prefix=prefix)["t"] <= limit + 1e-9
+def search_prefill(s, prefix, limit=10.0, ngpu=None, mem=False):
+    gpu = N if ngpu is None else ngpu
+    cap = 20_000_000
+    if mem:
+        per, _ = room_bytes(gpu)
+        cap = int(per * gpu // store_seq(s)) if per > 0 else 0
+        if cap < 1:
+            return 0, prefill(1, s, prefix=prefix, ngpu=gpu)
 
+    def ok(bs):
+        return bs <= cap and prefill(bs, s, prefix=prefix, ngpu=gpu)["t"] <= limit + 1e-9
+
+    if not ok(1):
+        return 0, prefill(1, s, prefix=prefix, ngpu=gpu)
     lo, hi = 1, 2
-    while ok(hi) and hi < 20_000_000:
-        lo, hi = hi, hi * 2
-    while lo + 1 < hi:
-        mid = (lo + hi) // 2
-        if ok(mid):
-            lo = mid
-        else:
-            hi = mid
+    while ok(hi) and hi < cap:
+        lo, hi = hi, min(cap, hi * 2)
+    if ok(hi) and hi == cap:
+        lo = cap
+    else:
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if ok(mid):
+                lo = mid
+            else:
+                hi = mid
     while lo > 1 and not ok(lo):
         lo -= 1
-    while ok(lo + 1) and lo < 20_000_000:
+    while lo < cap and ok(lo + 1):
         lo += 1
-    return lo, prefill(lo, s, prefix=prefix)
+    return lo, prefill(lo, s, prefix=prefix, ngpu=gpu)
 
 
 def search_decode(s, limit, pool, cap):
@@ -503,6 +526,7 @@ def collect():
     rows = []
     for s in LENGTHS:
         b25, p25 = search_prefill(s, PREFIX_25)
+        b24, p24 = search_prefill(s, PREFIX_25, ngpu=PF_N)
         b100, p100 = search_prefill(s, PREFIX_100)
         b10, d10 = search_decode(s, 0.010, HOST, DDR_CAP)
         p10b, d10p = search_decode(s, 0.010, POOL, None)
@@ -511,6 +535,7 @@ def collect():
         rows.append({
             "S": s,
             "b25": b25, "p25": p25,
+            "b24": b24, "p24": p24,
             "b100": b100, "p100": p100,
             "b10": b10, "d10": d10,
             "p10": p10b, "d10p": d10p,
@@ -534,7 +559,7 @@ def req_pair(bs_p, t_p, bs_d, t_d):
 
 def slide_conclusion(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 1, "10 秒和 10 毫秒都能摸高，冷的 4M 过线", "N+2    ·    20T DeepSeek    ·    640 GB / 48P FP4    ·    256 卡一份副本")
+    chrome(slide, 1, "10 秒和 10 毫秒都能摸高，冷的 4M 过线", "N+2    ·    20T DeepSeek    ·    本页是 256 卡副本    ·    Prefill 最优为 24 卡")
     banner(slide, 0.92, f"99.5% 命中。参数面 800 Gb/s，拉 KV 基线每卡 {PREFIX_25/1e9:.0f} GB/s。Decode 换入取 min(H2D {H2D/1e9:.0f}, DDR 每卡 {DDR_SHARE/1e9:.0f}) = {HOST/1e9:.0f} GB/s。")
     r64, r4 = by_len(data, 65536), by_len(data, 4194304)
     head = ["约束", "64K 全局批", "64K 系统 TPS", "4M 全局批", "4M 系统 TPS", "4M 实际耗时"]
@@ -545,14 +570,16 @@ def slide_conclusion(prs, blank, data):
     ]
     add_table(slide, 0.42, 1.50, [2.05, 1.85, 2.15, 1.85, 2.20, 2.40], [head] + body, [0.40, 0.46, 0.46, 0.46], ["head", "key", "body", "body"], size=14)
     rp, rd, ratio = req_pair(r64["b25"], r64["p25"]["t"], r64["b10"], r64["d10"]["t"])
+    rp24, _, ratio24 = req_pair(r64["b24"], r64["p24"]["t"], r64["b10"], r64["d10"]["t"])
     gold(
         slide,
         3.50,
-        1.55,
+        1.85,
         f"冷请求不拉 prefix。最大输入 {data['cold_s']:,}，TTFT {sec(data['cold']['t'])}。4M 冷请求是 {sec(data['cold4']['t'])}，过 10 秒。\n"
         f"99.5% 命中下，64K 到 4M 的摸高批都落在 10 秒、10 毫秒、30 毫秒里面。系统 Prefill TPS = 全局批 × 输入长度 / 实际 TTFT。系统 Decode TPS = 全局批 / 实际 TPOT。\n"
-        f"按输出 {OUT_LEN} token 配副本：64K、10 毫秒时 Prefill {rp:.0f} 请求/秒，Decode {rd:.0f} 请求/秒，{ratio:.2f} 份 Prefill 配 1 份 Decode。副本个数不改变单条 TTFT、TPOT。",
-        14,
+        f"本页 Prefill 按 256 卡计。64K、10 毫秒：Prefill {rp:.0f} 请求/秒，Decode {rd:.0f} 请求/秒，{ratio:.2f} 份 Prefill 配 1 份 Decode。\n"
+        f"Prefill 改到 24 卡后每卡吞吐不变。同一 Decode 要 {ratio24:.1f} 份 24 卡 Prefill，一份的请求速率是 {rp24:.0f} /秒。",
+        13,
     )
     slide.notes_slide.notes_text_frame.text = (
         f"cold {data['cold_s']} t={data['cold']['t']:.6f} cold4={data['cold4']['t']:.6f} "
@@ -623,37 +650,40 @@ def slide_hardware(prs, blank):
 
 def slide_parallel(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 4, "注意力留在机内，专家铺满 256 卡", "N+2    ·    TP=8    ·    DP=32    ·    EP=256")
-    banner(slide, 0.92, "一份模型放进一个 256 卡超节点。专家通信留在 48 Tb/s 的交换平面，AllReduce 留在机内两两 1.6 Tb/s 的链路上。")
-    head = ["", "Attention", "MoE"]
-    ep16 = ROUTED / 16 / 1e9
+    chrome(slide, 4, "Prefill 收到 24 卡，Decode 仍用 256", "N+2    ·    Prefill TP=8 EP=24 DP=3    ·    Decode TP=8 EP=256 DP=32")
+    banner(slide, 0.92, "每卡 Prefill 吞吐从 24 卡到 256 卡持平。24 卡是 8 卡对齐下，10 秒批量仍由时间决定的最小副本。")
+    head = ["", "Prefill", "Decode"]
+    pf_room, pf_cluster = room_bytes(PF_N)
+    dc_room, dc_cluster = room_bytes(N)
     body = [
-        ["切分", "TP=8，DP=32\n32 个机内组", "EP=256\n一份专家表铺满超节点"],
-        ["理由", "AllReduce 每层一次\n有效带宽 1.12 TB/s", f"专家表 {ROUTED/1e12:.2f} TB\nEP=16 时每卡路由约 {ep16:.0f} GB"],
-        ["每卡权重", f"注意力 {ATTN/TP/1e9:.2f} GB FP8", f"路由 {E/N:.1f} 个，{ROUTED/N/1e9:.1f} GB FP4\n共享 {SHARED/1e9:.2f} GB，每卡一份"],
-        ["KV 房间", f"扣 6 GB 预留后每卡 {(ROOM/N)/1e9:.1f} GB", f"256 卡合计 {ROOM/1e12:.1f} TB\n4M 单条 KV {store_seq(4194304)/1e9:.1f} GB"],
+        ["切分", "TP=8，EP=24，DP=3\n一份副本 3 个机内组", "TP=8，EP=256，DP=32\n一份副本铺满超节点"],
+        ["理由", "拉 KV 是每卡 25 GB/s\n加大 EP 不提高每卡 token/s", "64K、30 毫秒存量约 146 TB\n要吃满 151 TB 的 KV 房间"],
+        ["每卡权重", f"路由 {ROUTED/PF_N/1e9:.0f} GB FP4\n注意力 {ATTN/TP/1e9:.2f} GB", f"路由 {ROUTED/N/1e9:.1f} GB FP4\n注意力 {ATTN/TP/1e9:.2f} GB"],
+        ["KV 房间", f"每卡 {pf_room/1e9:.0f} GB\n副本 {pf_cluster/1e12:.2f} TB", f"每卡 {dc_room/1e9:.0f} GB\n副本 {dc_cluster/1e12:.1f} TB"],
     ]
-    add_table(slide, 0.42, 1.48, [1.70, 5.40, 5.40], [head] + body, [0.34, 0.62, 0.62, 0.70, 0.62], ["head", "key", "body", "body", "key"], size=13)
-    r64, r4 = by_len(data, 65536), by_len(data, 4194304)
-    a = req_pair(r64["b25"], r64["p25"]["t"], r64["b10"], r64["d10"]["t"])
-    b = req_pair(r64["b25"], r64["p25"]["t"], r64["b30"], r64["d30"]["t"])
-    c = req_pair(r4["b25"], r4["p25"]["t"], r4["b10"], r4["d10"]["t"])
+    add_table(slide, 0.42, 1.48, [1.70, 5.40, 5.40], [head] + body, [0.34, 0.62, 0.70, 0.62, 0.62], ["head", "key", "body", "body", "key"], size=13)
+    r64 = by_len(data, 65536)
+    per24 = r64["b24"] * r64["S"] / r64["p24"]["t"] / PF_N
+    per256 = r64["b25"] * r64["S"] / r64["p25"]["t"] / N
+    b16, p16 = search_prefill(4194304, PREFIX_25, ngpu=16, mem=True)
+    per16 = (b16 * 4194304 / p16["t"] / 16) if b16 else 0.0
+    per4 = by_len(data, 4194304)
+    per4_24 = per4["b24"] * per4["S"] / per4["p24"]["t"] / PF_N
     gold(
         slide,
         5.05,
         1.95,
-        f"EP=16 的每卡路由权重大约 {ep16:.0f} GB，再加共享、注意力和 6 GB 预留，KV 房间不够撑 4M 的批。256 卡是这颗交换芯片的互联范围，EP 不进参数面。\n"
-        f"Prefill 副本和 Decode 副本按吞吐加。单条请求不跨副本。输出按 {OUT_LEN} token 把请求/秒对齐。\n"
-        f"64K、10 毫秒：Prefill {a[0]:.0f} 请求/秒，Decode {a[1]:.0f} 请求/秒，{a[2]:.2f} 份 Prefill 配 1 份 Decode。\n"
-        f"64K、30 毫秒：{b[2]:.2f} 份 Prefill 配 1 份 Decode。4M、10 毫秒：Prefill {c[0]:.0f} 请求/秒，Decode {c[1]:.0f} 请求/秒，{c[2]:.1f} 份 Prefill 配 1 份 Decode。",
+        f"64K 每卡 Prefill TPS：24 卡 {fmt_rate(per24)}，256 卡 {fmt_rate(per256)}。AllReduce 仍在机内 1.12 TB/s，专家通信仍按每卡 {D2D/1e12:.2f} TB/s。\n"
+        f"16 卡每卡 KV 只剩 {room_bytes(16)[0]/1e9:.1f} GB。4M 摸高批被显存卡在 {b16}，每卡吞吐 {fmt_rate(per16)}，是 24 卡的 {per16 / per4_24 * 100:.0f}%。\n"
+        "单条请求不跨副本。Decode 不跟着缩小。24 卡的系统 TPS、耗时和 HBM 占用见后三页。",
         13,
     )
-    slide.notes_slide.notes_text_frame.text = f"TP={TP} DP={DP} EP={N} ROOM_TB={ROOM/1e12:.3f} weight_gpu={(ROUTED/N+SHARED+ATTN/TP)/1e9:.3f}"
+    slide.notes_slide.notes_text_frame.text = f"PF_N={PF_N} PF_DP={PF_DP} room24={pf_room:.3e} room256={dc_room:.3e} ep16_4m={b16}"
 
 
 def slide_tps(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 5, "64K 到 4M，系统 TPS 随输入下降", "N+2    ·    TTFT ≤ 10 秒    ·    TPOT ≤ 10 / 30 毫秒")
+    chrome(slide, 5, "64K 到 4M，系统 TPS 随输入下降", "N+2    ·    256 卡副本    ·    TTFT ≤ 10 秒    ·    TPOT ≤ 10 / 30 毫秒")
     banner(slide, 0.92, f"基线：拉 KV 25%，Decode 换入 {HOST/1e9:.0f} GB/s。Prefill TPS 用完整输入 token。Decode TPS 是这一步新 token 的吞吐。")
     head = ["输入", "10 秒批", "Prefill TPS", "10 毫秒批", "10 毫秒 TPS", "30 毫秒批", "30 毫秒 TPS"]
     body, kinds = [], ["head"]
@@ -691,7 +721,7 @@ def slide_tps(prs, blank, data):
 
 def slide_prefill(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 6, "拉 KV 占掉 10 秒里的大部分", "N+2    ·    Prefill    ·    TTFT 拆解    ·    99.5% 命中")
+    chrome(slide, 6, "拉 KV 占掉 10 秒里的大部分", "N+2    ·    256 卡 Prefill    ·    TTFT 拆解    ·    DP=32")
     banner(slide, 0.92, "HBM 只有几毫秒，计算列就是 Attention FLOP。P→D 尾巴在这些批上是 0。四段相加等于 TTFT。")
     head = ["输入", "全局批", "拉 KV", "计算", "AR", "MoE", "HBM", "TTFT", "拉KV占比"]
     body, kinds = [], ["head"]
@@ -739,9 +769,148 @@ def slide_prefill(prs, blank, data):
     )
 
 
+def slide_pf_tps(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    chrome(slide, 7, "24 卡系统 TPS 按卡数缩小，每卡持平", "N+2    ·    Prefill EP=24    ·    对照 256 卡    ·    TTFT ≤ 10 秒")
+    banner(slide, 0.92, "版式同第 5 页。系统 TPS 是一份副本的吞吐。24 卡约为 256 卡的 24/256，每卡 token/s 相同。")
+    head = ["输入", "24卡批", "24卡 TPS", "24卡每卡", "256卡 TPS", "256卡每卡", "每卡比"]
+    body, kinds = [], ["head"]
+    for row in data["rows"]:
+        t24 = row["b24"] * row["S"] / row["p24"]["t"]
+        t256 = row["b25"] * row["S"] / row["p25"]["t"]
+        kinds.append("key" if row["S"] in (65536, 1048576, 4194304) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_bs(row["b24"]),
+            fmt_rate(t24),
+            fmt_rate(t24 / PF_N),
+            fmt_rate(t256),
+            fmt_rate(t256 / N),
+            f"{(t24 / PF_N) / (t256 / N) * 100:.1f}%",
+        ])
+    add_table(slide, 0.42, 1.50, [1.05, 1.45, 1.90, 1.80, 2.05, 2.10, 2.15], [head] + body, [0.36] + [0.38] * len(body), kinds, size=14)
+    r64, r4 = by_len(data, 65536), by_len(data, 4194304)
+    cap64 = int(room_bytes(PF_N)[1] // store_seq(65536))
+    rp, rd, ratio = req_pair(r64["b24"], r64["p24"]["t"], r64["b10"], r64["d10"]["t"])
+    gold(
+        slide,
+        5.05,
+        1.95,
+        f"64K：24 卡批 {fmt_bs(r64['b24'])}，TTFT {sec(r64['p24']['t'])}，系统 TPS {fmt_rate(r64['b24'] * r64['S'] / r64['p24']['t'])}。"
+        f"256 卡批 {fmt_bs(r64['b25'])}，系统 TPS {fmt_rate(r64['b25'] * r64['S'] / r64['p25']['t'])}。\n"
+        f"4M：24 卡批 {fmt_bs(r4['b24'])}，系统 TPS {fmt_rate(r4['b24'] * r4['S'] / r4['p24']['t'])}；"
+        f"256 卡批 {fmt_bs(r4['b25'])}，系统 TPS {fmt_rate(r4['b25'] * r4['S'] / r4['p25']['t'])}。\n"
+        f"64K 的 24 卡显存上限是 {fmt_bs(cap64)} 条，时间批 {fmt_bs(r64['b24'])} 条，仍由 10 秒卡住。\n"
+        f"按输出 {OUT_LEN} token、64K、10 毫秒：一份 24 卡 Prefill {rp:.0f} 请求/秒，Decode {rd:.0f} 请求/秒，{ratio:.1f} 份 Prefill 配 1 份 Decode。",
+        13,
+    )
+    slide.notes_slide.notes_text_frame.text = " ".join(
+        f"{fmt_len(row['S'])} b24={row['b24']} t={row['p24']['t']:.4f}" for row in data["rows"]
+    )
+
+
+def slide_pf_time(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    chrome(slide, 8, "24 卡的 10 秒拆解和 256 卡同构", "N+2    ·    24 卡 Prefill    ·    TTFT 拆解    ·    DP=3")
+    banner(slide, 0.92, "版式同第 6 页。HBM 仍是几毫秒。拉 KV 占比不变，批量约为 256 卡的 24/256。四段相加等于 TTFT。")
+    head = ["输入", "全局批", "拉 KV", "计算", "AR", "MoE", "HBM", "TTFT", "拉KV占比"]
+    body, kinds = [], ["head"]
+    for row in data["rows"]:
+        p = row["p24"]
+        kinds.append("key" if row["S"] in (65536, 1048576, 4194304) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_bs(row["b24"]),
+            sec(p["pull"]),
+            sec(p["compute"]),
+            sec(p["ar"]),
+            sec(p["moe"]),
+            ms(p["hbm"]),
+            sec(p["t"]),
+            f"{p['pull'] / p['t'] * 100:.1f}%",
+        ])
+    add_table(
+        slide,
+        0.42,
+        1.48,
+        [0.85, 1.25, 1.35, 1.25, 1.25, 1.25, 1.25, 1.30, 1.75],
+        [head] + body,
+        [0.34] + [0.36] * len(body),
+        kinds,
+        size=13,
+    )
+    r64 = by_len(data, 65536)
+    gold(
+        slide,
+        4.55,
+        2.45,
+        "TTFT = T_pull + max(T_HBM, T_compute) + T_AR + T_MoE + T_tail。\n"
+        f"T_pull = n × (p×4939.5 + 61×min(p,128)×576) / (8 × {PREFIX_25/1e9:.0f} GB/s)。p = 0.995×S，n = ceil(全局批 / {PF_DP})。\n"
+        "T_compute = n × (F_idx + F_hca + F_core + F_proj) / (8 × 33.60 P × align(n×q))。q = 0.005×S。\n"
+        f"T_AR = 61 × (5 微秒 + 2×7/8 × n×q × 7168 × 2 / {P2P/1e12:.2f} TB/s)。\n"
+        f"T_MoE = T_dispatch + max(T_weight, T_gemm) + T_combine。dispatch 1 字节，combine 2 字节，带宽 {D2D/1e12:.2f} TB/s。\n"
+        f"64K 拉 KV 占 {r64['p24']['pull'] / r64['p24']['t'] * 100:.1f}%，256 卡同一输入是 {r64['p25']['pull'] / r64['p25']['t'] * 100:.1f}%。这些批的尾巴是 0。",
+        13,
+    )
+    slide.notes_slide.notes_text_frame.text = " ".join(
+        f"{fmt_len(row['S'])} pull={row['p24']['pull']:.4f} comp={row['p24']['compute']:.4f} "
+        f"ar={row['p24']['ar']:.4f} moe={row['p24']['moe']:.4f} t={row['p24']['t']:.4f}"
+        for row in data["rows"]
+    )
+
+
+def _hbm_cells(ngpu, bs, s):
+    per, cluster = room_bytes(ngpu)
+    kv = bs * store_seq(s) / ngpu
+    free = HBM_CAP - (ROUTED / ngpu + SHARED + ATTN / TP + RESERVE) - kv
+    return per, cluster, kv, free
+
+
+def slide_pf_hbm(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    chrome(slide, 9, "24 卡把专家权重放进 HBM", "N+2    ·    每卡 HBM    ·    10 秒摸高批    ·    256 卡对照 24 卡")
+    banner(slide, 0.92, "同一条 10 秒批上，每卡实际 KV 几乎一样。24 卡的差别是路由权重大，KV 空闲被压到 64K 的边上。")
+    r64, r4 = by_len(data, 65536), by_len(data, 4194304)
+    room256, cluster256, kv64_256, free64_256 = _hbm_cells(N, r64["b25"], 65536)
+    _, _, kv4_256, free4_256 = _hbm_cells(N, r4["b25"], 4194304)
+    room24, cluster24, kv64_24, free64_24 = _hbm_cells(PF_N, r64["b24"], 65536)
+    _, _, kv4_24, free4_24 = _hbm_cells(PF_N, r4["b24"], 4194304)
+    head = ["项目", "256 卡", "24 卡"]
+    body = [
+        ["路由专家", f"{ROUTED/N/1e9:.1f} GB", f"{ROUTED/PF_N/1e9:.1f} GB"],
+        ["共享专家", f"{SHARED/1e9:.2f} GB", f"{SHARED/1e9:.2f} GB"],
+        ["注意力", f"{ATTN/TP/1e9:.2f} GB", f"{ATTN/TP/1e9:.2f} GB"],
+        ["预留", "6 GB", "6 GB"],
+        ["KV 房间", f"{room256/1e9:.1f} GB", f"{room24/1e9:.1f} GB"],
+        ["64K 实际 KV", f"{kv64_256/1e9:.1f} GB", f"{kv64_24/1e9:.1f} GB"],
+        ["64K 空闲", f"{free64_256/1e9:.1f} GB", f"{free64_24/1e9:.1f} GB"],
+        ["4M 实际 KV", f"{kv4_256/1e9:.1f} GB", f"{kv4_24/1e9:.1f} GB"],
+        ["4M 空闲", f"{free4_256/1e9:.1f} GB", f"{free4_24/1e9:.1f} GB"],
+        ["副本 KV 房间", f"{cluster256/1e12:.1f} TB", f"{cluster24/1e12:.2f} TB"],
+    ]
+    kinds = ["head"] + ["key" if i in (4, 6, 8) else "body" for i in range(len(body))]
+    add_table(slide, 0.42, 1.42, [3.30, 4.60, 4.60], [head] + body, [0.30] + [0.34] * len(body), kinds, size=13)
+    cap64 = int(cluster24 // store_seq(65536))
+    b16, _ = search_prefill(4194304, PREFIX_25, ngpu=16, mem=True)
+    gold(
+        slide,
+        5.28,
+        1.72,
+        "切分调整的理由：拉 KV 占 64K TTFT 的约 71%，带宽是每卡 25 GB/s。EP 从 24 加到 256，每卡 token/s 不变，系统 TPS 只按卡数放大。\n"
+        f"16 卡每卡 KV 房间 {room_bytes(16)[0]/1e9:.1f} GB，一条 4M 序列 {store_seq(4194304)/1e9:.1f} GB。摸高批被显存卡在 {b16}，每卡吞吐掉下来。\n"
+        f"24 卡是 8 卡对齐下的最小时间受限副本。64K 显存上限 {fmt_bs(cap64)} 条，时间批 {fmt_bs(r64['b24'])} 条，空闲 {free64_24/1e9:.0f} GB。\n"
+        f"Decode 保持 256 卡。64K、30 毫秒存量 {r64['d30']['store']/1e12:.0f} TB，256 卡房间 {cluster256/1e12:.0f} TB 几乎被用满。",
+        13,
+    )
+    slide.notes_slide.notes_text_frame.text = (
+        f"kv64_24={kv64_24:.3e} free64_24={free64_24:.3e} kv4_24={kv4_24:.3e} free4_24={free4_24:.3e} "
+        f"kv64_256={kv64_256:.3e} free64_256={free64_256:.3e}"
+    )
+
+
 def slide_decode(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 7, "10 毫秒少换入，30 毫秒从 128K 起换入是大头", f"N+2    ·    Decode    ·    TPOT 拆解    ·    H2D {HOST/1e9:.0f} GB/s")
+    chrome(slide, 10, "10 毫秒少换入，30 毫秒从 128K 起换入是大头", f"N+2    ·    Decode    ·    TPOT 拆解    ·    H2D {HOST/1e9:.0f} GB/s")
     head = ["输入", "批", "SWAP", "计算", "AR", "MoE", "TPOT", "溢出"]
 
     def rows_for(batch_key, dec_key):
@@ -785,7 +954,7 @@ def slide_decode(prs, blank, data):
 
 def slide_case1(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 8, "拉 KV 从基线改到 NEW，TPS 上升不到 4 倍", f"N+2 Case 1    ·    基线 {PREFIX_25/1e9:.0f} GB/s    ·    NEW {PREFIX_100/1e9:.0f} GB/s")
+    chrome(slide, 11, "拉 KV 从基线改到 NEW，TPS 上升不到 4 倍", f"N+2 Case 1    ·    基线 {PREFIX_25/1e9:.0f} GB/s    ·    NEW {PREFIX_100/1e9:.0f} GB/s")
     banner(slide, 0.92, f"基线是物理带宽的 25%，每卡 {PREFIX_25/1e9:.0f} GB/s。NEW 是物理 {PREFIX_100/1e9:.0f} GB/s，不叠乘 80%。TPS 提升以基线列计算。")
     head = ["输入", "基线批", "NEW批", "基线 TPS", "NEW TPS", "TPS提升", "基线占比", "NEW占比"]
     body, kinds = [], ["head"]
@@ -840,7 +1009,7 @@ def slide_case1(prs, blank, data):
 
 def slide_case2(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 9, "总线 DDR 池把长上下文的 30 毫秒 TPS 抬上去", f"N+2 Case 2    ·    H2D {HOST/1e9:.0f} GB/s 对照池 {POOL/1e12:.2f} TB/s")
+    chrome(slide, 12, "总线 DDR 池把长上下文的 30 毫秒 TPS 抬上去", f"N+2 Case 2    ·    H2D {HOST/1e9:.0f} GB/s 对照池 {POOL/1e12:.2f} TB/s")
     banner(slide, 0.92, f"池是每卡 51.2 Tb/s ×80% = {POOL/1e12:.2f} TB/s，容量不限，不经 H2D，也不用 48 Tb/s 的交换平面截断。提升以 H2D 为基线。")
     head = ["输入", "H2D·10毫秒", "池·10毫秒", "10毫秒提升", "H2D·30毫秒", "池·30毫秒", "30毫秒提升"]
     body, kinds = [], ["head"]
@@ -887,7 +1056,7 @@ def slide_case2(prs, blank, data):
 
 def slide_pies(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 10, "30 毫秒把 KV 房间占满，多出来的进 DDR 池", "N+2 Case 2    ·    每卡 HBM 占用和 DDR 池溢出")
+    chrome(slide, 13, "30 毫秒把 KV 房间占满，多出来的进 DDR 池", "N+2 Case 2    ·    每卡 HBM 占用和 DDR 池溢出")
     banner(slide, 0.92, "上表和饼图都是池上的批，按每卡。四块是权重加预留、HBM 里的 KV、HBM 空闲，以及溢出到 DDR 池的 KV。")
     head = ["输入", "池10ms HBM", "池10ms DDR", "池30ms HBM", "池30ms DDR", "30ms 溢出"]
     body, kinds = [], ["head"]
@@ -1033,6 +1202,30 @@ def write_md(path, data):
         "",
         f"64K、输出 {OUT_LEN}、10 毫秒的副本配比见第 4 页。单条请求不跨副本。",
         "",
+        "## 7. Prefill 改到 24 卡",
+        "",
+        "TP=8，EP=24，DP=3。Decode 仍是 TP=8，EP=256，DP=32。",
+        "每卡 Prefill TPS 与 256 卡相同。一份 24 卡副本的系统 TPS 约为 256 卡的 24/256。",
+        "16 卡的 KV 房间装不下 4M 摸高批。24 卡是 8 卡对齐下，10 秒批仍由时间决定的最小副本。",
+        "",
+        "| 输入 | 24卡批 | 24卡TPS | 24卡每卡TPS | 256卡TPS | 拉KV秒 | TTFT秒 | 拉KV占比 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in data["rows"]:
+        t24 = row["b24"] * row["S"] / row["p24"]["t"]
+        t256 = row["b25"] * row["S"] / row["p25"]["t"]
+        lines.append(
+            f"| {fmt_len(row['S'])} | {row['b24']} | {t24:.6e} | {t24 / PF_N:.6e} | {t256:.6e} | "
+            f"{row['p24']['pull']:.4f} | {row['p24']['t']:.4f} | {row['p24']['pull'] / row['p24']['t'] * 100:.1f}% |"
+        )
+    r64 = by_len(data, 65536)
+    per, cluster = room_bytes(PF_N)
+    kv64 = r64["b24"] * store_seq(65536) / PF_N
+    lines += [
+        "",
+        f"24 卡每卡路由权重 {ROUTED / PF_N / 1e9:.1f} GB，KV 房间 {per / 1e9:.1f} GB，副本 {cluster / 1e12:.2f} TB。",
+        f"64K 摸高批每卡实际 KV {kv64 / 1e9:.1f} GB。",
+        "",
     ]
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
@@ -1051,6 +1244,9 @@ def main():
     slide_parallel(prs, blank, data)
     slide_tps(prs, blank, data)
     slide_prefill(prs, blank, data)
+    slide_pf_tps(prs, blank, data)
+    slide_pf_time(prs, blank, data)
+    slide_pf_hbm(prs, blank, data)
     slide_decode(prs, blank, data)
     slide_case1(prs, blank, data)
     slide_case2(prs, blank, data)

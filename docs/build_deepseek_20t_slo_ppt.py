@@ -255,6 +255,17 @@ def gold(slide, y, h, text, size=13):
     textbox(slide, 0.58, y + 0.04, 12.18, h - 0.08, text, size, False, GOLD, anchor=MSO_ANCHOR.MIDDLE)
 
 
+def add_key(slide, x, y, w, items, size=11, row=0.20):
+    swatch = 0.13
+    for i, (color, text) in enumerate(items):
+        yy = y + i * row
+        chip = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE, Inches(x), Inches(yy + 0.035), Inches(swatch), Inches(swatch)
+        )
+        solid(chip, color)
+        textbox(slide, x + swatch + 0.06, yy, w - swatch - 0.06, row, text, size, False, INK, anchor=MSO_ANCHOR.MIDDLE)
+
+
 def add_pie(slide, cx, cy, r, slices):
     total = sum(v for v, _ in slices if v > 0.05)
     theta = 0.0
@@ -887,9 +898,16 @@ def slide_pf_hbm(prs, blank, data):
             values = (weight / 1e9, kv / 1e9, free / 1e9)
             cy = 2.28 if j == 0 else 4.62
             add_pie(slide, x0 + 1.52, cy, 0.52, list(zip(values, colors)))
-            textbox(slide, x0, cy + 0.56, 3.05, 0.22, f"{tag} · 批 {fmt_bs(bs)}", 12, True, NAVY, PP_ALIGN.CENTER)
-            legend = "\n".join(f"{name}  {val:.0f} GB" for name, val in zip(names, values))
-            textbox(slide, x0 + 0.20, cy + 0.78, 2.70, 0.70, legend, 11, False, INK, PP_ALIGN.CENTER, MSO_ANCHOR.TOP)
+            textbox(slide, x0, cy + 0.56, 3.05, 0.20, f"{tag} · 批 {fmt_bs(bs)}", 12, True, NAVY, PP_ALIGN.CENTER)
+            add_key(
+                slide,
+                x0 + 0.48,
+                cy + 0.78,
+                2.45,
+                [(color, f"{name}  {val:.0f} GB") for color, name, val in zip(colors, names, values)],
+                size=11,
+                row=0.19,
+            )
             notes.append(f"{fmt_len(s)} {tag} w={values[0]:.1f} kv={values[1]:.1f} free={values[2]:.1f}")
     r64 = by_len(data, 65536)
     _, _, kv64, free64 = _hbm_cells(PF_N, r64["b24"], 65536)
@@ -1077,9 +1095,16 @@ def slide_pies(prs, blank, data):
         mem = row["m30"]
         values = (mem["weight"], mem["hbm"], mem["free"], mem["ddr"])
         add_pie(slide, x0 + 0.70, 4.55, 0.62, list(zip(values, colors)))
-        textbox(slide, x0, 5.28, 3.05, 0.24, f"{fmt_len(row['S'])} · 30 毫秒 · 批 {fmt_bs(row['p30'])}", 12, True, NAVY, PP_ALIGN.CENTER)
-        legend = "\n".join(f"{name}  {val:.0f} GB" for name, val in zip(labels, values))
-        textbox(slide, x0 + 0.15, 5.52, 2.90, 1.05, legend, 12, False, INK, anchor=MSO_ANCHOR.TOP)
+        textbox(slide, x0, 5.22, 3.05, 0.22, f"{fmt_len(row['S'])} · 30 毫秒 · 批 {fmt_bs(row['p30'])}", 12, True, NAVY, PP_ALIGN.CENTER)
+        add_key(
+            slide,
+            x0 + 0.28,
+            5.46,
+            2.70,
+            [(color, f"{name}  {val:.0f} GB") for color, name, val in zip(colors, labels, values)],
+            size=11,
+            row=0.20,
+        )
     gold(
         slide,
         6.62,

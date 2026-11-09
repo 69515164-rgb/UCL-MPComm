@@ -868,44 +868,41 @@ def _hbm_cells(ngpu, bs, s):
 
 def slide_pf_hbm(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    chrome(slide, 9, "24 卡把专家权重放进 HBM", "N+2    ·    每卡 HBM    ·    10 秒摸高批    ·    256 卡对照 24 卡")
-    banner(slide, 0.92, "同一条 10 秒批上，每卡实际 KV 几乎一样。24 卡的差别是路由权重大，KV 空闲被压到 64K 的边上。")
-    r64, r4 = by_len(data, 65536), by_len(data, 4194304)
-    room256, cluster256, kv64_256, free64_256 = _hbm_cells(N, r64["b25"], 65536)
-    _, _, kv4_256, free4_256 = _hbm_cells(N, r4["b25"], 4194304)
-    room24, cluster24, kv64_24, free64_24 = _hbm_cells(PF_N, r64["b24"], 65536)
-    _, _, kv4_24, free4_24 = _hbm_cells(PF_N, r4["b24"], 4194304)
-    head = ["项目", "256 卡", "24 卡"]
-    body = [
-        ["路由专家", f"{ROUTED/N/1e9:.1f} GB", f"{ROUTED/PF_N/1e9:.1f} GB"],
-        ["共享专家", f"{SHARED/1e9:.2f} GB", f"{SHARED/1e9:.2f} GB"],
-        ["注意力", f"{ATTN/TP/1e9:.2f} GB", f"{ATTN/TP/1e9:.2f} GB"],
-        ["预留", "6 GB", "6 GB"],
-        ["KV 房间", f"{room256/1e9:.1f} GB", f"{room24/1e9:.1f} GB"],
-        ["64K 实际 KV", f"{kv64_256/1e9:.1f} GB", f"{kv64_24/1e9:.1f} GB"],
-        ["64K 空闲", f"{free64_256/1e9:.1f} GB", f"{free64_24/1e9:.1f} GB"],
-        ["4M 实际 KV", f"{kv4_256/1e9:.1f} GB", f"{kv4_24/1e9:.1f} GB"],
-        ["4M 空闲", f"{free4_256/1e9:.1f} GB", f"{free4_24/1e9:.1f} GB"],
-        ["副本 KV 房间", f"{cluster256/1e12:.1f} TB", f"{cluster24/1e12:.2f} TB"],
-    ]
-    kinds = ["head"] + ["key" if i in (4, 6, 8) else "body" for i in range(len(body))]
-    add_table(slide, 0.42, 1.42, [3.30, 4.60, 4.60], [head] + body, [0.30] + [0.34] * len(body), kinds, size=13)
-    cap64 = int(cluster24 // store_seq(65536))
+    chrome(slide, 9, "四档输入看 24 卡和 256 卡的 HBM", "N+2    ·    每卡    ·    10 秒摸高批    ·    上排 256 卡，下排 24 卡")
+    banner(slide, 0.92, "三块是权重加预留、HBM 里的 KV、HBM 空闲。同一输入上两边的 KV 接近，24 卡的权重块更大。")
+    lengths = (65536, 262144, 1048576, 4194304)
+    colors = (NAVY, TEAL, "D5DDE6")
+    names = ("权重+预留", "HBM KV", "空闲")
+    notes = []
+    for i, s in enumerate(lengths):
+        row = by_len(data, s)
+        x0 = 0.42 + i * 3.22
+        textbox(slide, x0, 1.40, 3.05, 0.26, fmt_len(s), 16, True, NAVY, PP_ALIGN.CENTER)
+        for j, (ngpu, bs, tag) in enumerate((
+            (N, row["b25"], "256 卡"),
+            (PF_N, row["b24"], "24 卡"),
+        )):
+            _, _, kv, free = _hbm_cells(ngpu, bs, s)
+            weight = ROUTED / ngpu + SHARED + ATTN / TP + RESERVE
+            values = (weight / 1e9, kv / 1e9, free / 1e9)
+            cy = 2.28 if j == 0 else 4.62
+            add_pie(slide, x0 + 1.52, cy, 0.52, list(zip(values, colors)))
+            textbox(slide, x0, cy + 0.56, 3.05, 0.22, f"{tag} · 批 {fmt_bs(bs)}", 12, True, NAVY, PP_ALIGN.CENTER)
+            legend = "\n".join(f"{name}  {val:.0f} GB" for name, val in zip(names, values))
+            textbox(slide, x0 + 0.20, cy + 0.78, 2.70, 0.70, legend, 11, False, INK, PP_ALIGN.CENTER, MSO_ANCHOR.TOP)
+            notes.append(f"{fmt_len(s)} {tag} w={values[0]:.1f} kv={values[1]:.1f} free={values[2]:.1f}")
+    r64 = by_len(data, 65536)
+    _, _, kv64, free64 = _hbm_cells(PF_N, r64["b24"], 65536)
     b16, _ = search_prefill(4194304, PREFIX_25, ngpu=16, mem=True)
     gold(
         slide,
-        5.28,
-        1.72,
-        "切分调整的理由：拉 KV 占 64K TTFT 的约 71%，带宽是每卡 25 GB/s。EP 从 24 加到 256，每卡 token/s 不变，系统 TPS 只按卡数放大。\n"
-        f"16 卡每卡 KV 房间 {room_bytes(16)[0]/1e9:.1f} GB，一条 4M 序列 {store_seq(4194304)/1e9:.1f} GB。摸高批被显存卡在 {b16}，每卡吞吐掉下来。\n"
-        f"24 卡是 8 卡对齐下的最小时间受限副本。64K 显存上限 {fmt_bs(cap64)} 条，时间批 {fmt_bs(r64['b24'])} 条，空闲 {free64_24/1e9:.0f} GB。\n"
-        f"Decode 保持 256 卡。64K、30 毫秒存量 {r64['d30']['store']/1e12:.0f} TB，256 卡房间 {cluster256/1e12:.0f} TB 几乎被用满。",
+        6.18,
+        0.90,
+        f"切分理由：拉 KV 是每卡 25 GB/s，EP 从 24 加到 256 不提高每卡 token/s。64K 两边 KV 都约 {kv64/1e9:.0f} GB，24 卡空闲只剩 {free64/1e9:.0f} GB。\n"
+        f"16 卡 KV 房间 {room_bytes(16)[0]/1e9:.1f} GB，4M 摸高批被显存卡在 {b16}。Decode 仍用 256 卡，64K、30 毫秒要吃满约 151 TB 的房间。",
         13,
     )
-    slide.notes_slide.notes_text_frame.text = (
-        f"kv64_24={kv64_24:.3e} free64_24={free64_24:.3e} kv4_24={kv4_24:.3e} free4_24={free4_24:.3e} "
-        f"kv64_256={kv64_256:.3e} free64_256={free64_256:.3e}"
-    )
+    slide.notes_slide.notes_text_frame.text = " ".join(notes)
 
 
 def slide_decode(prs, blank, data):

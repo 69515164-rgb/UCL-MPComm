@@ -3,8 +3,9 @@
 
 Hit rate is 99.95%. Tensor peak is 486T x 70% only; the 108T incremental
 core is not included. Prefix pull is compared at 25% and 100% of the
-physical 50 GB/s parameter-plane rate. Both rates share one HBM-limited
-batch, because the KV resident set fills the card before TTFT reaches 10 s.
+physical 50 GB/s parameter-plane rate. Each rate takes its own maximum
+batch with TTFT <= 10 s. There is no DDR pool, so the KV footprint of
+that batch is reported against the 44.69 GB left on each GPU.
 """
 
 from __future__ import annotations
@@ -150,8 +151,7 @@ def prefill(bs, s, prefix):
 
 def search_prefill(s, prefix, limit=10.0):
     def ok(bs):
-        row = prefill(bs, s, prefix)
-        return row["t"] <= limit + 1e-9 and row["kv"] <= ROOM_GPU + 1.0
+        return prefill(bs, s, prefix)["t"] <= limit + 1e-9
 
     if not ok(1):
         return 0, prefill(1, s, prefix)
@@ -309,7 +309,7 @@ def slide_model(prs, blank):
 def slide_cluster(prs, blank, rows):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 2, "128 卡切分两种带宽相同", "A5    ·    集群与并行    ·    去掉 108T    ·    无 DDR 池")
-    ui.banner(slide, 0.92, "一份 128 卡副本。Attention TP=8、DP=16，MoE EP=128。只改拉 KV，25% 为 12.5 GB/s，100% 为 50 GB/s。")
+    ui.banner(slide, 0.92, "一份 128 卡副本。Attention TP=8、DP=16，MoE EP=128。只改拉 KV。批量各自摸到 TTFT ≤ 10 秒。")
     head = ["项目", "两种带宽都用这一套"]
     body = [
         ["副本", "128 卡超节点，每机 8 卡。一条请求不跨副本"],
@@ -323,7 +323,7 @@ def slide_cluster(prs, blank, rows):
     ]
     kinds = ["head"] + ["key" if i == 3 else "body" for i in range(8)]
     ui.add_table(slide, 0.42, 1.46, [2.45, 10.1], [head] + body, [0.30] + [0.32] * 8, kinds, size=13)
-    head2 = ["输入", "全局批", "每卡批", "25% TTFT", "100% TTFT", "每卡 KV"]
+    head2 = ["输入", "25% 批", "25% TTFT", "25% KV/卡", "100% 批", "100% TTFT", "100% KV/卡"]
     body2, kinds2 = [], ["head"]
     for row in rows:
         kinds2.append("body")
@@ -331,13 +331,14 @@ def slide_cluster(prs, blank, rows):
         body2.append([
             fmt_len(row["S"]),
             fmt_bs(row["25"]["bs"]),
-            f"{row['25']['bs'] / N:.2f}",
             dur(d25["t"]),
+            f"{d25['kv'] / 1e9:.1f} GB",
+            fmt_bs(row["100"]["bs"]),
             dur(d100["t"]),
-            f"{d25['kv'] / 1e9:.2f} GB",
+            f"{d100['kv'] / 1e9:.1f} GB",
         ])
-    ui.add_table(slide, 0.42, 4.55, [1.4, 1.8, 1.7, 2.3, 2.5, 2.3], [head2] + body2, [0.30] + [0.30] * 4, kinds2, size=13)
-    ui.gold(slide, 6.15, 0.90, "无 DDR 池，KV 只放 HBM。每卡扣掉权重和 6 GB 预留后剩 44.69 GB。四档都是这 44.69 GB 先满，10 秒预算没有用完。\n所以两种带宽是同一批。100% 只把拉 KV 的秒数变成 25% 的四分之一。", 13)
+    ui.add_table(slide, 0.42, 4.55, [1.15, 1.55, 1.70, 1.85, 1.70, 1.85, 2.15], [head2] + body2, [0.30] + [0.30] * 4, kinds2, size=12)
+    ui.gold(slide, 6.15, 0.90, "摸高只看 TTFT ≤ 10 秒。无 DDR 池时，每卡扣掉权重和 6 GB 预留后只剩 44.69 GB。上表每卡 KV 都超过这 44.69 GB，这批在 HBM 里放不下。", 13)
 
 
 def slide_formula(prs, blank):
@@ -389,8 +390,8 @@ def panel(slide, x, y, w, title, detail):
 
 def slide_pies(prs, blank, rows, page, title, lengths):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, page, title, "同一批    ·    左 25%    ·    右 100%    ·    颜色表示同一阶段")
-    ui.banner(slide, 0.90, "扇区加总等于该带宽自己的 TTFT。批量相同，100% 的拉 KV 秒数是 25% 的四分之一。")
+    ui.chrome(slide, page, title, "TTFT ≤ 10 秒摸高    ·    左 25%    ·    右 100%    ·    颜色表示同一阶段")
+    ui.banner(slide, 0.90, "各自摸到 TTFT ≤ 10 秒。扇区加总等于该带宽自己的 TTFT。100% 的批更大，AllReduce 和 MoE 的秒数跟着变长。")
     by = {row["S"]: row for row in rows}
     slots = ((0.32, 1.40), (6.78, 1.40), (0.32, 4.22), (6.78, 4.22))
     pairs = []
@@ -411,7 +412,7 @@ def write_md(rows):
         "",
         "10T Prefill / Decode 仿真口径。Prefill 固定 128 卡超节点，去掉 108T 增量核，其余沿用已保存的 96 GB / 486T 集群和 TP=8、DP=16、EP=128。无 DDR 池。KV 命中率 99.95%。",
         "",
-        "两种拉 KV 带宽是参数面物理 50 GB/s 的 25% 和 100%，每卡 12.5 GB/s 和 50 GB/s，不另乘 80%。P→D 仍是每卡 40 GB/s。",
+        "两种拉 KV 带宽是参数面物理 50 GB/s 的 25% 和 100%，每卡 12.5 GB/s 和 50 GB/s，不另乘 80%。P→D 仍是每卡 40 GB/s。Prefill 的全局批按 TTFT ≤ 10 秒各自摸高。无 DDR 池时每卡只剩 44.69 GB 放 KV，这些摸高批都超过这个容量。",
         "",
         "## 1. 模型",
         "",
@@ -509,25 +510,25 @@ def write_md(rows):
         "",
         "## 5. Prefill 批量",
         "",
-        "TTFT 上限 10 秒，同时每卡 KV 不超过 44.69 GB。四档都是容量先满，两种带宽因此是同一批。TTFT 都低于 10 秒。",
+        "每种带宽各自把全局批摸到 TTFT ≤ 10 秒，搜索不再用 HBM 容量截断。无 DDR 池时每卡只剩 44.69 GB 放 KV，下表的每卡 KV 都超过这个数，这批在卡上放不下。",
         "",
-        "| 输入 | 全局批 | 每卡批 | 25% TTFT | 100% TTFT | 每卡 KV |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| 输入 | 25% 批 | 25% 每卡 | 25% TTFT | 25% KV/卡 | 100% 批 | 100% 每卡 | 100% TTFT | 100% KV/卡 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         d25, d100 = row["25"]["row"], row["100"]["row"]
         lines.append(
-            f"| {fmt_len(row['S'])} | {row['25']['bs']} | {row['25']['bs'] / N:.2f} | {d25['t']:.3f} 秒 | {d100['t']:.3f} 秒 | {d25['kv'] / 1e9:.2f} GB |"
+            f"| {fmt_len(row['S'])} | {row['25']['bs']} | {row['25']['bs'] / N:.2f} | {d25['t']:.3f} 秒 | {d25['kv'] / 1e9:.1f} GB | {row['100']['bs']} | {row['100']['bs'] / N:.2f} | {d100['t']:.3f} 秒 | {d100['kv'] / 1e9:.1f} GB |"
         )
     lines += [
         "",
         "## 6. 各段占 TTFT",
         "",
-        "百分比按最大余数修到一位小数，九段相加为 100%。秒数是该段自己的耗时。",
+        "百分比按最大余数修到一位小数，九段相加为 100%。秒数是该段在各自 10 秒摸高批上的耗时。",
         "",
     ]
     for row in rows:
-        lines.append(f"### {fmt_len(row['S'])}，全局批 {row['25']['bs']}")
+        lines.append(f"### {fmt_len(row['S'])}，25% 批 {row['25']['bs']}，100% 批 {row['100']['bs']}")
         lines.append("")
         lines.append("| 阶段 | 25% 耗时 | 25% 占比 | 100% 耗时 | 100% 占比 |")
         lines.append("| --- | ---: | ---: | ---: | ---: |")
@@ -581,10 +582,6 @@ def audit(prs):
 
 def main():
     rows = collect()
-    # 25% and 100% must share the HBM-limited batch.
-    for row in rows:
-        if row["25"]["bs"] != row["100"]["bs"]:
-            raise SystemExit(f"batch diverged at {row['S']}: {row['25']['bs']} vs {row['100']['bs']}")
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -593,8 +590,8 @@ def main():
     slide_model(prs, blank)
     slide_cluster(prs, blank, rows)
     slide_formula(prs, blank)
-    slide_pies(prs, blank, rows, 4, "128K 和 256K：拉 KV 仍是最大一块", (131072, 262144))
-    slide_pies(prs, blank, rows, 5, "512K 和 1M：计算占比随长度上升", (524288, 1048576))
+    slide_pies(prs, blank, rows, 4, "10 秒摸高：128K 和 256K 拉 KV 仍是最大一块", (131072, 262144))
+    slide_pies(prs, blank, rows, 5, "10 秒摸高：512K 和 1M 计算占比上升", (524288, 1048576))
     prs.save(PPT)
     write_md(rows)
     bad = audit(prs)

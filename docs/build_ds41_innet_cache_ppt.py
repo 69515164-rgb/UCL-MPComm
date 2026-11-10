@@ -93,7 +93,7 @@ def slide_csa2_map(prs, blank):
     layer_row(
         slide, 1.70,
         [
-            (SOFT, NAVY, "层 1\nReuse"),
+            ("E7EEF6", "145A96", "层 1\n滑窗"),
             (TEAL, WHITE, "层 2\nFull"),
             (SOFT, NAVY, "层 3–7\nReuse"),
             (TEAL, WHITE, "层 8\nFull"),
@@ -117,7 +117,7 @@ def slide_csa2_map(prs, blank):
             (HOST, WHITE, "层 36\nReindex"),
         ],
     )
-    ui.textbox(slide, 0.36, 3.48, 12.4, 0.24, "层 37–40 仍是 Reuse。Reuse 不再挑块，沿用上一层已经选出的 512。", 12, False, MUTED)
+    ui.textbox(slide, 0.36, 3.46, 12.5, 0.28, "层 1 只有 128 滑窗，不继承块。层 3–7 沿用层 2。层 37–40 沿用层 36 选出的 512。", 12, False, MUTED)
     flow = [
         (SOFT, NAVY, INK, "全文", "每个 token\n890 字节\n冷数据"),
         (TEAL, WHITE, WHITE, "4 个 Full", "压缩比 2\n从全文里\n选出块"),

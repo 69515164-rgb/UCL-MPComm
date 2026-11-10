@@ -25,9 +25,8 @@ N = 256
 TP = 1
 DP = 256
 EP = 256
-# Prefill replica: smallest 8-GPU-aligned size whose baseline per-card
-# batch still fits. Per-card batch stops rising once N >= 24 and TP = 1.
-PF_N = 56
+# Prefill replica is 8 nodes. Per-card batch is flat in N for TP = 1.
+PF_N = 64
 PF_TP = 1
 PF_DP = PF_N // PF_TP
 PF_EP = PF_N
@@ -63,8 +62,8 @@ HIT = 0.995
 LENGTHS = (65536, 131072, 262144, 524288, 1048576, 2097152, 4194304)
 PIE_LENGTHS = (65536, 262144, 1048576, 4194304)
 
-SLIDES = 9
-FOOTER = "N+2    ·    20T    ·    Prefill 56 卡 TP=1    ·    Decode DP=256 EP=256    ·    参数面 1.6 Tb/s    ·    无 fullmesh"
+SLIDES = 10
+FOOTER = "N+2    ·    20T    ·    Prefill 64 卡 TP=1    ·    Decode DP=256 EP=256    ·    参数面 1.6 Tb/s    ·    无 fullmesh"
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
 NAVY, TEAL, INK = ui.NAVY, ui.TEAL, ui.INK
@@ -217,7 +216,12 @@ def collect():
             bs, row = search(10.0, lambda b, bw=bw: prefill(b, s, bw))
             item[key] = {"bs": bs, "row": row}
         for limit, tag in ((0.010, "10"), (0.030, "30")):
-            for key, bw, cap in (("h2d", HOST, DDR_CAP), ("p51", POOL_51, None), ("p26", POOL_26, None)):
+            for key, bw, cap in (
+                ("hbm", HOST, 0.0),
+                ("h2d", HOST, DDR_CAP),
+                ("p51", POOL_51, None),
+                ("p26", POOL_26, None),
+            ):
                 bs, row = search(limit, lambda b, bw=bw, cap=cap: decode(b, s, bw, cap))
                 item[f"{key}{tag}"] = bs
                 item[f"d{key}{tag}"] = row
@@ -267,6 +271,10 @@ def ms(v):
     return f"{v * 1e3:.1f} 毫秒"
 
 
+def tpot_ms(v):
+    return f"{v * 1e3:.2f} 毫秒"
+
+
 def gb(n):
     if n >= 1e12:
         return f"{n / 1e12:.2f} TB"
@@ -306,7 +314,7 @@ def add_pie(slide, cx, cy, r, slices):
 
 def slide_open(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 1, "64K 到 4M 都能对上两组目标", "Prefill 56 卡    ·    基线拉 KV 50 GB/s    ·    Decode 256 卡走 H2D")
+    ui.chrome(slide, 1, "64K 到 4M 都能对上两组目标", "Prefill 64 卡    ·    基线拉 KV 50 GB/s    ·    Decode 256 卡走 H2D")
     ui.banner(slide, 0.92, "一组目标是 TTFT ≤ 10 秒且 TPOT ≤ 10 毫秒。另一组把 TPOT 放宽到 30 毫秒。Prefill 的批是 10 秒摸高。")
     r64, r4 = data["rows"][0], data["rows"][-1]
     head = ["约束", "64K 全局批", "64K 系统 TPS", "4M 全局批", "4M 系统 TPS", "4M 实际耗时"]
@@ -355,14 +363,14 @@ def slide_model(prs, blank):
     )
 
 
-def slide_split(prs, blank):
+def slide_split(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 3, "Prefill 用 56 卡，Decode 用满 256 卡", "两边都是 TP=1    ·    每卡批摸高不再随卡数上升")
+    ui.chrome(slide, 3, "Prefill 用 64 卡，Decode 用满 256 卡", "两边都是 TP=1    ·    每卡批摸高不再随卡数上升")
     ui.banner(slide, 0.92, "机内 fullmesh 取消。TP 大于 1 就要在 D2D 上做 AllReduce，每卡批不增加，所以两边都取 TP=1。")
     head = ["", "Prefill", "Decode"]
     body = [
-        ["规模", "56 卡，7 个 8 卡节点", "256 卡，整份超节点"],
-        ["切分", "TP=1，DP=56，EP=56", "TP=1，DP=256，EP=256"],
+        ["规模", "64 卡，8 个 8 卡节点", "256 卡，整份超节点"],
+        ["切分", "TP=1，DP=64，EP=64", "TP=1，DP=256，EP=256"],
         ["每卡路由专家", f"{ROUTED/PF_EP/1e9:.1f} GB，{E/PF_EP:.1f} 个", f"{ROUTED/EP/1e9:.1f} GB，{E/EP:.1f} 个"],
         ["每卡注意力", "19.35 GB，不再按 TP 切开", "19.35 GB，同样不切开"],
         ["KV 房间", f"{PF_ROOM/1e9:.1f} GB", f"{ROOM_GPU/1e9:.1f} GB"],
@@ -370,12 +378,14 @@ def slide_split(prs, blank):
     ]
     kinds = ["head"] + ["key" if i in (0, 1) else "body" for i in range(6)]
     ui.add_table(slide, 0.42, 1.48, [2.20, 5.15, 5.15], [head] + body, [0.34] + [0.48] * 6, kinds, size=14)
+    n64 = data["rows"][0]["p25"]["row"]["n"]
+    kv64 = data["rows"][0]["p25"]["row"]["kv"] / 1e9
     ui.gold(
         slide,
         5.00,
         1.85,
-        "Prefill 的每卡批在 TP=1、卡数从 24 加到 256 时停在同一档：64K 是每卡 1,232 条。多出来的卡只把系统 TPS 按卡数放大。\n"
-        "24 卡的房间只有 195 GB，64K 基线的每卡 KV 有 404 GB，放不下。56 卡房间 432 GB，是 8 卡对齐里基线七档都放得下的最小规模。\n"
+        f"Prefill 固定 64 卡。TP=1 时每卡批不随卡数上升，64K 基线是每卡 {fmt_bs(n64)} 条，每卡 KV {kv64:.0f} GB。\n"
+        f"24 卡房间只有 195 GB，这条 KV 放不下。64 卡房间 {PF_ROOM/1e9:.0f} GB，基线七档都放得下。多出来的卡只放大系统 TPS。\n"
         "Decode 要摊 9.975 TB 的专家表。EP 降到 16 时单是路由专家就有 623 GB，KV 没有地方放，所以 Decode 维持 EP=256。",
         14,
     )
@@ -384,34 +394,46 @@ def slide_split(prs, blank):
 def slide_formula(prs, blank):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 4, "TTFT 与 TPOT", "没有 AllReduce    ·    n 是一张卡上的条数")
-    ui.banner(slide, 0.92, "Prefill 的 n = ceil(全局批 / 56)。Decode 的 n = ceil(全局批 / 256)。注意力由这一张卡承担。")
-    left = (
-        "Prefill，56 卡，命中 99.5%\n"
-        "p = 0.995S，q = 0.005S\n"
-        "T_pull = n×(p×4939.5 + 61×min(p,128)×576) / BW\n"
-        "BW = 50 GB/s 或 200 GB/s\n"
-        "T_compute = n×F / (33.60 P × align(n×q))\n"
-        "T_HBM = (19.35 GB + n×(K(S)+q×4939.5)) / 26.40 TB/s\n"
-        "T_MoE = T_dispatch + max(T_weight, T_gemm) + T_combine\n"
-        "T_tail = max(0, n×K(S)/160 GB/s − 主体×60/61)\n"
-        "TTFT = T_pull + max(T_HBM, T_compute) + T_MoE + T_tail"
+    ui.banner(slide, 0.92, "Prefill 的 n = ceil(全局批 / 64)。Decode 的 n = ceil(全局批 / 256)。注意力由这一张卡承担。")
+    panels = (
+        (
+            0.36,
+            "TTFT    ·    Prefill 64 卡",
+            [
+                ["n", "ceil(全局批 / 64)"],
+                ["命中", "p = 0.995 S，q = 0.005 S"],
+                ["拉 KV", "n × (p×4939.5 + 61×min(p,128)×576) / BW"],
+                ["带宽", "基线 50 GB/s，NEW 200 GB/s"],
+                ["计算", "n × F / (33.60 P × align(n×q))"],
+                ["HBM", "(19.35 GB + n×(K(S) + q×4939.5)) / 26.40 TB/s"],
+                ["MoE", "dispatch + max(权重, GEMM) + combine"],
+                ["尾部", "max(0, n×K(S) / 160 GB/s − 主体×60/61)"],
+                ["TTFT", "拉 KV + max(HBM, 计算) + MoE + 尾部"],
+            ],
+        ),
+        (
+            6.86,
+            "TPOT    ·    Decode 256 卡",
+            [
+                ["n", "ceil(全局批 / 256)"],
+                ["溢出", "f = max(n×K(S) − 571.65 GB, 0) / (n×K(S))"],
+                ["读出", "30×(S/4)×64 + 31×(S/128)×576\n+ 30×min(1024, S/4)×576 + 滑窗"],
+                ["换入", "f × n × Read / BW"],
+                ["带宽", "HBM 不换入；H2D 160 GB/s\n池 6.40 TB/s 或 3.20 TB/s"],
+                ["HBM", "(n×Read + 19.35 GB) / 26.40 TB/s"],
+                ["计算", "n × (F_score + 3.87×10^10) / (33.60 P × align(n))"],
+                ["MoE", "与 Prefill 同一组 dispatch / combine"],
+                ["TPOT", "换入 + max(HBM, 计算) + MoE"],
+            ],
+        ),
     )
-    right = (
-        "Decode，256 卡\n"
-        "f = max(n×K(S) − 571.65 GB, 0) / (n×K(S))\n"
-        "Read = 30×(S/4)×64 + 31×(S/128)×576\n"
-        "      + 30×min(1024,S/4)×576 + 滑窗\n"
-        "T_swap = f × n × Read / BW\n"
-        "BW = 160 GB/s，或 6.40 / 3.20 TB/s\n"
-        "T_HBM = (n×Read + 19.35 GB) / 26.40 TB/s\n"
-        "T_compute = n×(F_score+3.87×10^10) / (33.60 P×align(n))\n"
-        "TPOT = T_swap + max(T_HBM, T_compute) + T_MoE"
-    )
-    for x, title, text in ((0.42, "TTFT", left), (6.88, "TPOT", right)):
-        box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(1.48), Inches(6.05), Inches(5.40))
-        ui.solid(box, "F4F7FA")
-        ui.textbox(slide, x + 0.16, 1.60, 5.70, 0.34, title, 18, True, NAVY, anchor=MSO_ANCHOR.TOP)
-        ui.textbox(slide, x + 0.16, 2.02, 5.70, 4.65, text, 13, False, INK, anchor=MSO_ANCHOR.TOP)
+    for x, title, rows in panels:
+        ui.textbox(slide, x, 1.46, 6.10, 0.32, title, 16, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
+        kinds = ["head"] + ["key" if i == len(rows) - 1 else "body" for i in range(len(rows))]
+        heights = [0.30]
+        for label, _text in rows:
+            heights.append(0.56 if label in ("读出", "带宽") and x > 6 else 0.46)
+        ui.add_table(slide, x, 1.82, [1.05, 5.05], [["项", "公式"]] + rows, heights, kinds, size=11)
 
 
 def stage_cell(part, total):
@@ -420,20 +442,31 @@ def stage_cell(part, total):
 
 def slide_cmp(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 5, "基线对 NEW：都按 10 秒摸高", "56 卡 Prefill    ·    基线 50 GB/s    ·    NEW 200 GB/s")
-    ui.banner(slide, 0.90, "批只受 TTFT ≤ 10 秒约束。尾部是 0。NEW 的 64K 到 2M，每卡 KV 是 466 到 1020 GB，超过 432 GB 房间。", size=12)
-    head = ["输入", "方案", "每卡批", "系统 TPS", "TTFT", "拉 KV", "计算", "HBM", "MoE"]
+    ui.chrome(slide, 5, "基线对 NEW：都按 10 秒摸高", "64 卡 Prefill    ·    基线 50 GB/s    ·    NEW 200 GB/s")
+    over = [row for row in data["rows"] if row["p100"]["row"]["kv"] > PF_ROOM + 1]
+    if over:
+        lo = min(row["p100"]["row"]["kv"] for row in over) / 1e9
+        hi = max(row["p100"]["row"]["kv"] for row in over) / 1e9
+        span = f"{fmt_len(over[0]['S'])} 到 {fmt_len(over[-1]['S'])}"
+        note = f"NEW 的 {span} 每卡 KV {lo:.0f}–{hi:.0f} GB，超过 {PF_ROOM/1e9:.0f} GB 房间。"
+    else:
+        note = f"NEW 七档都放进 {PF_ROOM/1e9:.0f} GB 房间。"
+    ui.banner(slide, 0.90, f"批只受 TTFT ≤ 10 秒约束。尾部是 0。提升是 NEW 的系统 TPS 相对基线。{note}", size=12)
+    head = ["输入", "方案", "每卡批", "系统 TPS", "提升", "TTFT", "拉 KV", "计算", "HBM", "MoE"]
     body, kinds = [], ["head"]
     for row in data["rows"]:
+        base = tps_p(row["p25"]["bs"], row["S"], row["p25"]["row"])
         for key, name in (("p25", "基线"), ("p100", "NEW")):
             item = row[key]
             r = item["row"]
+            rate = tps_p(item["bs"], row["S"], r)
             kinds.append("key" if name == "NEW" else "body")
             body.append([
                 fmt_len(row["S"]),
                 name,
                 fmt_bs(r["n"]),
-                fmt_rate(tps_p(item["bs"], row["S"], r)),
+                fmt_rate(rate),
+                "—" if name == "基线" else signed_pct(rate, base),
                 sec(r["t"]),
                 stage_cell(r["pull"], r["t"]),
                 stage_cell(r["compute"], r["t"]),
@@ -442,11 +475,11 @@ def slide_cmp(prs, blank, data):
             ])
     ui.add_table(
         slide, 0.28, 1.42,
-        [0.85, 0.75, 0.95, 1.25, 0.95, 1.85, 1.75, 1.70, 1.70],
+        [0.72, 0.68, 0.78, 1.12, 0.88, 0.86, 1.78, 1.68, 1.48, 1.62],
         [head] + body,
         [0.32] + [0.36] * len(body),
         kinds,
-        size=11,
+        size=10,
     )
 
 
@@ -473,34 +506,34 @@ def slide_decode(prs, blank, data):
     ui.add_table(slide, 0.32, 1.42, [1.05, 1.25, 1.45, 1.35, 1.25, 1.25, 1.25, 1.45], [head] + body, [0.28] + [0.32] * len(body), kinds, size=11)
 
 
-def slide_case2(prs, blank, data):
+def pair_cell(bs, row):
+    return f"{fmt_bs(bs)}\n{tpot_ms(row['t'])}"
+
+
+def slide_tpot(prs, blank, data, page, tag, title, kicker, note):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 7, "DDR 池把 30 毫秒的长上下文抬上去", "Case 2    ·    51.2 Tb/s = 6.40 TB/s    ·    25.6 Tb/s = 3.20 TB/s")
-    ui.banner(slide, 0.90, "51.2 Tb/s 是 D2D 57.6 Tb/s 的 88.8%，不再另乘 80%。池容量不限。提升以 H2D 160 GB/s、每卡 96 GB 为基线。")
-    head = ["输入", "H2D·10ms", "51.2·10ms", "25.6·10ms", "H2D·30ms", "51.2·30ms", "25.6·30ms"]
+    ui.chrome(slide, page, title, kicker)
+    ui.banner(slide, 0.90, "每格上面是全局批，下面是这一批的实际 TPOT。HBM 不卸载。H2D 是 160 GB/s，每卡主机最多 96 GB。")
+    head = ["输入", "HBM", "H2D 卸载", "51.2 Tb/s", "25.6 Tb/s"]
     body, kinds = [], ["head"]
     for row in data["rows"]:
         kinds.append("key" if row["S"] in (65536, 4194304) else "body")
         body.append([
             fmt_len(row["S"]),
-            fmt_rate(tps_d(row["h2d10"], row["dh2d10"])),
-            fmt_rate(tps_d(row["p5110"], row["dp5110"])) + "\n" + signed_pct(tps_d(row["p5110"], row["dp5110"]), tps_d(row["h2d10"], row["dh2d10"])),
-            fmt_rate(tps_d(row["p2610"], row["dp2610"])) + "\n" + signed_pct(tps_d(row["p2610"], row["dp2610"]), tps_d(row["h2d10"], row["dh2d10"])),
-            fmt_rate(tps_d(row["h2d30"], row["dh2d30"])),
-            fmt_rate(tps_d(row["p5130"], row["dp5130"])) + "\n" + signed_pct(tps_d(row["p5130"], row["dp5130"]), tps_d(row["h2d30"], row["dh2d30"])),
-            fmt_rate(tps_d(row["p2630"], row["dp2630"])) + "\n" + signed_pct(tps_d(row["p2630"], row["dp2630"]), tps_d(row["h2d30"], row["dh2d30"])),
+            pair_cell(row[f"hbm{tag}"], row[f"dhbm{tag}"]),
+            pair_cell(row[f"h2d{tag}"], row[f"dh2d{tag}"]),
+            pair_cell(row[f"p51{tag}"], row[f"dp51{tag}"]),
+            pair_cell(row[f"p26{tag}"], row[f"dp26{tag}"]),
         ])
-    ui.add_table(slide, 0.32, 1.46, [1.15, 1.70, 1.85, 1.85, 1.70, 1.95, 1.95], [head] + body, [0.36] + [0.58] * len(body), kinds, size=11)
-    r4 = data["rows"][-1]
-    ui.gold(
-        slide,
-        5.95,
-        1.05,
-        f"2M 和 4M 的 10 毫秒，H2D 停在没溢出的批，实际只有 5.7 到 5.8 毫秒，TPS 更高。池把批加大并把 10 毫秒用满，TPS 低 22% 到 31%。\n"
-        f"30 毫秒才拉开。4M：H2D 批 {fmt_bs(r4['h2d30'])}，51.2 Tb/s 批 {fmt_bs(r4['p5130'])}（{signed_pct(tps_d(r4['p5130'], r4['dp5130']), tps_d(r4['h2d30'], r4['dh2d30']))}），"
-        f"25.6 Tb/s 批 {fmt_bs(r4['p2630'])}（{signed_pct(tps_d(r4['p2630'], r4['dp2630']), tps_d(r4['h2d30'], r4['dh2d30']))}）。",
-        13,
+    ui.add_table(
+        slide, 0.36, 1.46,
+        [1.15, 2.85, 2.85, 2.85, 2.85],
+        [head] + body,
+        [0.32] + [0.52] * len(body),
+        kinds,
+        size=13,
     )
+    ui.gold(slide, 5.55, 1.48, note, 13)
 
 
 def slide_pies(prs, blank, data, page, limit_tag, title):
@@ -551,13 +584,34 @@ def main():
     blank = prs.slide_layouts[6]
     slide_open(prs, blank, data)
     slide_model(prs, blank)
-    slide_split(prs, blank)
+    slide_split(prs, blank, data)
     slide_formula(prs, blank)
     slide_cmp(prs, blank, data)
     slide_decode(prs, blank, data)
-    slide_case2(prs, blank, data)
-    slide_pies(prs, blank, data, 8, "10", "10 毫秒：64K 全在 HBM，更长的开始溢出")
-    slide_pies(prs, blank, data, 9, "30", "30 毫秒：KV 顶满 HBM 后进 DDR 池")
+    r4 = data["rows"][-1]
+    r2 = data["rows"][-2]
+    lift = lambda row, a, b: signed_pct(tps_d(row[a], row["d" + a]), tps_d(row[b], row["d" + b]))
+    slide_tpot(
+        prs, blank, data, 7, "10",
+        "10 毫秒：HBM、H2D 和两档 DDR 池",
+        "实际 TPOT    ·    池容量不限    ·    51.2 Tb/s = 6.40 TB/s",
+        "64K 四档同批，KV 全在 HBM，TPOT 9.93 毫秒。128K 到 1M 的 HBM 先被 571.65 GB 装满，实际 TPOT 是 5.93 到 7.63 毫秒。\n"
+        "2M、4M 再加一条，H2D 换入把 TPOT 从 5.7 毫秒抬过 10 毫秒，所以 H2D 与 HBM 停在同一批。\n"
+        f"池把步时用到 9.5 到 9.9 毫秒。批的涨幅小于步时涨幅，系统 TPS 下降："
+        f"2M 的 51.2 / 25.6 是 {lift(r2, 'p5110', 'h2d10')} / {lift(r2, 'p2610', 'h2d10')}，"
+        f"4M 是 {lift(r4, 'p5110', 'h2d10')} / {lift(r4, 'p2610', 'h2d10')}。",
+    )
+    slide_tpot(
+        prs, blank, data, 8, "30",
+        "30 毫秒：HBM 被房间卡住，池把批拉开",
+        "实际 TPOT    ·    H2D 每卡主机 96 GB    ·    池容量不限",
+        "128K 及更长的 HBM 与 10 毫秒同批，实际 TPOT 5.69 到 7.63 毫秒。64K 的 HBM 加到 445,696，TPOT 10.93 毫秒。\n"
+        "H2D 的换入占 19 到 23 毫秒。1M 的 H2D 停在 25.91 毫秒，下一条是 30.14 毫秒。\n"
+        f"30 毫秒才是池的收益。4M 相对 H2D，51.2 Tb/s 的系统 TPS {lift(r4, 'p5130', 'h2d30')}，"
+        f"25.6 Tb/s {lift(r4, 'p2630', 'h2d30')}。",
+    )
+    slide_pies(prs, blank, data, 9, "10", "10 毫秒：64K 全在 HBM，更长的开始溢出")
+    slide_pies(prs, blank, data, 10, "30", "30 毫秒：KV 顶满 HBM 后进 DDR 池")
     prs.save(PPT)
     print("slides", len(prs.slides), "overflow", audit(prs))
     print("cold", data["cold_s"], "hit", data["hit_s"], "dec", data["dec10_s"], data["dec30_s"])

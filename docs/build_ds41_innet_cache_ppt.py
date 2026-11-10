@@ -21,7 +21,7 @@ v41 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(v41)
 ui = v41.ui
 
-SLIDES = 6
+SLIDES = 9
 FOOTER = "DS 4.1 在网 cache    ·    讲的是 V4.1 外扩 20T 那一版    ·    CSA2 的 2048 块"
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
@@ -64,6 +64,132 @@ def arrow_down(slide, x, y, w=0.22, h=0.26, fill=NAVY):
     return shape
 
 
+def pill(slide, x, y, w, h, fill, text, color, size=11):
+    shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    ui.solid(shape, fill)
+    try:
+        shape.adjustments[0] = 0.18
+    except Exception:
+        pass
+    ui.textbox(slide, x + 0.04, y, w - 0.08, h, text, size, True, color, PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
+    return shape
+
+
+def layer_row(slide, y, items):
+    gap = 0.16
+    width = 1.38
+    for i, (fill, color, text) in enumerate(items):
+        x = 0.36 + i * (width + gap)
+        pill(slide, x, y, width, 0.62, fill, text, color, 11)
+        if i + 1 < len(items):
+            arrow_right(slide, x + width + 0.01, y + 0.20, 0.14, 0.18, MUTED)
+
+
+def layer_kind(i):
+    if i in (0, 1):
+        return "win"
+    if i in (2, 8, 14, 20):
+        return "full"
+    if i in (24, 28, 32, 36):
+        return "reindex"
+    return "reuse"
+
+
+def slide_csa2_map(prs, blank):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 2, "40 层都有滑窗，层 0 和层 1 只有滑窗", "层号从 0 计    ·    和论文的 layer id 一致")
+    ui.banner(slide, 0.90, "滑窗是每层自己的 128 条。层 2 到层 39 在滑窗之外，再读选出的全局 KV。")
+    colors = {
+        "win": ("145A96", WHITE),
+        "full": (TEAL, WHITE),
+        "reindex": (HOST, WHITE),
+        "reuse": (SOFT, NAVY),
+    }
+    for row, start, title in ((0, 0, "编码器 · 层 0–19"), (1, 20, "解码器 · 层 20–39")):
+        y = 1.46 + row * 1.15
+        ui.textbox(slide, 0.36, y, 4.0, 0.24, title, 13, True, NAVY)
+        width, gap = 0.56, 0.055
+        for i in range(20):
+            idx = start + i
+            fill, color = colors[layer_kind(idx)]
+            pill(slide, 0.36 + i * (width + gap), y + 0.28, width, 0.42, fill, str(idx), color, 11)
+    legend = [
+        ("145A96", "0、1  只有滑窗"),
+        (TEAL, "Full  滑窗 + 自己选"),
+        (SOFT, "Reuse  滑窗 + 沿用"),
+        (HOST, "Reindex  滑窗 + 重选"),
+    ]
+    for i, (fill, text) in enumerate(legend):
+        x = 0.36 + i * 3.20
+        pill(slide, x, 3.78, 0.42, 0.28, fill, "", WHITE, 10)
+        ui.textbox(slide, x + 0.50, 3.74, 2.55, 0.36, text, 13, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
+    ui.gold(
+        slide,
+        4.28,
+        2.55,
+        "层 0、层 1 不跑 CSA2，没有上一层的块可以继承，只看本层 128 滑窗。\n"
+        "编码器压缩比 2，三组各 6 层：Full 在 2、8、14，后面各跟 5 层 Reuse。Reuse 沿用本组 Full 选出的 512。\n"
+        "解码器压缩比 1。层 20 是 Full，KV 从编码器最后一层的隐状态投影，后面 21–23 沿用它。\n"
+        "24、28、32、36 是 Reindex，只在层 20 留下的 2048 块 × 8 位置里重选 512；每组后面 3 层 Reuse 沿用这次重选。\n"
+        "滑窗 KV 每层从本层隐状态算，40 层都不共享。40 × 128 留在 GPU，不进那 5.16 MB 的全局热数据。",
+        14,
+    )
+
+
+def slide_attn(prs, blank):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 3, "4.1 的注意力：滑窗打底，CSA2 补全局", "CED 编码器 20 层 + 解码器 20 层    ·    纯 CSA2，不再混 HCA")
+    ui.banner(slide, 0.90, "一条查询在层 2–39 读两段：本层滑窗 128 条，加上选出的 512 条全局主 KV。层 0、1 只有前一段。")
+    head = ["环节", "谁来做", "读什么、留下什么"]
+    body = [
+        ["滑窗", "40 层都做", "窗口 128。KV 从本层隐状态算，不跨层共享"],
+        ["只有滑窗", "层 0、1", "没有全局分支，也不继承任何 Full 的选择"],
+        ["Full", "层 2、8、14、20", "自己产生主 KV 和 indexer K，并选出 Top-512"],
+        ["Reindex", "层 24、28、32、36", "沿用最近 Full 的主 KV，自己重打分，换一批 512"],
+        ["Reuse", "其余 30 层", "主 KV 和 Top-512 都沿用，本层只算 Q 和滑窗 KV"],
+        ["压缩", "编码器 2，解码器 1", "每 token 全局 KV = (3/2 + 1) × 356 = 890 字节"],
+        ["候选池", "只在解码器", "层 20 留 2048 块 × 8 位置。后面的 Reindex 只在这 16384 条里选"],
+    ]
+    kinds = ["head"] + ["key" if i in (0, 2, 6) else "body" for i in range(7)]
+    ui.add_table(slide, 0.36, 1.48, [1.55, 3.15, 7.85], [head] + body, [0.34] + [0.46] * 7, kinds, size=13)
+    ui.gold(
+        slide,
+        5.30,
+        1.55,
+        "×8 是一块里的位置数，不是 TP。层 20 先给自己选出 Top-512，再按块内最高分留下 2048 块，池子是 16384 条主 KV，4.72 MB。编码器还有三组 Top-512，0.44 MB。两样加起来是每步热的 5.16 MB。\n"
+        "CED 让 Prefill 只跑编码器。解码器的全局 KV 由层 20 从编码器最后一层的隐状态投影得到，滑窗仍要按层重算。",
+        14,
+    )
+
+
+def slide_placement(prs, blank):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 4, "模块位置不动，变的是哪一段离开 GPU", "上：在网 cache    ·    中：GPU    ·    下：主机    ·    左：DDR 池")
+    ui.banner(slide, 0.90, "索引和滑窗三种方案都留在 GPU。出卡的只有主 KV，或者 CSA2 每步要重读的那 5.16 MB。")
+
+    card(slide, 0.32, 1.48, 3.55, 2.05, "F3E6D4", "DDR 池", "主 KV 全量，容量不限。\n方案 3 整份存放。\n不在每步热路径上。", DDR, INK, 16, 14)
+    arrow_right(slide, 3.92, 2.30, 0.48, 0.20, DDR)
+    ui.textbox(slide, 0.32, 3.62, 3.55, 0.70, "这条箭头只把主 KV 放进池里。GPU 不每步回来读它。", 13, False, INK, anchor=MSO_ANCHOR.TOP)
+
+    box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(4.55), Inches(1.48), Inches(4.35), Inches(1.02))
+    ui.solid(box, "D5EBE3")
+    ui.textbox(slide, 4.68, 1.52, 4.10, 0.30, "在网 cache · 交换芯片 HBM", 14, True, TEAL, PP_ALIGN.CENTER)
+    ui.textbox(slide, 4.68, 1.84, 4.10, 0.55, "30×64 GB。方案 3 的 2048 块常驻。\n向下每步搬 5.16 MB，4.80 TB/s。", 13, False, INK, PP_ALIGN.CENTER)
+    arrow_down(slide, 6.60, 2.54, 0.22, 0.24, TEAL)
+
+    card(
+        slide, 4.55, 2.84, 4.35, 1.62, SOFT, "GPU HBM",
+        "索引 + 滑窗：三种都留在这。\n方案 1 的主 KV 和 2048 块也留在这。",
+        NAVY, INK, 16, 14,
+    )
+    arrow_down(slide, 6.60, 4.50, 0.22, 0.24, HOST)
+    card(slide, 4.55, 4.80, 4.35, 1.35, "F8E6D4", "HOST DDR", "方案 2：每步搬溢出比例 × 5.16 MB。\n160 GB/s，每卡 96 GB。不搬权重和索引。", HOST, INK, 16, 13)
+
+    card(slide, 9.15, 1.48, 3.78, 1.55, NAVY, "方案 1 · 不出卡", "两条向下的箭头都不走。\n卡内读，26.4 TB/s。", WHITE, WHITE, 15, 14)
+    card(slide, 9.15, 3.18, 3.78, 1.40, HOST, "方案 2 · 只搬溢出", "走下面那条箭头。\n搬的是 GPU 放不下的主 KV。", WHITE, WHITE, 15, 14)
+    card(slide, 9.15, 4.72, 3.78, 1.43, TEAL, "方案 3 · 热冷分开", "2048 块走上面的箭头。\n主 KV 走左边，放进 DDR 池。", WHITE, WHITE, 15, 14)
+
+
 def slide_question(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 1, "每步只热 5.16 MB，问题是它放哪", "把 deepseek-v41-20t-n2-slo 的分析收成三句话")
@@ -91,11 +217,11 @@ def slide_question(prs, blank, data):
 
 def slide_csa2(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 2, "CSA2：先缩成 2048 块，后面只在块里挑", "40 层    ·    编码器 20 层    ·    解码器 20 层")
+    ui.chrome(slide, 5, "CSA2：先缩成 2048 块，后面只在块里挑", "层号从 0 计    ·    Full 是 2、8、14、20")
     ui.banner(slide, 0.92, "Full 负责从全文里挑块。Reindex 不再扫全文。Reuse 连挑块都不做，沿用上一层的结果。")
     stages = [
         (SOFT, NAVY, INK, "1  全文", "每个 token 存 890 字节。\n这是冷数据。\nDecode 不整段重读。"),
-        (NAVY, WHITE, WHITE, "2  四个 Full", "层 2、8、14、20。\n压缩比 2。\n从全文里选出块。"),
+        (NAVY, WHITE, WHITE, "2  四个 Full", "层 2、8、14 压缩比 2。\n层 20 压缩比 1。\n只有这四层产生主 KV。"),
         (TEAL, WHITE, WHITE, "3  候选池", "2048 块 × 8 位置\n= 16384 条主 KV。\n一共 4.72 MB。"),
         (HOST, WHITE, WHITE, "4  四个 Reindex", "层 24、28、32、36。\n只在这 16384 条里\n再挑 512。"),
     ]
@@ -108,7 +234,7 @@ def slide_csa2(prs, blank):
         slide,
         4.28,
         2.60,
-        "其余层是 Reuse：不再扫全文，也不再挑块，沿用已经选出的 512。滑窗 40×128 条留在 GPU，不进卸载。\n"
+        "层 0、1 只有滑窗。其余 CSA2 层里，不是 Full 也不是 Reindex 的是 Reuse，沿用已经选出的 512。滑窗 40×128 留在 GPU。\n"
         "编码器还有三组 Top-512，每步再读 0.44 MB。加上候选池 4.72 MB，一步的热数据是 5.16 MB / 序列。\n"
         "在网 cache 缓存的就是这 5.16 MB，不是 4M 上下文那 3.74 GB。主 KV 可以放得很远，只要这 2048 块离 GPU 近。",
         15,
@@ -117,7 +243,7 @@ def slide_csa2(prs, blank):
 
 def slide_three(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 3, "同一份数据，三条路", "左：全放 HBM    ·    中：走 HOST DDR    ·    右：交换 HBM + DDR 池")
+    ui.chrome(slide, 6, "同一份数据，三条路", "左：全放 HBM    ·    中：走 HOST DDR    ·    右：交换 HBM + DDR 池")
     ui.banner(slide, 0.90, "箭头是 Decode 每一步的热路径。索引和滑窗三种方案都留在 GPU。")
     cols = [
         (0.36, NAVY, "全放 HBM"),
@@ -149,7 +275,7 @@ def slide_three(prs, blank):
 
 def slide_compare(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 4, "差别只在热数据走哪条带宽", "容量墙和每步带宽一起决定批量")
+    ui.chrome(slide, 7, "差别只在热数据走哪条带宽", "容量墙和每步带宽一起决定批量")
     ui.banner(slide, 0.92, "系统 TPS = 全局批 / 实际 TPOT。批量变大但步时更长时，TPS 可以下降。")
     r64 = v41.by_len(data, 65536)
     r4 = v41.by_len(data, 4194304)
@@ -176,7 +302,7 @@ def slide_compare(prs, blank, data):
 
 def slide_process(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 5, "分析就按这五步走", "数字来自 deepseek-v41-20t-n2-slo，这里不另算一套")
+    ui.chrome(slide, 8, "分析就按这五步走", "数字来自 deepseek-v41-20t-n2-slo，这里不另算一套")
     ui.banner(slide, 0.92, "前三步三种方案完全一样。从第四步起，只改 KV 放哪、每步从哪读。")
     steps = [
         ("1", "定模型", "V4.1-Flash 的 40 层、隐藏 5120、CSA2 不动。路由专家从 384 加到 14123，凑到 20T。Engram 196B 留在主机，不占 GPU。"),
@@ -196,7 +322,7 @@ def slide_process(prs, blank):
 
 def slide_takeaway(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 6, "在网 cache 只值当主 KV 已经放不下", "记住短上下文和 4M 这两头")
+    ui.chrome(slide, 9, "在网 cache 只值当主 KV 已经放不下", "记住短上下文和 4M 这两头")
     ui.banner(slide, 0.92, "缓存对象是 CSA2 的 2048 块，不是整段 KV。整段主 KV 在第三种方案里放 DDR 池。")
     r64 = v41.by_len(data, 65536)
     r4 = v41.by_len(data, 4194304)
@@ -245,6 +371,9 @@ def main():
     prs.core_properties.title = "DS 4.1在网cache"
     blank = prs.slide_layouts[6]
     slide_question(prs, blank, data)
+    slide_csa2_map(prs, blank)
+    slide_attn(prs, blank)
+    slide_placement(prs, blank)
     slide_csa2(prs, blank)
     slide_three(prs, blank)
     slide_compare(prs, blank, data)

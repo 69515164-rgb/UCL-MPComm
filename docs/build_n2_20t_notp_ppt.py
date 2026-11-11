@@ -51,6 +51,9 @@ HOST = min(1.6e12 / 8 * 0.80, 2e12 * 0.80 / 8)
 DDR_CAP = 96e9
 POOL_51 = 51.2e12 / 8
 POOL_26 = 25.6e12 / 8
+# 51.2 Tb/s pool is shared by the 256-GPU decode replica.
+POOL_51_TOTAL = 2432e9
+POOL_51_CAP = POOL_51_TOTAL / N
 COLL = 5e-6
 ROOM_GPU = HBM_CAP - ROUTED / EP - SHARED - ATTN / TP - RESERVE
 ROOM = N * ROOM_GPU
@@ -136,14 +139,17 @@ def prefill(bs, s, bw, hit=HIT):
     }
 
 
-def decode(bs, s, bw, cap):
+def decode(bs, s, bw, cap, resident=False):
     n = math.ceil(bs / DP)
     sel = min(1024.0, s / 4.0)
     score = N_CSA * 4096 * s + N_HCA * 2048 * s + N_CSA * 262144 * (sel + 128)
     kept = n * store_seq(s)
     spill = max(kept - ROOM_GPU, 0.0) / kept if kept else 0.0
     overflow = spill * kept
-    if cap is not None and overflow > cap + 1.0:
+    # 30 ms HBM column is a time estimate: reads stay on HBM, the room does not stop the batch.
+    if resident:
+        spill = 0.0
+    elif cap is not None and overflow > cap + 1.0:
         return None
     read = n * n_read(s)
     t_swap = read * spill / bw
@@ -220,13 +226,16 @@ def collect():
             bs, row = search(10.0, lambda b, bw=bw: prefill(b, s, bw))
             item[key] = {"bs": bs, "row": row}
         for limit, tag in ((0.010, "10"), (0.030, "30")):
-            for key, bw, cap in (
-                ("hbm", HOST, 0.0),
-                ("h2d", HOST, DDR_CAP),
-                ("p51", POOL_51, None),
-                ("p26", POOL_26, None),
+            for key, bw, cap, resident in (
+                ("hbm", HOST, 0.0, tag == "30"),
+                ("h2d", HOST, DDR_CAP, False),
+                ("p51", POOL_51, POOL_51_CAP, False),
+                ("p26", POOL_26, None, False),
             ):
-                bs, row = search(limit, lambda b, bw=bw, cap=cap: decode(b, s, bw, cap))
+                bs, row = search(
+                    limit,
+                    lambda b, bw=bw, cap=cap, resident=resident: decode(b, s, bw, cap, resident),
+                )
                 item[f"{key}{tag}"] = bs
                 item[f"d{key}{tag}"] = row
         rows.append(item)
@@ -423,7 +432,7 @@ def slide_formula(prs, blank):
                 ["溢出", "f = max(n×K(S) − 571.65 GB, 0) / (n×K(S))"],
                 ["读出", "30×(S/4)×64 + 31×(S/128)×576\n+ 30×min(1024, S/4)×576 + 滑窗"],
                 ["换入", "f × n × Read / BW"],
-                ["带宽", "HBM 不换入；H2D 160 GB/s\n池 6.40 TB/s 或 3.20 TB/s"],
+                ["带宽", "HBM 不换入。30 毫秒按 TPOT 摸到 30 毫秒\nH2D 160 GB/s、每卡 96 GB。51.2 总计 2432 GB\n25.6 为 3.20 TB/s，容量不限"],
                 ["HBM", "(n×Read + 19.35 GB) / 26.40 TB/s"],
                 ["计算", "n × (F_score + 3.87×10^10) / (33.60 P × align(n))"],
                 ["MoE", "与 Prefill 同一组 dispatch / combine"],
@@ -436,7 +445,12 @@ def slide_formula(prs, blank):
         kinds = ["head"] + ["key" if i == len(rows) - 1 else "body" for i in range(len(rows))]
         heights = [0.30]
         for label, _text in rows:
-            heights.append(0.56 if label in ("读出", "带宽") and x > 6 else 0.46)
+            if x > 6 and label == "带宽":
+                heights.append(0.78)
+            elif x > 6 and label == "读出":
+                heights.append(0.56)
+            else:
+                heights.append(0.46)
         ui.add_table(slide, x, 1.82, [1.05, 5.05], [["项", "公式"]] + rows, heights, kinds, size=11)
 
 
@@ -541,7 +555,7 @@ def slide_tpot(prs, blank, data, page, tag, title, kicker, note):
     ui.textbox(
         slide, 0.50, 0.94, 12.32, 0.54,
         "第一行是全局批和实际 TPOT。换=换入，H=HBM，算=计算，派=派发，权=权重，G=GEMM，合=合并，单位毫秒。\n"
-        "TPOT = 换入 + max(H, 算) + 派 + max(权, G) + 合。HBM 不卸载。H2D 160 GB/s，每卡主机最多 96 GB。",
+        "TPOT = 换入 + max(H, 算) + 派 + max(权, G) + 合。H2D 每卡 96 GB。51.2 池总计 2432 GB。25.6 容量不限。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
     head = ["输入", "HBM", "H2D 卸载", "51.2 Tb/s", "25.6 Tb/s"]
@@ -629,24 +643,22 @@ def main():
     slide_tpot(
         prs, blank, data, 7, "10",
         "10 毫秒：HBM、H2D 和两档 DDR 池",
-        "实际 TPOT    ·    池容量不限    ·    51.2 Tb/s = 6.40 TB/s",
-        "64K 四档同批，KV 全在 HBM，TPOT 9.93 毫秒。128K 到 1M 的 HBM 先被 571.65 GB 装满，实际 TPOT 是 5.93 到 7.63 毫秒。\n"
-        "2M、4M 再加一条，H2D 换入把 TPOT 从 5.7 毫秒抬过 10 毫秒，所以 H2D 与 HBM 停在同一批。\n"
-        f"池把步时用到 9.5 到 9.9 毫秒。批的涨幅小于步时涨幅，系统 TPS 下降："
-        f"2M 的 51.2 / 25.6 是 {lift(r2, 'p5110', 'h2d10')} / {lift(r2, 'p2610', 'h2d10')}，"
+        "实际 TPOT    ·    51.2 总计 2432 GB    ·    25.6 容量不限",
+        "64K 四档同批，KV 还在 571.65 GB 里，TPOT 9.93 毫秒。128K 到 4M 的 HBM 先被房间装满，实际 TPOT 5.69 到 7.63 毫秒。\n"
+        "2M、4M 的 H2D 再加一条就超过 10 毫秒，所以和 HBM 同批。51.2 每卡只能再放 9.5 GB。\n"
+        f"2M 相对 H2D，51.2 / 25.6 的系统 TPS 是 {lift(r2, 'p5110', 'h2d10')} / {lift(r2, 'p2610', 'h2d10')}，"
         f"4M 是 {lift(r4, 'p5110', 'h2d10')} / {lift(r4, 'p2610', 'h2d10')}。",
     )
     slide_tpot(
         prs, blank, data, 8, "30",
-        "30 毫秒：HBM 被房间卡住，池把批拉开",
-        "实际 TPOT    ·    H2D 每卡主机 96 GB    ·    池容量不限",
-        "128K 及更长的 HBM 与 10 毫秒同批，实际 TPOT 5.69 到 7.63 毫秒。64K 的 HBM 加到 445,696，TPOT 10.93 毫秒。\n"
-        "H2D 的换入占 19 到 23 毫秒。1M 的 H2D 停在 25.91 毫秒，下一条是 30.14 毫秒。\n"
-        f"30 毫秒才是池的收益。4M 相对 H2D，51.2 Tb/s 的系统 TPS {lift(r4, 'p5130', 'h2d30')}，"
-        f"25.6 Tb/s {lift(r4, 'p2630', 'h2d30')}。",
+        "30 毫秒：HBM 按步时摸批，51.2 被 2432 GB 卡住",
+        "HBM 换入记 0，批量摸到 TPOT 30 毫秒    ·    51.2 总计 2432 GB",
+        "HBM 不看房间。64K 批 1,344,512，4M 批 68,608，TPOT 30.00 和 29.96 毫秒。\n"
+        "51.2 的 2432 GB 从 64K 起就先满。64K 的 TPOT 11.32 毫秒，128K 到 4M 是 5.96 到 7.94 毫秒。\n"
+        f"4M 的 51.2 相对这列 HBM，系统 TPS {lift(r4, 'p5130', 'hbm30')}。25.6 批 13,568，TPOT 29.12 毫秒，相对 H2D {lift(r4, 'p2630', 'h2d30')}。",
     )
     slide_pies(prs, blank, data, 9, "10", "10 毫秒：64K 全在 HBM，更长的开始溢出")
-    slide_pies(prs, blank, data, 10, "30", "30 毫秒：KV 顶满 HBM 后进 DDR 池")
+    slide_pies(prs, blank, data, 10, "30", "30 毫秒：51.2 每卡只再放 9.5 GB，25.6 继续外溢")
     prs.save(PPT)
     print("slides", len(prs.slides), "overflow", audit(prs))
     print("cold", data["cold_s"], "hit", data["hit_s"], "dec", data["dec10_s"], data["dec30_s"])

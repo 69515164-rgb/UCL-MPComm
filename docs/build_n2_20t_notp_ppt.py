@@ -156,6 +156,10 @@ def decode(bs, s, bw, cap):
         "hbm": t_hbm,
         "ca": t_ca,
         "moe": moe["t"],
+        "td": moe["td"],
+        "tw": moe["tw"],
+        "tg": moe["tg"],
+        "tc": moe["tc"],
         "spill": spill,
         "n": n,
         "kv": kept,
@@ -271,8 +275,8 @@ def ms(v):
     return f"{v * 1e3:.1f} 毫秒"
 
 
-def tpot_ms(v):
-    return f"{v * 1e3:.2f} 毫秒"
+def ms2(v):
+    return f"{v * 1e3:.2f}"
 
 
 def gb(n):
@@ -486,8 +490,13 @@ def slide_cmp(prs, blank, data):
 def slide_decode(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 6, "Decode：30 毫秒里换入是大头", "H2D 160 GB/s    ·    每卡主机最多再放 96 GB")
-    ui.banner(slide, 0.90, "2M 和 4M 的 10 毫秒停在还没溢出的批，实际约 5.8 毫秒；再加一条就开始换入，步时超过 10 毫秒。30 毫秒的换入从 64K 起超过 18 毫秒。")
-    head = ["输入", "约束", "批", "换入", "HBM", "计算", "MoE", "TPOT"]
+    ui.banner(
+        slide,
+        0.90,
+        "耗时单位毫秒。TPOT = 换入 + max(HBM, 计算) + 派发 + max(权重, GEMM) + 合并。2M、4M 的 10 毫秒停在还没溢出的批。",
+        size=12,
+    )
+    head = ["输入", "约束", "批", "换入", "HBM", "计算", "派发", "权重", "GEMM", "合并", "TPOT"]
     body, kinds = [], ["head"]
     for row in data["rows"]:
         for tag, label in (("10", "10 毫秒"), ("30", "30 毫秒")):
@@ -497,43 +506,69 @@ def slide_decode(prs, blank, data):
                 fmt_len(row["S"]),
                 label,
                 fmt_bs(row[f"h2d{tag}"]),
-                ms(r["swap"]),
-                ms(r["hbm"]),
-                ms(r["ca"]),
-                ms(r["moe"]),
-                ms(r["t"]),
+                ms2(r["swap"]),
+                ms2(r["hbm"]),
+                ms2(r["ca"]),
+                ms2(r["td"]),
+                ms2(r["tw"]),
+                ms2(r["tg"]),
+                ms2(r["tc"]),
+                ms2(r["t"]),
             ])
-    ui.add_table(slide, 0.32, 1.42, [1.05, 1.25, 1.45, 1.35, 1.25, 1.25, 1.25, 1.45], [head] + body, [0.28] + [0.32] * len(body), kinds, size=11)
+    ui.add_table(
+        slide, 0.28, 1.42,
+        [0.82, 1.08, 1.32, 1.18, 1.15, 1.15, 1.15, 1.18, 1.15, 1.15, 1.28],
+        [head] + body,
+        [0.30] + [0.36] * len(body),
+        kinds,
+        size=11,
+    )
 
 
-def pair_cell(bs, row):
-    return f"{fmt_bs(bs)}\n{tpot_ms(row['t'])}"
+def open_cell(bs, row):
+    return (
+        f"{fmt_bs(bs)}  ·  {ms2(row['t'])} 毫秒\n"
+        f"换 {ms2(row['swap'])}    H {ms2(row['hbm'])}    算 {ms2(row['ca'])}\n"
+        f"派 {ms2(row['td'])}    权 {ms2(row['tw'])}    G {ms2(row['tg'])}    合 {ms2(row['tc'])}"
+    )
 
 
 def slide_tpot(prs, blank, data, page, tag, title, kicker, note):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, page, title, kicker)
-    ui.banner(slide, 0.90, "每格上面是全局批，下面是这一批的实际 TPOT。HBM 不卸载。H2D 是 160 GB/s，每卡主机最多 96 GB。")
+    legend = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.36), Inches(0.92), Inches(12.60), Inches(0.58))
+    ui.solid(legend, ui.PALE)
+    ui.textbox(
+        slide, 0.50, 0.94, 12.32, 0.54,
+        "第一行是全局批和实际 TPOT。换=换入，H=HBM，算=计算，派=派发，权=权重，G=GEMM，合=合并，单位毫秒。\n"
+        "TPOT = 换入 + max(H, 算) + 派 + max(权, G) + 合。HBM 不卸载。H2D 160 GB/s，每卡主机最多 96 GB。",
+        12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
+    )
     head = ["输入", "HBM", "H2D 卸载", "51.2 Tb/s", "25.6 Tb/s"]
     body, kinds = [], ["head"]
     for row in data["rows"]:
         kinds.append("key" if row["S"] in (65536, 4194304) else "body")
         body.append([
             fmt_len(row["S"]),
-            pair_cell(row[f"hbm{tag}"], row[f"dhbm{tag}"]),
-            pair_cell(row[f"h2d{tag}"], row[f"dh2d{tag}"]),
-            pair_cell(row[f"p51{tag}"], row[f"dp51{tag}"]),
-            pair_cell(row[f"p26{tag}"], row[f"dp26{tag}"]),
+            open_cell(row[f"hbm{tag}"], row[f"dhbm{tag}"]),
+            open_cell(row[f"h2d{tag}"], row[f"dh2d{tag}"]),
+            open_cell(row[f"p51{tag}"], row[f"dp51{tag}"]),
+            open_cell(row[f"p26{tag}"], row[f"dp26{tag}"]),
         ])
-    ui.add_table(
-        slide, 0.36, 1.46,
-        [1.15, 2.85, 2.85, 2.85, 2.85],
+    shape = ui.add_table(
+        slide, 0.28, 1.58,
+        [0.78, 3.00, 3.00, 3.00, 3.00],
         [head] + body,
-        [0.32] + [0.52] * len(body),
+        [0.28] + [0.60] * len(body),
         kinds,
-        size=13,
+        size=10,
     )
-    ui.gold(slide, 5.55, 1.48, note, 13)
+    for cell in shape.table.iter_cells():
+        cell.margin_top = Inches(0.02)
+        cell.margin_bottom = Inches(0.01)
+        cell.margin_left = Inches(0.05)
+        cell.margin_right = Inches(0.04)
+    ui.gold(slide, 6.16, 0.94, note, 12)
 
 
 def slide_pies(prs, blank, data, page, limit_tag, title):

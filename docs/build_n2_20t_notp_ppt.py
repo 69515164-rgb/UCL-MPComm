@@ -52,7 +52,7 @@ DDR_CAP = 96e9
 POOL_51 = 51.2e12 / 8
 POOL_26 = 25.6e12 / 8
 # 51.2 Tb/s pool is shared by the 256-GPU decode replica.
-POOL_51_TOTAL = 2432e9
+POOL_51_TOTAL = 9728e9
 POOL_51_CAP = POOL_51_TOTAL / N
 COLL = 5e-6
 ROOM_GPU = HBM_CAP - ROUTED / EP - SHARED - ATTN / TP - RESERVE
@@ -432,7 +432,7 @@ def slide_formula(prs, blank):
                 ["溢出", "f = max(n×K(S) − 571.65 GB, 0) / (n×K(S))"],
                 ["读出", "30×(S/4)×64 + 31×(S/128)×576\n+ 30×min(1024, S/4)×576 + 滑窗"],
                 ["换入", "f × n × Read / BW"],
-                ["带宽", "HBM 不换入。30 毫秒按 TPOT 摸到 30 毫秒\nH2D 160 GB/s、每卡 96 GB。51.2 总计 2432 GB\n25.6 为 3.20 TB/s，容量不限"],
+                ["带宽", "HBM 不换入。30 毫秒按 TPOT 摸到 30 毫秒\nH2D 160 GB/s、每卡 96 GB。51.2 总计 9728 GB\n25.6 为 3.20 TB/s，容量不限"],
                 ["HBM", "(n×Read + 19.35 GB) / 26.40 TB/s"],
                 ["计算", "n × (F_score + 3.87×10^10) / (33.60 P × align(n))"],
                 ["MoE", "与 Prefill 同一组 dispatch / combine"],
@@ -555,7 +555,7 @@ def slide_tpot(prs, blank, data, page, tag, title, kicker, note):
     ui.textbox(
         slide, 0.50, 0.94, 12.32, 0.54,
         "第一行是全局批和实际 TPOT。换=换入，H=HBM，算=计算，派=派发，权=权重，G=GEMM，合=合并，单位毫秒。\n"
-        "TPOT = 换入 + max(H, 算) + 派 + max(权, G) + 合。H2D 每卡 96 GB。51.2 池总计 2432 GB。25.6 容量不限。",
+        "TPOT = 换入 + max(H, 算) + 派 + max(权, G) + 合。H2D 每卡 96 GB。51.2 池总计 9728 GB。25.6 容量不限。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
     head = ["输入", "HBM", "H2D 卸载", "51.2 Tb/s", "25.6 Tb/s"]
@@ -643,22 +643,22 @@ def main():
     slide_tpot(
         prs, blank, data, 7, "10",
         "10 毫秒：HBM、H2D 和两档 DDR 池",
-        "实际 TPOT    ·    51.2 总计 2432 GB    ·    25.6 容量不限",
+        "实际 TPOT    ·    51.2 总计 9728 GB    ·    25.6 容量不限",
         "64K 四档同批，KV 还在 571.65 GB 里，TPOT 9.93 毫秒。128K 到 4M 的 HBM 先被房间装满，实际 TPOT 5.69 到 7.63 毫秒。\n"
-        "2M、4M 的 H2D 再加一条就超过 10 毫秒，所以和 HBM 同批。51.2 每卡只能再放 9.5 GB。\n"
+        "2M、4M 的 H2D 再加一条就超过 10 毫秒，所以和 HBM 同批。51.2 每卡再放 38 GB。\n"
         f"2M 相对 H2D，51.2 / 25.6 的系统 TPS 是 {lift(r2, 'p5110', 'h2d10')} / {lift(r2, 'p2610', 'h2d10')}，"
         f"4M 是 {lift(r4, 'p5110', 'h2d10')} / {lift(r4, 'p2610', 'h2d10')}。",
     )
     slide_tpot(
         prs, blank, data, 8, "30",
-        "30 毫秒：HBM 按步时摸批，51.2 被 2432 GB 卡住",
-        "HBM 换入记 0，批量摸到 TPOT 30 毫秒    ·    51.2 总计 2432 GB",
+        "30 毫秒：HBM 按步时摸批，51.2 被 9728 GB 卡住",
+        "HBM 换入记 0，批量摸到 TPOT 30 毫秒    ·    51.2 总计 9728 GB",
         "HBM 不看房间。64K 批 1,344,512，4M 批 68,608，TPOT 30.00 和 29.96 毫秒。\n"
-        "51.2 的 2432 GB 从 64K 起就先满。64K 的 TPOT 11.32 毫秒，128K 到 4M 是 5.96 到 7.94 毫秒。\n"
+        "51.2 再加一条就超过 9728 GB。64K 的 TPOT 12.67 毫秒，128K 到 4M 是 6.47 到 8.89 毫秒。\n"
         f"4M 的 51.2 相对这列 HBM，系统 TPS {lift(r4, 'p5130', 'hbm30')}。25.6 批 13,568，TPOT 29.12 毫秒，相对 H2D {lift(r4, 'p2630', 'h2d30')}。",
     )
     slide_pies(prs, blank, data, 9, "10", "10 毫秒：64K 全在 HBM，更长的开始溢出")
-    slide_pies(prs, blank, data, 10, "30", "30 毫秒：51.2 每卡只再放 9.5 GB，25.6 继续外溢")
+    slide_pies(prs, blank, data, 10, "30", "30 毫秒：51.2 每卡再放 38 GB，25.6 继续外溢")
     prs.save(PPT)
     print("slides", len(prs.slides), "overflow", audit(prs))
     print("cold", data["cold_s"], "hit", data["hit_s"], "dec", data["dec10_s"], data["dec30_s"])

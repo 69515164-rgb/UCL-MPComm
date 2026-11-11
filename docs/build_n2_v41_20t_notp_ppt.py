@@ -5,9 +5,10 @@ Hardware matches the no-TP V4 deck: parameter plane 1.6 Tb/s, D2D
 57.6 Tb/s per GPU, Prefill 64 cards, Decode 256 cards, TP=1.
 The model is the V4.1-Flash skeleton extrapolated to 20T.
 
-KV is 890 bytes per token. The sliding window and the indexer stay on
-the GPU. Each decode step moves 5.16 MB: the 16384-entry candidate
-pool plus three encoder Top-512 groups. Overflow of the main KV fills
+KV is 890 bytes per token. The indexer, the sliding window and the
+three encoder Top-512 groups stay on the GPU. Each decode step moves
+only the 4.72 MB candidate pool (2048 blocks x 8 positions). Overflow
+of the main KV fills
 the 51.2 Tb/s tier up to 9728 GB, then the unlimited 25.6 Tb/s tier.
 The baseline is HBM plus 96 GB of host DDR per card at 160 GB/s.
 """
@@ -76,7 +77,6 @@ FIXED = L * WIN * SWA_B
 INDEX_FLOP = 2 * 32 * 128
 CORE_FLOP = 2 * 2 * 64 * 512
 POOL_POS = 2048 * 8
-STEP = 3 * 512 * MAIN + POOL_POS * MAIN
 HIT = 0.995
 LENGTHS = (65536, 131072, 262144, 524288, 1048576, 2097152, 4194304)
 
@@ -111,8 +111,8 @@ def store_seq(s):
 
 
 def offload_bytes(s):
-    enc = 3 * min(512.0, s / 2.0) * MAIN
-    return enc + pool_pos(s) * MAIN
+    """Candidate pool only. Encoder Top-512 stays on the GPU."""
+    return pool_pos(s) * MAIN
 
 
 def index_read(s):
@@ -192,8 +192,9 @@ def _time(bs, s, n, main, overflow, parts):
     if main:
         for part, bw in parts:
             t_swap += n * moved * (part / main) / bw
+    pinned = 3 * min(512.0, s / 2.0) * MAIN
     resident = (1.0 - spill) * moved
-    t_hbm = (n * (index_read(s) + resident) + ATTN) / HBM_BW
+    t_hbm = (n * (index_read(s) + pinned + resident) + ATTN) / HBM_BW
     t_ca = n * (score_flops(s) + 2 * ATTN) / (PEAK * align(n))
     moe = expert(float(bs), N, L)
     return {
@@ -411,11 +412,12 @@ def slide_model(prs, blank):
     ui.add_table(slide, 0.42, 1.46, [2.55, 4.85, 5.10], [head] + body, [0.30] + [0.42] * 8, kinds, size=13)
     ui.gold(
         slide,
-        5.30,
-        1.55,
+        5.22,
+        1.72,
         f"E = ceil((2×10^13 − {OTHER/1e9:.3f}×10^9) / {W_ONE/1e9:.3f}×10^9) = {E}。单个专家 = 3×5120×2304×40 = {W_ONE/1e9:.3f}×10^9。\n"
-        f"全局 KV = 890×S + 2,621,440。4M 一条 {store_seq(4194304)/1e9:.2f} GB。TP=1，这条 KV 整段落在一张卡上。\n"
-        "索引和滑窗留在 GPU。每步卸载是候选池 4.72 MB 加编码器三组 Top-512 共 0.44 MB，合计 5.16 MB。",
+        f"全局 KV = 890×S + 2,621,440。4M 一条 {store_seq(4194304)/1e9:.2f} GB，其中主 KV {main_seq(4194304)/1e9:.2f} GB。这是压缩比 2 和 1 的存量。\n"
+        "候选池 = 2048 块 × 8 位置 × 288 字节 = 4.72 MB，是 Reindex 的固定工作集，不按压缩比随 S 放大。\n"
+        "编码器三组 Top-512 共 0.44 MB，留在 GPU。每步卸载只算这 4.72 MB。",
         14,
     )
 
@@ -476,9 +478,9 @@ def slide_formula(prs, blank):
                 ["n", "ceil(全局批 / 256)"],
                 ["存量", "索引 2.5×S×68 + 滑窗留在 GPU\n主 KV = 2.5×S×288"],
                 ["溢出", f"max(n×主KV − ({room} GB − n×索引), 0)"],
-                ["换入", "溢出 / 主KV × n × 5.16 MB / BW"],
+                ["换入", "溢出 / 主KV × n × 4.72 MB / BW"],
                 ["带宽", "基线 H2D 160 GB/s，每卡 96 GB\n1 级 6.40 TB/s，总计 9728 GB\n2 级 3.20 TB/s，容量不限"],
-                ["HBM", "索引全文 + 留在 GPU 的那截 5.16 MB"],
+                ["HBM", "索引全文 + Top-512 + 留在 GPU 的候选池"],
                 ["计算", "n × (F_score + 2×注意力) / (33.60 P × align(n))"],
                 ["MoE", "40 层 dispatch / combine，D2D 5.76 TB/s"],
                 ["TPOT", "换入 + max(HBM, 计算) + MoE"],
@@ -538,7 +540,7 @@ def slide_cmp(prs, blank, data):
 
 def slide_decode(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 6, "Decode 基线：HBM 加每卡主机 96 GB", "换入 160 GB/s    ·    每步搬走的是 5.16 MB 里的溢出比例")
+    ui.chrome(slide, 6, "Decode 基线：HBM 加每卡主机 96 GB", "换入 160 GB/s    ·    每步搬走的是 4.72 MB 候选池里的溢出比例")
     ui.banner(
         slide,
         0.90,
@@ -582,7 +584,7 @@ def slide_tier(prs, blank, data, page, tag, title):
     ui.textbox(
         slide, 0.46, 0.94, 12.40, 0.66,
         "主 KV 的溢出先填 1 级，256 卡合计最多 9728 GB，带宽 6.40 TB/s。剩下的进 2 级，带宽 3.20 TB/s。\n"
-        "换入 = 5.16 MB × n × 1 级占比 / 6.40 TB/s + 5.16 MB × n × 2 级占比 / 3.20 TB/s。基线是 HBM 加每卡主机 96 GB、160 GB/s。总量是 256 卡相加。",
+        "换入 = 4.72 MB × n × 1 级占比 / 6.40 TB/s + 4.72 MB × n × 2 级占比 / 3.20 TB/s。Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。总量是 256 卡相加。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
     head = ["输入", "基线批", "基线毫秒", "基线吞吐", "两级批", "两级毫秒", "1 级总量", "2 级总量", "两级吞吐", "相对基线"]

@@ -83,7 +83,7 @@ POOL_POS = 2048 * 8
 HIT = 0.995
 LENGTHS = (65536, 131072, 262144, 524288, 1048576, 2097152, 4194304)
 
-SLIDES = 14
+SLIDES = 16
 FOOTER = "N+2    ·    V4.1 外扩 20T    ·    Prefill 64 卡 TP=1    ·    Decode DP=256 EP=256    ·    参数面 1.6 Tb/s    ·    无 fullmesh"
 PPT = "/agent/repos/ucl-mpcomm/docs/N+2-20T-V4.1-无TP.pptx"
 ui.SLIDES = SLIDES
@@ -224,7 +224,7 @@ def decode_host(bs, s):
     return _time(bs, s, n, main, overflow, [(overflow, HOST)] if overflow else [])
 
 
-def decode_tier(bs, s):
+def decode_tier(bs, s, tier2_bw=POOL_26):
     placed = _place(bs, s)
     if placed is None:
         return None
@@ -235,7 +235,7 @@ def decode_tier(bs, s):
     if tier1:
         parts.append((tier1, POOL_51))
     if tier2:
-        parts.append((tier2, POOL_26))
+        parts.append((tier2, tier2_bw))
     row = _time(bs, s, n, main, overflow, parts)
     row["tier1"] = tier1 * N
     row["tier2"] = tier2 * N
@@ -312,6 +312,9 @@ def collect():
             bs, row = search(limit, lambda b, s=s: decode_tier(b, s))
             item[f"tier{tag}"] = bs
             item[f"dtier{tag}"] = row
+            bs, row = search(limit, lambda b, s=s: decode_tier(b, s, POOL_64))
+            item[f"t64{tag}"] = bs
+            item[f"dt64{tag}"] = row
             for key, _label, bw in SINGLE_POOLS:
                 bs, row = search(limit, lambda b, s=s, bw=bw: decode_pool(b, s, bw))
                 item[f"{key}{tag}"] = bs
@@ -406,7 +409,7 @@ def slide_open(prs, blank, data):
         f"冷请求不拉 prefix。单条冷请求摸到 10 秒的输入是 {data['cold_s']:,}。4M 冷请求 TTFT {sec(data['cold4'])}。\n"
         f"99.5% 命中的单条请求可以到 {data['hit_s']:,}。批量摸高仍看 64K 到 4M 这七档。\n"
         f"单条 Decode 在输入 {data['dec_cap_s']:,} 时先顶到每卡主机 96 GB，TPOT {ms2(data['dec_cap_t'])} 毫秒，到不了 10 毫秒。\n"
-        "系统 Prefill TPS = 全局批 × 输入长度 / 实际 TTFT。系统 Decode TPS = 全局批 / 实际 TPOT。两级池在第 7、8 页，三档单级池在第 9 到 14 页。",
+        "系统 Prefill TPS = 全局批 × 输入长度 / 实际 TTFT。系统 Decode TPS = 全局批 / 实际 TPOT。两级 25.6 在第 7、8 页，两级 6.4 在第 15、16 页，单级池在第 9 到 14 页。",
         14,
     )
 
@@ -594,34 +597,34 @@ def slide_decode(prs, blank, data):
     )
 
 
-def slide_tier(prs, blank, data, page, tag, title):
+def slide_tier(prs, blank, data, page, tag, title, key="tier", tier2_name="25.6 Tb/s", tier2_tb=3.20):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, page, title, "1 级 51.2 Tb/s · 合计 9728 GB    ·    2 级 25.6 Tb/s · 容量不限")
+    ui.chrome(slide, page, title, f"1 级 51.2 Tb/s · 合计 9728 GB    ·    2 级 {tier2_name} · 容量不限")
     legend = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.32), Inches(0.92), Inches(12.68), Inches(0.70))
     ui.solid(legend, ui.PALE)
     ui.textbox(
         slide, 0.46, 0.94, 12.40, 0.66,
-        "主 KV 的溢出先填 1 级，256 卡合计最多 9728 GB，带宽 6.40 TB/s。剩下的进 2 级，带宽 3.20 TB/s。\n"
-        "换入 = 4.72 MB × n × 1 级占比 / 6.40 TB/s + 4.72 MB × n × 2 级占比 / 3.20 TB/s。Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。总量是 256 卡相加。",
+        f"主 KV 的溢出先填 1 级，256 卡合计最多 9728 GB，带宽 6.40 TB/s。剩下的进 2 级，带宽 {tier2_tb:.2f} TB/s。\n"
+        f"换入 = 4.72 MB × n × 1 级占比 / 6.40 TB/s + 4.72 MB × n × 2 级占比 / {tier2_tb:.2f} TB/s。Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。总量是 256 卡相加。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
     head = ["输入", "基线批", "基线毫秒", "基线吞吐", "两级批", "两级毫秒", "1 级总量", "2 级总量", "两级吞吐", "相对基线"]
     body, kinds = [], ["head"]
     for row in data["rows"]:
         base = row[f"dh2d{tag}"]
-        tier = row[f"dtier{tag}"]
+        tier = row[f"d{key}{tag}"]
         kinds.append("key" if row["S"] in (65536, 4194304) else "body")
         body.append([
             fmt_len(row["S"]),
             fmt_bs(row[f"h2d{tag}"]),
             ms2(base["t"]),
             fmt_rate(tps_d(row[f"h2d{tag}"], base)),
-            fmt_bs(row[f"tier{tag}"]),
+            fmt_bs(row[f"{key}{tag}"]),
             ms2(tier["t"]),
             mem_total(tier["tier1"]),
             mem_total(tier["tier2"]),
-            fmt_rate(tps_d(row[f"tier{tag}"], tier)),
-            signed_pct(tps_d(row[f"tier{tag}"], tier), tps_d(row[f"h2d{tag}"], base)),
+            fmt_rate(tps_d(row[f"{key}{tag}"], tier)),
+            signed_pct(tps_d(row[f"{key}{tag}"], tier), tps_d(row[f"h2d{tag}"], base)),
         ])
     shape = ui.add_table(
         slide, 0.30, 1.74,
@@ -637,7 +640,7 @@ def slide_tier(prs, blank, data, page, tag, title):
         cell.margin_left = Inches(0.05)
         cell.margin_right = Inches(0.04)
     r64, r4 = data["rows"][0], data["rows"][-1]
-    full = [row for row in data["rows"] if row[f"dtier{tag}"]["tier1"] >= POOL_51_TOTAL - 1.0]
+    full = [row for row in data["rows"] if row[f"d{key}{tag}"]["tier1"] >= POOL_51_TOTAL - 1.0]
     if len(full) == len(data["rows"]):
         full_txt = "七档都把 1 级的 9728 GB 装满"
     elif full:
@@ -648,12 +651,12 @@ def slide_tier(prs, blank, data, page, tag, title):
         slide,
         5.86,
         1.16,
-        f"{full_txt}。64K 两级批 {fmt_bs(r64[f'tier{tag}'])}，"
-        f"1 级 {mem_total(r64[f'dtier{tag}']['tier1'])}，2 级 {mem_total(r64[f'dtier{tag}']['tier2'])}，"
-        f"吞吐相对基线 {signed_pct(tps_d(r64[f'tier{tag}'], r64[f'dtier{tag}']), tps_d(r64[f'h2d{tag}'], r64[f'dh2d{tag}']))}。\n"
-        f"4M 两级批 {fmt_bs(r4[f'tier{tag}'])}，TPOT {ms2(r4[f'dtier{tag}']['t'])} 毫秒，"
-        f"1 级 {mem_total(r4[f'dtier{tag}']['tier1'])}，2 级 {mem_total(r4[f'dtier{tag}']['tier2'])}，"
-        f"吞吐相对基线 {signed_pct(tps_d(r4[f'tier{tag}'], r4[f'dtier{tag}']), tps_d(r4[f'h2d{tag}'], r4[f'dh2d{tag}']))}。",
+        f"{full_txt}。64K 两级批 {fmt_bs(r64[f'{key}{tag}'])}，"
+        f"1 级 {mem_total(r64[f'd{key}{tag}']['tier1'])}，2 级 {mem_total(r64[f'd{key}{tag}']['tier2'])}，"
+        f"吞吐相对基线 {signed_pct(tps_d(r64[f'{key}{tag}'], r64[f'd{key}{tag}']), tps_d(r64[f'h2d{tag}'], r64[f'dh2d{tag}']))}。\n"
+        f"4M 两级批 {fmt_bs(r4[f'{key}{tag}'])}，TPOT {ms2(r4[f'd{key}{tag}']['t'])} 毫秒，"
+        f"1 级 {mem_total(r4[f'd{key}{tag}']['tier1'])}，2 级 {mem_total(r4[f'd{key}{tag}']['tier2'])}，"
+        f"吞吐相对基线 {signed_pct(tps_d(r4[f'{key}{tag}'], r4[f'd{key}{tag}']), tps_d(r4[f'h2d{tag}'], r4[f'dh2d{tag}']))}。",
         13,
     )
 
@@ -753,6 +756,16 @@ def main():
         for tag in ("10", "30"):
             slide_pool(prs, blank, data, page, tag, key, label, bw)
             page += 1
+    slide_tier(
+        prs, blank, data, 15, "10",
+        "10 毫秒：两级池 51.2 + 6.4，对照 HBM 加主机",
+        key="t64", tier2_name="6.4 Tb/s", tier2_tb=POOL_64 / 1e12,
+    )
+    slide_tier(
+        prs, blank, data, 16, "30",
+        "30 毫秒：两级池 51.2 + 6.4，对照 HBM 加主机",
+        key="t64", tier2_name="6.4 Tb/s", tier2_tb=POOL_64 / 1e12,
+    )
     prs.save(PPT)
     print("slides", len(prs.slides), "overflow", audit(prs))
     print("room", f"{ROOM_GPU/1e9:.2f}", "pf", f"{PF_ROOM/1e9:.2f}", "attn", f"{ATTN/1e9:.3f}", "E", E)

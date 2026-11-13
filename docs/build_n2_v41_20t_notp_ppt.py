@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""N+2 20T V4.1 with TP removed, and a two-level DDR pool.
+"""N+2 20T V4.1 with TP removed, and two decode-pool groupings.
 
 Hardware matches the no-TP V4 deck: parameter plane 1.6 Tb/s, D2D
 57.6 Tb/s per GPU, Prefill 64 cards, Decode 256 cards, TP=1.
@@ -7,10 +7,13 @@ The model is the V4.1-Flash skeleton extrapolated to 20T.
 
 KV is 890 bytes per token. The indexer, the sliding window and the
 three encoder Top-512 groups stay on the GPU. Each decode step moves
-only the 4.72 MB candidate pool (2048 blocks x 8 positions). Overflow
-of the main KV fills
-the 51.2 Tb/s tier up to 9728 GB, then the unlimited 25.6 Tb/s tier.
-The baseline is HBM plus 96 GB of host DDR per card at 160 GB/s.
+only the 4.72 MB candidate pool (2048 blocks x 8 positions).
+
+Group 1 is only the on-network cache: 29952 GB at 51.2 Tb/s, split
+evenly across 256 cards. A batch that would overflow that cap does
+not fit. Group 2 keeps that cache as tier 1 and spills the rest into
+an unlimited DDR pool at 6.4 Tb/s. The baseline is HBM plus 96 GB of
+host DDR per card at 160 GB/s.
 """
 
 from __future__ import annotations
@@ -63,11 +66,8 @@ PREFIX_100 = 1.6e12 / 8
 HOST = min(1.6e12 / 8 * 0.80, 2e12 * 0.80 / 8)
 DDR_CAP = 96e9
 POOL_51 = 51.2e12 / 8
-POOL_26 = 25.6e12 / 8
-POOL_128 = 12.8e12 / 8
 POOL_64 = 6.4e12 / 8
-SINGLE_POOLS = (("p256", "25.6", POOL_26), ("p128", "12.8", POOL_128), ("p64", "6.4", POOL_64))
-POOL_51_TOTAL = 9728e9
+POOL_51_TOTAL = 29952e9
 POOL_51_CAP = POOL_51_TOTAL / N
 COLL = 5e-6
 ROOM_GPU = HBM_CAP - ROUTED / EP - SHARED - ATTN / TP - RESERVE
@@ -83,7 +83,7 @@ POOL_POS = 2048 * 8
 HIT = 0.995
 LENGTHS = (65536, 131072, 262144, 524288, 1048576, 2097152, 4194304)
 
-SLIDES = 16
+SLIDES = 10
 FOOTER = "N+2    ·    V4.1 外扩 20T    ·    Prefill 64 卡 TP=1    ·    Decode DP=256 EP=256    ·    参数面 1.6 Tb/s    ·    无 fullmesh"
 PPT = "/agent/repos/ucl-mpcomm/docs/N+2-20T-V4.1-无TP.pptx"
 ui.SLIDES = SLIDES
@@ -224,7 +224,20 @@ def decode_host(bs, s):
     return _time(bs, s, n, main, overflow, [(overflow, HOST)] if overflow else [])
 
 
-def decode_tier(bs, s, tier2_bw=POOL_26):
+def decode_cache(bs, s):
+    """Only the on-net cache. Overflow above 29952 GB does not fit."""
+    placed = _place(bs, s)
+    if placed is None:
+        return None
+    n, main, overflow = placed
+    if overflow > POOL_51_CAP + 1.0:
+        return None
+    row = _time(bs, s, n, main, overflow, [(overflow, POOL_51)] if overflow else [])
+    row["pool"] = overflow * N
+    return row
+
+
+def decode_tier(bs, s, tier2_bw=POOL_64):
     placed = _place(bs, s)
     if placed is None:
         return None
@@ -309,16 +322,12 @@ def collect():
             bs, row = search(limit, lambda b, s=s: decode_host(b, s))
             item[f"h2d{tag}"] = bs
             item[f"dh2d{tag}"] = row
+            bs, row = search(limit, lambda b, s=s: decode_cache(b, s))
+            item[f"cache{tag}"] = bs
+            item[f"dcache{tag}"] = row
             bs, row = search(limit, lambda b, s=s: decode_tier(b, s))
             item[f"tier{tag}"] = bs
             item[f"dtier{tag}"] = row
-            bs, row = search(limit, lambda b, s=s: decode_tier(b, s, POOL_64))
-            item[f"t64{tag}"] = bs
-            item[f"dt64{tag}"] = row
-            for key, _label, bw in SINGLE_POOLS:
-                bs, row = search(limit, lambda b, s=s, bw=bw: decode_pool(b, s, bw))
-                item[f"{key}{tag}"] = bs
-                item[f"d{key}{tag}"] = row
         rows.append(item)
     return {
         "rows": rows,
@@ -409,7 +418,7 @@ def slide_open(prs, blank, data):
         f"冷请求不拉 prefix。单条冷请求摸到 10 秒的输入是 {data['cold_s']:,}。4M 冷请求 TTFT {sec(data['cold4'])}。\n"
         f"99.5% 命中的单条请求可以到 {data['hit_s']:,}。批量摸高仍看 64K 到 4M 这七档。\n"
         f"单条 Decode 在输入 {data['dec_cap_s']:,} 时先顶到每卡主机 96 GB，TPOT {ms2(data['dec_cap_t'])} 毫秒，到不了 10 毫秒。\n"
-        "系统 Prefill TPS = 全局批 × 输入长度 / 实际 TTFT。系统 Decode TPS = 全局批 / 实际 TPOT。两级 25.6 在第 7、8 页，两级 6.4 在第 15、16 页，单级池在第 9 到 14 页。",
+        "系统 Prefill TPS = 全局批 × 输入长度 / 实际 TTFT。系统 Decode TPS = 全局批 / 实际 TPOT。只有在网 cache 在第 7、8 页。在网 cache 再加 6.4 Tb/s 的 2 级池在第 9、10 页。",
         14,
     )
 
@@ -465,7 +474,7 @@ def slide_split(prs, blank, data):
         5.00,
         1.85,
         f"Prefill 固定 64 卡。64K 基线是每卡 {fmt_bs(n64)} 条，每卡 KV {kv64:.0f} GB，房间 {PF_ROOM/1e9:.0f} GB 放得下。\n"
-        f"Decode 每卡 KV 房间 {ROOM_GPU/1e9:.1f} GB。索引必须整段留在这间房间里，主 KV 装不下的部分才进主机或两级池。\n"
+        f"Decode 每卡 KV 房间 {ROOM_GPU/1e9:.1f} GB。索引必须整段留在这间房间里，主 KV 装不下的部分才进主机或在网 cache。\n"
         f"专家表 {ROUTED/1e12:.3f} TB。EP 降到 16 时单是路由专家就有 {ROUTED/16/1e9:.0f} GB，KV 没有地方放，所以 Decode 维持 EP=256。",
         14,
     )
@@ -500,7 +509,7 @@ def slide_formula(prs, blank):
                 ["存量", "索引 2.5×S×68 + 滑窗留在 GPU\n主 KV = 2.5×S×288"],
                 ["溢出", f"max(n×主KV − ({room} GB − n×索引), 0)"],
                 ["换入", "溢出 / 主KV × n × 4.72 MB / BW"],
-                ["带宽", "基线 H2D 160 GB/s，每卡 96 GB\n1 级 6.40 TB/s，总计 9728 GB\n2 级 3.20 TB/s，容量不限"],
+                ["带宽", f"基线 H2D 160 GB/s，每卡 96 GB\n组 1 在网 cache {POOL_51/1e12:.2f} TB/s，合计 {POOL_51_TOTAL/1e9:.0f} GB\n组 2 的 2 级 {POOL_64/1e12:.2f} TB/s，容量不限"],
                 ["HBM", "索引全文 + Top-512 + 留在 GPU 的候选池"],
                 ["计算", "n × (F_score + 2×注意力) / (33.60 P × align(n))"],
                 ["MoE", "40 层 dispatch / combine，D2D 5.76 TB/s"],
@@ -597,15 +606,16 @@ def slide_decode(prs, blank, data):
     )
 
 
-def slide_tier(prs, blank, data, page, tag, title, key="tier", tier2_name="25.6 Tb/s", tier2_tb=3.20):
+def slide_tier(prs, blank, data, page, tag, title, key="tier", tier2_name="6.4 Tb/s", tier2_tb=POOL_64 / 1e12):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, page, title, f"1 级 51.2 Tb/s · 合计 9728 GB    ·    2 级 {tier2_name} · 容量不限")
+    cap = f"{POOL_51_TOTAL/1e9:.0f}"
+    ui.chrome(slide, page, title, f"1 级 51.2 Tb/s · 合计 {cap} GB    ·    2 级 {tier2_name} · 容量不限")
     legend = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.32), Inches(0.92), Inches(12.68), Inches(0.70))
     ui.solid(legend, ui.PALE)
     ui.textbox(
         slide, 0.46, 0.94, 12.40, 0.66,
-        f"主 KV 的溢出先填 1 级，256 卡合计最多 9728 GB，带宽 6.40 TB/s。剩下的进 2 级，带宽 {tier2_tb:.2f} TB/s。\n"
-        f"换入 = 4.72 MB × n × 1 级占比 / 6.40 TB/s + 4.72 MB × n × 2 级占比 / {tier2_tb:.2f} TB/s。Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。总量是 256 卡相加。",
+        f"主 KV 的溢出先填 1 级在网 cache。256 卡合计 {cap} GB，均分后每卡 {POOL_51_CAP/1e9:.0f} GB，带宽 {POOL_51/1e12:.2f} TB/s。剩下的进 2 级 DDR 池，带宽 {tier2_tb:.2f} TB/s，容量不限。\n"
+        f"换入 = 4.72 MB × n × 1 级占比 / {POOL_51/1e12:.2f} TB/s + 4.72 MB × n × 2 级占比 / {tier2_tb:.2f} TB/s。Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
     head = ["输入", "基线批", "基线毫秒", "基线吞吐", "两级批", "两级毫秒", "1 级总量", "2 级总量", "两级吞吐", "相对基线"]
@@ -641,8 +651,9 @@ def slide_tier(prs, blank, data, page, tag, title, key="tier", tier2_name="25.6 
         cell.margin_right = Inches(0.04)
     r64, r4 = data["rows"][0], data["rows"][-1]
     full = [row for row in data["rows"] if row[f"d{key}{tag}"]["tier1"] >= POOL_51_TOTAL - 1.0]
+    cap = f"{POOL_51_TOTAL/1e9:.0f}"
     if len(full) == len(data["rows"]):
-        full_txt = "七档都把 1 级的 9728 GB 装满"
+        full_txt = f"七档都把 1 级的 {cap} GB 装满"
     elif full:
         full_txt = "1 级被装满的是 " + "、".join(fmt_len(row["S"]) for row in full)
     else:
@@ -656,24 +667,34 @@ def slide_tier(prs, blank, data, page, tag, title, key="tier", tier2_name="25.6 
         f"吞吐相对基线 {signed_pct(tps_d(r64[f'{key}{tag}'], r64[f'd{key}{tag}']), tps_d(r64[f'h2d{tag}'], r64[f'dh2d{tag}']))}。\n"
         f"4M 两级批 {fmt_bs(r4[f'{key}{tag}'])}，TPOT {ms2(r4[f'd{key}{tag}']['t'])} 毫秒，"
         f"1 级 {mem_total(r4[f'd{key}{tag}']['tier1'])}，2 级 {mem_total(r4[f'd{key}{tag}']['tier2'])}，"
-        f"吞吐相对基线 {signed_pct(tps_d(r4[f'{key}{tag}'], r4[f'd{key}{tag}']), tps_d(r4[f'h2d{tag}'], r4[f'dh2d{tag}']))}。",
+        f"吞吐相对基线 {signed_pct(tps_d(r4[f'{key}{tag}'], r4[f'd{key}{tag}']), tps_d(r4[f'h2d{tag}'], r4[f'dh2d{tag}']))}。"
+        + (
+            f"\n4M 再加 1 条，索引就超过每卡 {ROOM_GPU/1e9:.1f} GB 的 GPU 房间，批停在这里。"
+            if tag == "30" and r4[f"d{key}{tag}"]["t"] < 0.030
+            else ""
+        ),
         13,
     )
 
 
-def slide_pool(prs, blank, data, page, tag, key, label, bw):
+def slide_pool(prs, blank, data, page, tag, key, label, bw, cap_total=None):
     slide = prs.slides.add_slide(blank)
     tb = bw / 1e12
+    cap_txt = "容量不限" if cap_total is None else f"合计 {cap_total/1e9:.0f} GB"
     ui.chrome(
         slide, page,
-        f"{tag} 毫秒：{label} Tb/s 池摸高，对照 HBM 加主机",
-        f"单级池 {label} Tb/s = {tb:.2f} TB/s    ·    容量不限",
+        f"{tag} 毫秒：只有在网 cache，对照 HBM 加主机",
+        f"{label} Tb/s = {tb:.2f} TB/s    ·    {cap_txt}",
     )
     legend = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.32), Inches(0.92), Inches(12.68), Inches(0.70))
     ui.solid(legend, ui.PALE)
+    if cap_total is None:
+        place = "溢出的主 KV 全部进这一档池，容量不限。"
+    else:
+        place = f"只有在网 cache，没有 2 级池。256 卡合计 {cap_total/1e9:.0f} GB，均分后每卡 {cap_total/N/1e9:.0f} GB。一条批的溢出超过这个上限就放不下。"
     ui.textbox(
         slide, 0.46, 0.94, 12.40, 0.66,
-        f"溢出的主 KV 全部进这一档池，容量不限。换入 = 4.72 MB × n × 溢出比例 / {tb:.2f} TB/s。\n"
+        f"{place}换入 = 4.72 MB × n × 溢出比例 / {tb:.2f} TB/s。\n"
         "Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。池总量是 256 卡相加。相对基线是系统吞吐的提升。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
@@ -719,7 +740,12 @@ def slide_pool(prs, blank, data, page, tag, key, label, bw):
         f"64K 池批 {fmt_bs(r64[f'{key}{tag}'])}，TPOT {ms2(r64[f'd{key}{tag}']['t'])} 毫秒，"
         f"池总量 {mem_total(r64[f'd{key}{tag}']['pool'])}，吞吐相对基线 {lift(r64)}。\n"
         f"4M 池批 {fmt_bs(r4[f'{key}{tag}'])}，TPOT {ms2(r4[f'd{key}{tag}']['t'])} 毫秒，"
-        f"池总量 {mem_total(r4[f'd{key}{tag}']['pool'])}，吞吐相对基线 {lift(r4)}。",
+        f"池总量 {mem_total(r4[f'd{key}{tag}']['pool'])}，吞吐相对基线 {lift(r4)}。"
+        + (
+            "\n512K 到 4M 与 10 毫秒是同一批：29952 GB 先满，TPOT 还低于 10 毫秒。"
+            if cap_total is not None and tag == "30"
+            else ""
+        ),
         13,
     )
 
@@ -749,23 +775,14 @@ def main():
     slide_formula(prs, blank)
     slide_cmp(prs, blank, data)
     slide_decode(prs, blank, data)
-    slide_tier(prs, blank, data, 7, "10", "10 毫秒：两级池摸高，对照 HBM 加主机")
-    slide_tier(prs, blank, data, 8, "30", "30 毫秒：两级池摸高，对照 HBM 加主机")
-    page = 9
-    for key, label, bw in SINGLE_POOLS:
-        for tag in ("10", "30"):
-            slide_pool(prs, blank, data, page, tag, key, label, bw)
-            page += 1
-    slide_tier(
-        prs, blank, data, 15, "10",
-        "10 毫秒：两级池 51.2 + 6.4，对照 HBM 加主机",
-        key="t64", tier2_name="6.4 Tb/s", tier2_tb=POOL_64 / 1e12,
+    slide_pool(
+        prs, blank, data, 7, "10", "cache", "51.2", POOL_51, POOL_51_TOTAL,
     )
-    slide_tier(
-        prs, blank, data, 16, "30",
-        "30 毫秒：两级池 51.2 + 6.4，对照 HBM 加主机",
-        key="t64", tier2_name="6.4 Tb/s", tier2_tb=POOL_64 / 1e12,
+    slide_pool(
+        prs, blank, data, 8, "30", "cache", "51.2", POOL_51, POOL_51_TOTAL,
     )
+    slide_tier(prs, blank, data, 9, "10", "10 毫秒：两级访存，对照 HBM 加主机")
+    slide_tier(prs, blank, data, 10, "30", "30 毫秒：两级访存，对照 HBM 加主机")
     prs.save(PPT)
     print("slides", len(prs.slides), "overflow", audit(prs))
     print("room", f"{ROOM_GPU/1e9:.2f}", "pf", f"{PF_ROOM/1e9:.2f}", "attn", f"{ATTN/1e9:.3f}", "E", E)
@@ -775,11 +792,11 @@ def main():
             fmt_len(row["S"]),
             "pf", row["p25"]["bs"], row["p100"]["bs"],
             "h2d", row["h2d10"], row["h2d30"],
+            "cache", row["cache10"], row["cache30"],
+            mem_total(row["dcache10"]["pool"]), mem_total(row["dcache30"]["pool"]),
             "tier", row["tier10"], row["tier30"],
             mem_total(row["dtier10"]["tier1"]), mem_total(row["dtier10"]["tier2"]),
             mem_total(row["dtier30"]["tier1"]), mem_total(row["dtier30"]["tier2"]),
-            "swap10", f"{row['dtier10']['swap']*1e3:.3f}",
-            "swap30", f"{row['dtier30']['swap']*1e3:.3f}",
         )
 
 

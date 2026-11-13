@@ -21,7 +21,10 @@ v41 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(v41)
 ui = v41.ui
 
-SLIDES = 9
+SLIDES = 10
+S1M = 1_048_576
+MAIN_B, INDEX_B = 288, 68
+ENTRY_B = MAIN_B + INDEX_B
 FOOTER = "DS 4.1 在网 cache    ·    讲的是 V4.1 外扩 20T 那一版    ·    CSA2 的 2048 块"
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
@@ -145,7 +148,7 @@ def slide_attn(prs, blank):
         ["滑窗", "40 层都做", "窗口 128。KV 从本层隐状态算，不跨层共享"],
         ["只有滑窗", "层 0、1", "没有全局分支，也不继承任何 Full 的选择"],
         ["Full", "层 2、8、14、20", "自己产生主 KV 和 indexer K，并选出 Top-512"],
-        ["Reindex", "层 24、28、32、36", "沿用最近 Full 的主 KV，自己重打分，换一批 512"],
+        ["Reindex", "层 24、28、32、36", "沿用层 20 的主 KV 和 indexer K，自己重打分，换一批 512"],
         ["Reuse", "其余 30 层", "主 KV 和 Top-512 都沿用，本层只算 Q 和滑窗 KV"],
         ["压缩", "编码器 2，解码器 1", "每 token 全局 KV = (3/2 + 1) × 356 = 890 字节"],
         ["候选池", "只在解码器", "层 20 留 2048 块 × 8 位置。后面的 Reindex 只在这 16384 条里选"],
@@ -162,9 +165,56 @@ def slide_attn(prs, blank):
     )
 
 
+def mb(n):
+    return f"{n / 1e6:.2f} MB"
+
+
+def slide_kv_1m(prs, blank):
+    """Encoder main KV is three Full layers at compression 2."""
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 4, "1M 输入时，两边的 KV 分开算", "1M = 1,048,576 token    ·    主 KV 288 字节    ·    indexer K 68 字节")
+    ui.banner(slide, 0.90, "全量 KV = 主 KV + indexer K。Top-512 是从主 KV 里选出的那几条，不是另一份全文。")
+    enc_entries = 3 * (S1M // 2)
+    dec_entries = S1M
+    enc_main = enc_entries * MAIN_B
+    dec_main = dec_entries * MAIN_B
+    enc_all = enc_entries * ENTRY_B
+    dec_all = dec_entries * ENTRY_B
+    enc_top = 3 * 512 * MAIN_B
+    dec_top = 512 * MAIN_B
+    ui.gold(
+        slide,
+        1.42,
+        1.15,
+        "编码器主 KV = 3 × (S / 2) × 288 = 432 S 字节。三个 Full 层各写一份，压缩比 2。\n"
+        "解码器主 KV = S × 288 字节。只有层 20 写一份，压缩比 1，从编码器最后一层的隐状态投影。\n"
+        "全量 KV = 条目数 × 356。356 = 288 + 68。编码器是 534 S 字节，解码器是 356 S 字节。",
+        14,
+    )
+    head = ["", "条目数", "全量 KV", "主 KV", "Top-512"]
+    body = [
+        ["编码器", f"3 × {S1M // 2:,}", mb(enc_all), mb(enc_main), mb(enc_top)],
+        ["解码器", f"{dec_entries:,}", mb(dec_all), mb(dec_main), mb(dec_top)],
+        ["合计", f"{enc_entries + dec_entries:,}", mb(enc_all + dec_all), mb(enc_main + dec_main), mb(enc_top + dec_top)],
+    ]
+    kinds = ["head", "body", "body", "sum"]
+    ui.add_table(
+        slide, 0.36, 2.72, [1.70, 2.35, 2.55, 2.55, 2.40],
+        [head] + body, [0.40, 0.52, 0.52, 0.52], kinds, size=14,
+    )
+    ui.textbox(
+        slide, 0.40, 4.85, 12.5, 1.95,
+        "编码器 Top-512 是三组独立主 KV 上各 512 条：3×512×288 = 442,368 字节。组与组不共用条目，所以三份都计入。\n"
+        "解码器 Top-512 是层 20 选出的 512×288 = 147,456 字节。24、28、32、36 也各选 512，但下标落在层 20 这一份主 KV 上，不另占主 KV 容量。\n"
+        "候选池是另一回事：层 20 按块留下最多 2048×8 = 16,384 条，16,384×288 = 4.72 MB，给 Reindex 当搜索范围。它大于解码器这一列的 Top-512。\n"
+        "合计全量 KV = 890 × S = 933.23 MB，和每 token 890 字节一致。滑窗 40×128 不在这张表里。",
+        14, False, INK, anchor=MSO_ANCHOR.TOP,
+    )
+
+
 def slide_placement(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 4, "模块位置不动，变的是哪一段离开 GPU", "上：在网 cache    ·    中：GPU    ·    下：主机    ·    左：DDR 池")
+    ui.chrome(slide, 5, "模块位置不动，变的是哪一段离开 GPU", "上：在网 cache    ·    中：GPU    ·    下：主机    ·    左：DDR 池")
     ui.banner(slide, 0.90, "索引和滑窗三种方案都留在 GPU。出卡的只有主 KV，或者 CSA2 每步要重读的那 5.16 MB。")
 
     card(slide, 0.32, 1.48, 3.55, 2.05, "F3E6D4", "DDR 池", "主 KV 全量，容量不限。\n方案 3 整份存放。\n不在每步热路径上。", DDR, INK, 16, 14)
@@ -217,7 +267,7 @@ def slide_question(prs, blank, data):
 
 def slide_csa2(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 5, "CSA2：先缩成 2048 块，后面只在块里挑", "层号从 0 计    ·    Full 是 2、8、14、20")
+    ui.chrome(slide, 6, "CSA2：先缩成 2048 块，后面只在块里挑", "层号从 0 计    ·    Full 是 2、8、14、20")
     ui.banner(slide, 0.92, "Full 负责从全文里挑块。Reindex 不再扫全文。Reuse 连挑块都不做，沿用上一层的结果。")
     stages = [
         (SOFT, NAVY, INK, "1  全文", "每个 token 存 890 字节。\n这是冷数据。\nDecode 不整段重读。"),
@@ -243,7 +293,7 @@ def slide_csa2(prs, blank):
 
 def slide_three(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 6, "同一份数据，三条路", "左：全放 HBM    ·    中：走 HOST DDR    ·    右：交换 HBM + DDR 池")
+    ui.chrome(slide, 7, "同一份数据，三条路", "左：全放 HBM    ·    中：走 HOST DDR    ·    右：交换 HBM + DDR 池")
     ui.banner(slide, 0.90, "箭头是 Decode 每一步的热路径。索引和滑窗三种方案都留在 GPU。")
     cols = [
         (0.36, NAVY, "全放 HBM"),
@@ -275,7 +325,7 @@ def slide_three(prs, blank):
 
 def slide_compare(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 7, "差别只在热数据走哪条带宽", "容量墙和每步带宽一起决定批量")
+    ui.chrome(slide, 8, "差别只在热数据走哪条带宽", "容量墙和每步带宽一起决定批量")
     ui.banner(slide, 0.92, "系统 TPS = 全局批 / 实际 TPOT。批量变大但步时更长时，TPS 可以下降。")
     r64 = v41.by_len(data, 65536)
     r4 = v41.by_len(data, 4194304)
@@ -302,7 +352,7 @@ def slide_compare(prs, blank, data):
 
 def slide_process(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 8, "分析就按这五步走", "数字来自 deepseek-v41-20t-n2-slo，这里不另算一套")
+    ui.chrome(slide, 9, "分析就按这五步走", "数字来自 deepseek-v41-20t-n2-slo，这里不另算一套")
     ui.banner(slide, 0.92, "前三步三种方案完全一样。从第四步起，只改 KV 放哪、每步从哪读。")
     steps = [
         ("1", "定模型", "V4.1-Flash 的 40 层、隐藏 5120、CSA2 不动。路由专家从 384 加到 14123，凑到 20T。Engram 196B 留在主机，不占 GPU。"),
@@ -322,7 +372,7 @@ def slide_process(prs, blank):
 
 def slide_takeaway(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 9, "在网 cache 只值当主 KV 已经放不下", "记住短上下文和 4M 这两头")
+    ui.chrome(slide, 10, "在网 cache 只值当主 KV 已经放不下", "记住短上下文和 4M 这两头")
     ui.banner(slide, 0.92, "缓存对象是 CSA2 的 2048 块，不是整段 KV。整段主 KV 在第三种方案里放 DDR 池。")
     r64 = v41.by_len(data, 65536)
     r4 = v41.by_len(data, 4194304)
@@ -373,6 +423,7 @@ def main():
     slide_question(prs, blank, data)
     slide_csa2_map(prs, blank)
     slide_attn(prs, blank)
+    slide_kv_1m(prs, blank)
     slide_placement(prs, blank)
     slide_csa2(prs, blank)
     slide_three(prs, blank)

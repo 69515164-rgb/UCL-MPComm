@@ -179,49 +179,50 @@ def slide_prod(prs):
         slide,
         3,
         "大型软件工程里，已经有几十到上百个 coding agent 同时在跑",
-        "AI coding    ·    三份一手工程记录，不是研究问答的多 agent",
-        "数字后的方括号对到页底",
+        "AI coding    ·    三份一手工程记录    ·    输入是总消耗，不是单次 prompt",
+        "数字后的方括号对到页底    ·    [1*] 是用原文两个数相除，原文没有这个商",
     )
-    ui.banner(slide, 0.92, "三份都是把一个大代码库交给一批 coding agent。同时在跑的个数和代码规模分开标。")
-    head = ["工程", "同时在跑", "代码规模和花费", "他们怎么组织"]
+    ui.banner(slide, 0.92, "三份都写出了总输入或总 token。只有编译器能按会话粗除，而且那是整段会话的累计，不是单次输入。")
+    head = ["工程", "同时在跑", "输入", "代码规模"]
     body = [
         [
             "C 编译器\nAnthropic\n2026-02-05 [1]",
-            "16 个 Claude 并行 [1]。\n没有总控 agent [1]。",
-            "约 2,000 次会话，约 2 万美元 [1]。\n约 10 万行 Rust，能编 Linux 6.9 [1]。",
-            "用 git 锁认领任务。编内核时 16 个 agent 卡在同一个错误上，改动互相覆盖 [1]。",
+            "16 个 Claude 并行，没有总控 [1]。\n编内核时会卡在同一个错误上，改动互相覆盖 [1]。",
+            "总输入 20 亿 token，输出 1.4 亿 [1]。\n约 2,000 次会话，相除约 100 万/会话 [1*]。\n整段会话累计。原文没有单次 prompt。\n每次从空容器开始 [1]。",
+            "约 10 万行 Rust，能编 Linux 6.9 [1]。\n费用不到 2 万美元 [1]。",
         ],
         [
-            "浏览器\nCursor [2]",
-            "几百个 agent 同时跑一个项目 [2]。",
-            "将近一周。超过 100 万行，约 1,000 个文件 [2]。\n累计 token 写成万亿级，那是总消耗，不是单次输入 [2]。",
-            "规划 agent 可以再派子规划。worker 不互相协调，做完自己的任务再提交 [2]。",
+            "浏览器等实验\nCursor [2]",
+            "几百个 agent 同时跑 [2]。\n规划可以再派子规划，worker 不互相协调 [2]。",
+            "这些实验合计万亿级 token [2]。\n原文没有单次输入，也没有把输入和输出分开。",
+            "浏览器将近一周，超过 100 万行，约 1,000 个文件 [2]。",
         ],
         [
             "Bun 从 Zig 移植到 Rust\n2026-05-03 至 05-14 [3]",
-            "约 50 条工作流 [3]。\n峰值 4 个工作区，每个 16 个 Claude，约 64 个同时在跑 [3]。",
-            "53.5 万行 Zig，6,502 次提交 [3]。\n未缓存输入 59 亿 token，缓存读 720 亿，输出 6.9 亿，约 16.5 万美元 [3]。",
-            "1 个实现者配 2 个以上审查者。审查在另一块上下文里，只找错误 [3]。",
+            "峰值 4 个工作区 × 16 个 Claude，约 64 个同时在跑 [3]。\n1 个实现者配 2 个以上审查者 [3]。",
+            "未缓存输入 59 亿，缓存读 720 亿，输出 6.9 亿 [3]。\n原文没有调用次数，除不出单次长度。\n审查者的上下文只有 diff [3]。",
+            "53.5 万行 Zig，6,502 次提交 [3]。\n约 16.5 万美元 [3]。",
         ],
     ]
     ui.add_table(
         slide,
-        0.28,
+        0.24,
         1.46,
-        [2.35, 3.15, 3.85, 3.40],
+        [2.20, 3.15, 4.35, 2.95],
         [head] + body,
-        [0.32, 1.22, 1.22, 1.38],
+        [0.30, 1.38, 1.18, 1.38],
         ["head", "body", "body", "body"],
         size=11,
     )
     note(
         slide,
-        5.74,
-        1.30,
-        "[1] Nicholas Carlini，Building a C compiler with a team of parallel Claudes，2026-02-05。anthropic.com/research/building-c-compiler。\n"
-        "[2] Cursor，Scaling long-running autonomous coding。cursor.com/blog/scaling-agents。博文写的是 hundreds，没有给出精确峰值。\n"
-        "[3] Jarred Sumner，Rewriting Bun in Rust，2026-07-08。bun.com/blog/bun-in-rust。64 是峰值同时在跑，不是一共只有 64 个 agent。",
-        12,
+        5.82,
+        1.22,
+        "[1] Carlini，Building a C compiler with parallel Claudes，2026-02-05。20 亿输入、1.4 亿输出、约 2,000 次会话、不到 2 万美元。\n"
+        "[1*] 100 万/会话 = 20 亿 ÷ 约 2,000。原文没有这个商。一次会话里有多次调用，所以大于单次 prompt。\n"
+        "[2] Cursor，cursor.com/blog/scaling-agents。万亿级是 trillions of tokens，跨多个实验。hundreds 没有精确峰值。\n"
+        "[3] Sumner，Rewriting Bun in Rust，2026-07-08。64 是峰值同时在跑。原文没有请求条数。",
+        11,
     )
 
 

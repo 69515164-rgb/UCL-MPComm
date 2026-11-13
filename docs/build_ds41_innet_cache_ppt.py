@@ -182,6 +182,9 @@ def slide_kv_1m(prs, blank):
     dec_all = dec_entries * ENTRY_B
     enc_top = 3 * 512 * MAIN_B
     dec_top = 512 * MAIN_B
+    swa_b = 512
+    enc_swa = 20 * 128 * swa_b
+    dec_swa = 20 * 128 * swa_b
     ui.gold(
         slide,
         1.42,
@@ -191,23 +194,23 @@ def slide_kv_1m(prs, blank):
         "全量 KV = 条目数 × 356。356 = 288 + 68。编码器是 534 S 字节，解码器是 356 S 字节。",
         14,
     )
-    head = ["", "条目数", "全量 KV", "主 KV", "Top-512"]
+    head = ["", "条目数", "全量 KV", "主 KV", "Top-512", "滑窗"]
     body = [
-        ["编码器", f"3 × {S1M // 2:,}", mb(enc_all), mb(enc_main), mb(enc_top)],
-        ["解码器", f"{dec_entries:,}", mb(dec_all), mb(dec_main), mb(dec_top)],
-        ["合计", f"{enc_entries + dec_entries:,}", mb(enc_all + dec_all), mb(enc_main + dec_main), mb(enc_top + dec_top)],
+        ["编码器", f"3 × {S1M // 2:,}", mb(enc_all), mb(enc_main), mb(enc_top), mb(enc_swa)],
+        ["解码器", f"{dec_entries:,}", mb(dec_all), mb(dec_main), mb(dec_top), mb(dec_swa)],
+        ["合计", f"{enc_entries + dec_entries:,}", mb(enc_all + dec_all), mb(enc_main + dec_main), mb(enc_top + dec_top), mb(enc_swa + dec_swa)],
     ]
     kinds = ["head", "body", "body", "sum"]
     ui.add_table(
-        slide, 0.36, 2.72, [1.70, 2.35, 2.55, 2.55, 2.40],
-        [head] + body, [0.40, 0.52, 0.52, 0.52], kinds, size=14,
+        slide, 0.32, 2.72, [1.35, 2.15, 2.15, 2.15, 2.05, 2.15],
+        [head] + body, [0.40, 0.52, 0.52, 0.52], kinds, size=13,
     )
     ui.textbox(
-        slide, 0.40, 4.85, 12.5, 1.95,
+        slide, 0.36, 4.85, 12.6, 1.95,
         "编码器 Top-512 是三组独立主 KV 上各 512 条：3×512×288 = 442,368 字节。组与组不共用条目，所以三份都计入。\n"
         "解码器 Top-512 是层 20 选出的 512×288 = 147,456 字节。24、28、32、36 也各选 512，但下标落在层 20 这一份主 KV 上，不另占主 KV 容量。\n"
-        "候选池是另一回事：层 20 按块留下最多 2048×8 = 16,384 条，16,384×288 = 4.72 MB，给 Reindex 当搜索范围。它大于解码器这一列的 Top-512。\n"
-        "合计全量 KV = 890 × S = 933.23 MB，和每 token 890 字节一致。滑窗 40×128 不在这张表里。",
+        "滑窗 = 层数 × 128 × 512 字节，FP8，每层自己一份，不随 S 再涨。编码器 20 层、解码器 20 层各 1.31 MB，合计 40×128×512 = 2.62 MB。\n"
+        "合计全量 KV = 890 × S = 933.23 MB。再加上滑窗是 935.85 MB。候选池 16,384×288 = 4.72 MB 仍是层 20 主 KV 里的搜索范围，不在滑窗列。",
         14, False, INK, anchor=MSO_ANCHOR.TOP,
     )
 

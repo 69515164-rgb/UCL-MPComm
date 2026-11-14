@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""N+2 20T V4.1 with TP removed, and two decode-pool groupings.
+"""N+2 20T V4.1 with TP removed, and the corrected decode offload.
 
-Hardware matches the no-TP V4 deck: parameter plane 1.6 Tb/s, D2D
-57.6 Tb/s per GPU, Prefill 64 cards, Decode 256 cards, TP=1.
-The model is the V4.1-Flash skeleton extrapolated to 20T.
+A node is 2 CPUs x 4 GPUs. Each GPU has a 1.6 Tb/s unidirectional
+H2D link. Each CPU has 2 TB/s and 2 TB of DDR, shared by its 4 GPUs.
+Usable H2D is 80% of the line rate, 160 GB/s, which is below the
+500 GB/s DDR share, so host reads move at 160 GB/s. The per-GPU
+share of the 2 TB is 500 GB.
 
-KV is 890 bytes per token. The indexer, the sliding window and the
-three encoder Top-512 groups stay on the GPU. Each decode step moves
-only the 4.72 MB candidate pool (2048 blocks x 8 positions).
-
-Group 1 is only the on-network cache: 29952 GB at 51.2 Tb/s, split
-evenly across 256 cards. A batch that would overflow that cap does
-not fit. Group 2 keeps that cache as tier 1 and spills the rest into
-an unlimited DDR pool at 6.4 Tb/s. The baseline is HBM plus 96 GB of
-host DDR per card at 160 GB/s.
+Layer-20 main KV, the indexer and the sliding window stay on the GPU.
+An encoder group's main KV (S/2 x 288) is live only while that group
+runs. Groups that do not fit beside layer 20 are read from host DDR,
+the on-net cache, or the second-tier DDR pool. The candidate pool is
+not a separate offload.
 """
 
 from __future__ import annotations
@@ -63,8 +61,14 @@ D2D = 57.6e12 / 8 * 0.80
 PARAM = 1.6e12 / 8 * 0.80
 PREFIX_25 = 1.6e12 / 8 * 0.25
 PREFIX_100 = 1.6e12 / 8
-HOST = min(1.6e12 / 8 * 0.80, 2e12 * 0.80 / 8)
-DDR_CAP = 96e9
+H2D_LINE = 1.6e12
+H2D = H2D_LINE / 8 * 0.80
+CPU_DDR_BW = 2e12
+CPU_DDR_CAP = 2e12
+GPUS_PER_CPU = 4
+DDR_SHARE_BW = CPU_DDR_BW / GPUS_PER_CPU
+HOST = min(H2D, DDR_SHARE_BW)
+DDR_CAP = CPU_DDR_CAP / GPUS_PER_CPU
 POOL_51 = 51.2e12 / 8
 POOL_64 = 6.4e12 / 8
 POOL_51_TOTAL = 29952e9
@@ -178,26 +182,32 @@ def prefill(bs, s, bw, hit=HIT):
     }
 
 
-def _place(bs, s):
+def _resident(bs, s):
+    """Layer-20 main KV and the indexer stay on the GPU.
+
+    Each encoder group is S/2 x 288 and is live only while that group
+    runs. Groups that still fit beside layer 20 stay on the GPU; the
+    others are read from outside, one group at a time.
+    """
     n = math.ceil(bs / DP)
-    idx = n * index_seq(s)
-    main = n * main_seq(s)
-    if idx > ROOM_GPU + 1.0 or main <= 0:
+    pin = n * (index_seq(s) + s * MAIN)
+    group = n * (s / 2.0) * MAIN
+    if pin > ROOM_GPU + 1.0 or pin + group > ROOM_GPU + 1.0:
         return None
-    overflow = max(main - (ROOM_GPU - idx), 0.0)
-    return n, main, overflow
+    slots = min(3, int(math.floor((ROOM_GPU - pin + 1.0) / group))) if group > 1.0 else 3
+    slots = max(slots, 1)
+    ext = 3 - slots
+    return n, group, ext, ext * group
 
 
-def _time(bs, s, n, main, overflow, parts):
-    moved = offload_bytes(s)
-    spill = overflow / main if main else 0.0
+def _time_ext(bs, s, n, parts):
     t_swap = 0.0
-    if main:
-        for part, bw in parts:
-            t_swap += n * moved * (part / main) / bw
-    pinned = 3 * min(512.0, s / 2.0) * MAIN
-    resident = (1.0 - spill) * moved
-    t_hbm = (n * (index_read(s) + pinned + resident) + ATTN) / HBM_BW
+    for part, bw in parts:
+        if part > 0:
+            t_swap += part / bw
+    pinned = n * 3 * min(512.0, s / 2.0) * MAIN
+    pool = n * offload_bytes(s)
+    t_hbm = (n * index_read(s) + pinned + pool + ATTN) / HBM_BW
     t_ca = n * (score_flops(s) + 2 * ATTN) / (PEAK * align(n))
     moe = expert(float(bs), N, L)
     return {
@@ -210,59 +220,55 @@ def _time(bs, s, n, main, overflow, parts):
         "tg": moe["tg"],
         "tc": moe["tc"],
         "n": n,
-        "ddr": overflow,
     }
 
 
 def decode_host(bs, s):
-    placed = _place(bs, s)
+    placed = _resident(bs, s)
     if placed is None:
         return None
-    n, main, overflow = placed
-    if overflow > DDR_CAP + 1.0:
+    n, group, ext, external = placed
+    if external > DDR_CAP + 1.0:
         return None
-    return _time(bs, s, n, main, overflow, [(overflow, HOST)] if overflow else [])
+    row = _time_ext(bs, s, n, [(external, HOST)] if external else [])
+    row["ddr"] = external
+    row["ext"] = ext
+    row["group"] = group
+    return row
 
 
 def decode_cache(bs, s):
-    """Only the on-net cache. Overflow above 29952 GB does not fit."""
-    placed = _place(bs, s)
+    """Encoder groups that miss HBM must fit in the on-net cache."""
+    placed = _resident(bs, s)
     if placed is None:
         return None
-    n, main, overflow = placed
-    if overflow > POOL_51_CAP + 1.0:
+    n, group, ext, external = placed
+    if external > POOL_51_CAP + 1.0:
         return None
-    row = _time(bs, s, n, main, overflow, [(overflow, POOL_51)] if overflow else [])
-    row["pool"] = overflow * N
+    row = _time_ext(bs, s, n, [(external, POOL_51)] if external else [])
+    row["pool"] = external * N
+    row["ext"] = ext
+    row["group"] = group
     return row
 
 
 def decode_tier(bs, s, tier2_bw=POOL_64):
-    placed = _place(bs, s)
+    placed = _resident(bs, s)
     if placed is None:
         return None
-    n, main, overflow = placed
-    tier1 = min(overflow, POOL_51_CAP)
-    tier2 = overflow - tier1
+    n, group, ext, external = placed
+    tier1 = min(external, POOL_51_CAP)
+    tier2 = external - tier1
     parts = []
     if tier1:
         parts.append((tier1, POOL_51))
     if tier2:
         parts.append((tier2, tier2_bw))
-    row = _time(bs, s, n, main, overflow, parts)
+    row = _time_ext(bs, s, n, parts)
     row["tier1"] = tier1 * N
     row["tier2"] = tier2 * N
-    return row
-
-
-def decode_pool(bs, s, bw):
-    """One unlimited DDR pool. The whole main-KV overflow moves at bw."""
-    placed = _place(bs, s)
-    if placed is None:
-        return None
-    n, main, overflow = placed
-    row = _time(bs, s, n, main, overflow, [(overflow, bw)] if overflow else [])
-    row["pool"] = overflow * N
+    row["ext"] = ext
+    row["group"] = group
     return row
 
 
@@ -402,7 +408,7 @@ def stage_cell(part, total):
 def slide_open(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 1, "64K 到 4M 都能对上两组目标", "V4.1 外扩 20T    ·    Prefill 64 卡    ·    基线拉 KV 50 GB/s")
-    ui.banner(slide, 0.92, "一组目标是 TTFT ≤ 10 秒且 TPOT ≤ 10 毫秒。另一组把 TPOT 放宽到 30 毫秒。Decode 基线是 HBM 加每卡主机 96 GB。")
+    ui.banner(slide, 0.92, f"一组目标是 TTFT ≤ 10 秒且 TPOT ≤ 10 毫秒。另一组把 TPOT 放宽到 30 毫秒。Decode 基线是 HBM 加主机 DDR，每卡分到 {DDR_CAP/1e9:.0f} GB、{HOST/1e9:.0f} GB/s。")
     r64, r4 = data["rows"][0], data["rows"][-1]
     head = ["约束", "64K 全局批", "64K 系统 TPS", "4M 全局批", "4M 系统 TPS", "4M 实际耗时"]
     body = [
@@ -417,7 +423,7 @@ def slide_open(prs, blank, data):
         3.20,
         f"冷请求不拉 prefix。单条冷请求摸到 10 秒的输入是 {data['cold_s']:,}。4M 冷请求 TTFT {sec(data['cold4'])}。\n"
         f"99.5% 命中的单条请求可以到 {data['hit_s']:,}。批量摸高仍看 64K 到 4M 这七档。\n"
-        f"单条 Decode 在输入 {data['dec_cap_s']:,} 时先顶到每卡主机 96 GB，TPOT {ms2(data['dec_cap_t'])} 毫秒，到不了 10 毫秒。\n"
+        f"单条 Decode 在输入 {data['dec_cap_s']:,} 时先顶到 GPU 房间，TPOT {ms2(data['dec_cap_t'])} 毫秒。主机每卡 {DDR_CAP/1e9:.0f} GB 装的是没留在 GPU 的编码器组。\n"
         "系统 Prefill TPS = 全局批 × 输入长度 / 实际 TTFT。系统 Decode TPS = 全局批 / 实际 TPOT。只有在网 cache 在第 7、8 页。在网 cache 再加 6.4 Tb/s 的 2 级池在第 9、10 页。",
         14,
     )
@@ -473,8 +479,8 @@ def slide_split(prs, blank, data):
         slide,
         5.00,
         1.85,
-        f"Prefill 固定 64 卡。64K 基线是每卡 {fmt_bs(n64)} 条，每卡 KV {kv64:.0f} GB，房间 {PF_ROOM/1e9:.0f} GB 放得下。\n"
-        f"Decode 每卡 KV 房间 {ROOM_GPU/1e9:.1f} GB。索引必须整段留在这间房间里，主 KV 装不下的部分才进主机或在网 cache。\n"
+        f"一节点 2 个 CPU，各接 4 张 GPU。Prefill 固定 64 卡。64K 基线是每卡 {fmt_bs(n64)} 条，每卡 KV {kv64:.0f} GB，房间 {PF_ROOM/1e9:.0f} GB 放得下。\n"
+        f"Decode 每卡 KV 房间 {ROOM_GPU/1e9:.1f} GB。索引和层 20 主 KV 留在这间房间里。编码器一组用完就让出，放不下的组从主机或在网 cache 读。\n"
         f"专家表 {ROUTED/1e12:.3f} TB。EP 降到 16 时单是路由专家就有 {ROUTED/16/1e9:.0f} GB，KV 没有地方放，所以 Decode 维持 EP=256。",
         14,
     )
@@ -506,10 +512,10 @@ def slide_formula(prs, blank):
             "TPOT    ·    Decode 256 卡",
             [
                 ["n", "ceil(全局批 / 256)"],
-                ["存量", "索引 2.5×S×68 + 滑窗留在 GPU\n主 KV = 2.5×S×288"],
-                ["溢出", f"max(n×主KV − ({room} GB − n×索引), 0)"],
-                ["换入", "溢出 / 主KV × n × 4.72 MB / BW"],
-                ["带宽", f"基线 H2D 160 GB/s，每卡 96 GB\n组 1 在网 cache {POOL_51/1e12:.2f} TB/s，合计 {POOL_51_TOTAL/1e9:.0f} GB\n组 2 的 2 级 {POOL_64/1e12:.2f} TB/s，容量不限"],
+                ["存量", "索引和层 20 主 KV 留在 GPU\n编码器一组 = S/2×288，用完让出"],
+                ["外读", "3 − GPU 上放得下的组数"],
+                ["换入", "外读组数 × n × S/2 × 288 / BW"],
+                ["带宽", f"H2D 1.6 Tb/s×80% = {H2D/1e9:.0f} GB/s\nCPU DDR {CPU_DDR_BW/1e12:.0f} TB/s、{CPU_DDR_CAP/1e12:.0f} TB，4 卡分 {DDR_SHARE_BW/1e9:.0f} GB/s、{DDR_CAP/1e9:.0f} GB\n换入取 {HOST/1e9:.0f} GB/s。cache {POOL_51/1e12:.2f} TB/s"],
                 ["HBM", "索引全文 + Top-512 + 留在 GPU 的候选池"],
                 ["计算", "n × (F_score + 2×注意力) / (33.60 P × align(n))"],
                 ["MoE", "40 层 dispatch / combine，D2D 5.76 TB/s"],
@@ -570,11 +576,11 @@ def slide_cmp(prs, blank, data):
 
 def slide_decode(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 6, "Decode 基线：HBM 加每卡主机 96 GB", "换入 160 GB/s    ·    每步搬走的是 4.72 MB 候选池里的溢出比例")
+    ui.chrome(slide, 6, "Decode 基线：HBM 加主机 DDR", f"换入 {HOST/1e9:.0f} GB/s    ·    每卡 {DDR_CAP/1e9:.0f} GB    ·    读的是没留在 GPU 的编码器组")
     ui.banner(
         slide,
         0.90,
-        "耗时单位毫秒。TPOT = 换入 + max(HBM, 计算) + 派发 + max(权重, GEMM) + 合并。索引和滑窗留在 GPU，不进主机。",
+        "耗时单位毫秒。层 20 主 KV 留在 GPU。编码器一组用完让出，放不下的组整组从主机读。TPOT = 换入 + max(HBM, 计算) + 派发 + max(权重, GEMM) + 合并。",
         size=12,
     )
     head = ["输入", "约束", "批", "换入", "HBM", "计算", "派发", "权重", "GEMM", "合并", "TPOT"]
@@ -614,8 +620,8 @@ def slide_tier(prs, blank, data, page, tag, title, key="tier", tier2_name="6.4 T
     ui.solid(legend, ui.PALE)
     ui.textbox(
         slide, 0.46, 0.94, 12.40, 0.66,
-        f"主 KV 的溢出先填 1 级在网 cache。256 卡合计 {cap} GB，均分后每卡 {POOL_51_CAP/1e9:.0f} GB，带宽 {POOL_51/1e12:.2f} TB/s。剩下的进 2 级 DDR 池，带宽 {tier2_tb:.2f} TB/s，容量不限。\n"
-        f"换入 = 4.72 MB × n × 1 级占比 / {POOL_51/1e12:.2f} TB/s + 4.72 MB × n × 2 级占比 / {tier2_tb:.2f} TB/s。Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。",
+        f"没留在 GPU 的编码器组先填 1 级在网 cache。256 卡合计 {cap} GB，每卡 {POOL_51_CAP/1e9:.0f} GB，带宽 {POOL_51/1e12:.2f} TB/s。剩下的进 2 级 DDR 池，带宽 {tier2_tb:.2f} TB/s。\n"
+        f"一组 = n×S/2×288。层 20 主 KV 留在 GPU，不写出再读回。基线是主机 DDR，每卡 {DDR_CAP/1e9:.0f} GB、{HOST/1e9:.0f} GB/s。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
     head = ["输入", "基线批", "基线毫秒", "基线吞吐", "两级批", "两级毫秒", "1 级总量", "2 级总量", "两级吞吐", "相对基线"]
@@ -669,7 +675,7 @@ def slide_tier(prs, blank, data, page, tag, title, key="tier", tier2_name="6.4 T
         f"1 级 {mem_total(r4[f'd{key}{tag}']['tier1'])}，2 级 {mem_total(r4[f'd{key}{tag}']['tier2'])}，"
         f"吞吐相对基线 {signed_pct(tps_d(r4[f'{key}{tag}'], r4[f'd{key}{tag}']), tps_d(r4[f'h2d{tag}'], r4[f'dh2d{tag}']))}。"
         + (
-            f"\n4M 再加 1 条，索引就超过每卡 {ROOM_GPU/1e9:.1f} GB 的 GPU 房间，批停在这里。"
+            "\n4M 再加 1 条，GPU 上就少放下一组编码器主 KV，第二组读入超过 30 毫秒。"
             if tag == "30" and r4[f"d{key}{tag}"]["t"] < 0.030
             else ""
         ),
@@ -689,13 +695,13 @@ def slide_pool(prs, blank, data, page, tag, key, label, bw, cap_total=None):
     legend = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.32), Inches(0.92), Inches(12.68), Inches(0.70))
     ui.solid(legend, ui.PALE)
     if cap_total is None:
-        place = "溢出的主 KV 全部进这一档池，容量不限。"
+        place = "没留在 GPU 的编码器组全部进这一档池，容量不限。"
     else:
-        place = f"只有在网 cache，没有 2 级池。256 卡合计 {cap_total/1e9:.0f} GB，均分后每卡 {cap_total/N/1e9:.0f} GB。一条批的溢出超过这个上限就放不下。"
+        place = f"只有在网 cache。256 卡合计 {cap_total/1e9:.0f} GB，每卡 {cap_total/N/1e9:.0f} GB。编码器组超出这个上限就放不下。"
     ui.textbox(
         slide, 0.46, 0.94, 12.40, 0.66,
-        f"{place}换入 = 4.72 MB × n × 溢出比例 / {tb:.2f} TB/s。\n"
-        "Top-512 留在 GPU。基线是 HBM 加每卡主机 96 GB、160 GB/s。池总量是 256 卡相加。相对基线是系统吞吐的提升。",
+        f"{place}一组 = n×S/2×288，按组数整组读入。\n"
+        f"层 20 主 KV 留在 GPU。基线是主机 DDR，每卡 {DDR_CAP/1e9:.0f} GB、{HOST/1e9:.0f} GB/s。池总量是 256 卡相加。",
         12, True, TEAL, anchor=MSO_ANCHOR.MIDDLE,
     )
     head = ["输入", "基线批", "基线毫秒", "基线吞吐", "池批", "池毫秒", "池总量", "池吞吐", "相对基线"]
@@ -742,7 +748,7 @@ def slide_pool(prs, blank, data, page, tag, key, label, bw, cap_total=None):
         f"4M 池批 {fmt_bs(r4[f'{key}{tag}'])}，TPOT {ms2(r4[f'd{key}{tag}']['t'])} 毫秒，"
         f"池总量 {mem_total(r4[f'd{key}{tag}']['pool'])}，吞吐相对基线 {lift(r4)}。"
         + (
-            "\n512K 到 4M 与 10 毫秒是同一批：29952 GB 先满，TPOT 还低于 10 毫秒。"
+            "\n10 毫秒停在三组都还在 GPU 的批。30 毫秒多读一组，4M 这组还没把每卡 117 GB 装满。"
             if cap_total is not None and tag == "30"
             else ""
         ),

@@ -19,8 +19,10 @@ the highest throughput that still meets TPOT. The baseline is HBM only.
 from __future__ import annotations
 
 import importlib.util
+import math
 
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR
 from pptx.util import Emu, Inches
 
@@ -40,10 +42,20 @@ T1_BW = v4.POOL_51
 T1_TOTAL = 29184e9
 T1_CAP = T1_TOTAL / v4.N
 T2_BW = 6.4e12 / 8
+HOST_BW = min(1.6e12 / 8 * 0.80, 2e12 / 4)
+DDR_CAP = 2e12 / 4
 TIE = 1e-4
 SEL_BYTES = v4.N_CSA * 1024 * 576
+C_HOT = "1B4F8A"
+C_COLD = "8FCBB8"
+C_CACHE = "3D7CC9"
+C_DDR = "E07A3D"
+C_INDEX = "1B4F8A"
+C_HCA = "5B8FA8"
+C_WIN = "C4A35A"
+C_LAT = "E07A3D"
 
-SLIDES = 7
+SLIDES = 10
 FOOTER = "N+2    ·    20T V4    ·    Decode DP=256 EP=256    ·    一级 29184 GB · 51.2 Tb/s    ·    二级 6.4 Tb/s · 容量不限"
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
@@ -103,6 +115,35 @@ def decode_tier(n, s):
     }
 
 
+def decode_host(n, s):
+    """Hot stays on HBM. Cold fills the rest of HBM, then up to 500 GB of CPU DDR."""
+    hot, cold, cold_read = hot_cold(s)
+    need_h = n * hot
+    need_c = n * cold
+    hbm_h = min(need_h, v4.ROOM_GPU)
+    hbm_c = min(need_c, v4.ROOM_GPU - hbm_h)
+    rest_h = need_h - hbm_h
+    rest_c = need_c - hbm_c
+    if rest_h + rest_c > DDR_CAP + 1.0:
+        return None
+    b_hot = n * hot * (rest_h / need_h) if need_h else 0.0
+    b_cold = n * cold_read * (rest_c / need_c) if need_c else 0.0
+    base = decode_tier(n, s)
+    swap = (b_hot + b_cold) / HOST_BW
+    other = max(base["hbm"], base["ca"])
+    return {
+        "t": other + max(swap, base["moe"]),
+        "swap": swap,
+        "moe": base["moe"],
+        "hbm": base["hbm"],
+        "n": n,
+        "hbm_h": hbm_h,
+        "hbm_c": hbm_c,
+        "ddr_h": rest_h,
+        "ddr_c": rest_c,
+    }
+
+
 def decode_uniform(n, s):
     """Spill is a byte fraction of the whole KV, hot and cold together."""
     kept = n * v4.store_seq(s)
@@ -136,7 +177,7 @@ def search(s, limit, fn):
     n = 1
     while n < 200000:
         row = fn(n, s)
-        if row["t"] > limit + 1e-12:
+        if row is None or row["t"] > limit + 1e-12:
             break
         last = (n, row)
         best = _keep(best, n * v4.N / row["t"], n, row)
@@ -167,6 +208,8 @@ def collect():
             item[f"hbm{tag}"] = hbm_search(s, limit)
             best, last = search(s, limit, decode_tier)
             item[f"tier{tag}"] = {"best": best, "last": last}
+        best, last = search(s, 0.030, decode_host)
+        item["host30"] = {"best": best, "last": last}
         rows.append(item)
     return {"rows": rows}
 
@@ -194,6 +237,56 @@ def signed_pct(new, old):
 
 def ms2(v):
     return v4.ms2(v)
+
+
+def gb_pie(n):
+    if n >= 1e12:
+        return f"{n / 1e12:.2f} TB"
+    if n >= 1e9:
+        return f"{n / 1e9:.1f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.0f} MB"
+    return "0"
+
+
+def share(slices):
+    total = sum(v for _label, v, _color in slices)
+    if total <= 0:
+        return total, [0.0] * len(slices)
+    raw = [v / total * 100 for _label, v, _color in slices]
+    rounded = [round(x, 1) for x in raw]
+    drift = round(100.0 - sum(rounded), 1)
+    biggest = max(range(len(slices)), key=lambda i: slices[i][1])
+    rounded[biggest] = round(rounded[biggest] + drift, 1)
+    return total, rounded
+
+
+def add_pie(slide, cx, cy, r, slices):
+    alive = [(v, c) for _label, v, c in slices if v > 0]
+    if not alive:
+        return
+    if len(alive) == 1:
+        oval = slide.shapes.add_shape(
+            MSO_SHAPE.OVAL, Inches(cx - r), Inches(cy - r), Inches(2 * r), Inches(2 * r)
+        )
+        ui.solid(oval, alive[0][1])
+        return
+    total = sum(v for v, _c in alive)
+    theta = 0.0
+    for value, color in alive:
+        sweep = 360.0 * value / total
+        if sweep < 1.2:
+            theta += sweep
+            continue
+        steps = max(2, int(math.ceil(sweep / 6)))
+        pts = [(cx, cy)]
+        for i in range(steps + 1):
+            ang = math.radians(theta + sweep * i / steps)
+            pts.append((cx + r * math.sin(ang), cy - r * math.cos(ang)))
+        theta += sweep
+        builder = slide.shapes.build_freeform(Inches(pts[0][0]), Inches(pts[0][1]))
+        builder.add_line_segments([(Inches(x), Inches(y)) for x, y in pts[1:]], close=True)
+        ui.solid(builder.convert_to_shape(), color)
 
 
 def gb_seq(n):
@@ -537,6 +630,119 @@ def slide_ten(prs, blank, data):
     )
 
 
+def parts_tier(row):
+    return [
+        ("HBM 热", row["hbm_h"], C_HOT),
+        ("HBM 冷", row["hbm_c"], C_COLD),
+        ("cache", row["t1_h"] + row["t1_c"], C_CACHE),
+        ("二级", row["t2_h"] + row["t2_c"], C_DDR),
+    ]
+
+
+def parts_host(row):
+    return [
+        ("HBM 热", row["hbm_h"], C_HOT),
+        ("HBM 冷", row["hbm_c"], C_COLD),
+        ("CPU DDR", row["ddr_h"] + row["ddr_c"], C_DDR),
+    ]
+
+
+def parts_hbm(s, n):
+    return [
+        ("索引", 480.0 * s * n, C_INDEX),
+        ("HCA", 139.5 * s * n, C_HCA),
+        ("滑窗", v4.FIXED * n, C_WIN),
+        ("压缩体", 4320.0 * s * n, C_LAT),
+    ]
+
+
+def pie_label(title, batch, slices):
+    total, _pct = share(slices)
+    return f"{title}\n批 {fmt_bs(batch)}\n合计 {gb_pie(total)}", slices
+
+
+def slide_pies(prs, blank, page, title, kicker, banner, columns, note):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, page, title, kicker)
+    ui.banner(slide, 0.90, banner, size=12)
+    gap = 12.90 / len(columns)
+    for i, (label, slices) in enumerate(columns):
+        x = 0.22 + i * gap
+        ui.textbox(slide, x, 1.38, gap - 0.06, 0.62, label, 11, True, NAVY, anchor=MSO_ANCHOR.MIDDLE)
+        add_pie(slide, x + gap / 2.0, 2.62, 0.46, slices)
+        _total, pct = share(slices)
+        items = []
+        for (name, value, color), p in zip(slices, pct):
+            shown = "<0.1%" if p == 0.0 and value > 0 else f"{p:.1f}%"
+            items.append((color, f"{name}  {shown}\n{gb_pie(value)}"))
+        ui.add_key(slide, x + 0.02, 3.18, gap - 0.10, items, size=10, row=0.44)
+    ui.gold(slide, 5.50, 1.50, note, 13)
+
+
+def occ_note(slices):
+    _total, pct = share(slices)
+    return "，".join(
+        f"{name} {gb_pie(value)}（{p:.1f}%）"
+        for (name, value, _color), p in zip(slices, pct)
+        if value >= 1e6
+    )
+
+
+def slide_pie_tier(prs, blank, data):
+    columns = []
+    for row in data["rows"]:
+        n, found = pack(row["tier30"])
+        columns.append(pie_label(fmt_len(row["S"]), n * v4.N, parts_tier(found)))
+    one = columns[4][1]
+    four = columns[-1][1]
+    slide_pies(
+        prs, blank, 8,
+        "二级池：HBM、在网 cache、二级 DDR 各放多少",
+        "30 毫秒吞吐最高的批    ·    每卡 KV    ·    热 = 索引 + HCA + 滑窗    ·    冷 = 压缩体",
+        "饼按这一批的 KV 字节。HBM 拆成热和冷。cache 是一级 114 GB。二级是总线 DDR。权重和预留不在饼里。",
+        columns,
+        f"1M：{occ_note(one)}。\n4M：{occ_note(four)}。\n七档的热数据都在 HBM，cache 和二级里只有压缩体。",
+    )
+
+
+def slide_pie_host(prs, blank, data):
+    columns = []
+    for row in data["rows"]:
+        n, found = pack(row["host30"])
+        columns.append(pie_label(fmt_len(row["S"]), n * v4.N, parts_host(found)))
+    one = columns[4][1]
+    four = columns[-1][1]
+    slide_pies(
+        prs, blank, 9,
+        "主机卸载：HBM 和 CPU DDR 各放多少",
+        f"30 毫秒吞吐最高的批    ·    CPU DDR 每卡 {DDR_CAP / 1e9:.0f} GB、{HOST_BW / 1e9:.0f} GB/s",
+        "热数据先放 HBM。HBM 剩下的房间放压缩体，放不下的进这张卡的 CPU DDR。DDR 没有热数据。",
+        columns,
+        f"1M：{occ_note(one)}。\n4M：{occ_note(four)}。\n"
+        f"每卡 DDR 上限 {DDR_CAP / 1e9:.0f} GB。4M 用了 {gb_pie(four[2][1])}。",
+    )
+
+
+def slide_pie_hbm(prs, blank, data):
+    columns = []
+    for row in data["rows"]:
+        n, _found = pack(row["hbm30"])
+        columns.append(pie_label(fmt_len(row["S"]), n * v4.N, parts_hbm(row["S"], n)))
+    win64 = columns[0][1][2][1]
+    tot64, pct64 = share(columns[0][1])
+    tot4, pct4 = share(columns[-1][1])
+    slide_pies(
+        prs, blank, 10,
+        "不卸载：HBM 里这条 KV 怎么拆",
+        "30 毫秒只放 HBM 的吞吐最高批    ·    每卡    ·    四块都在 GPU HBM",
+        "没有 cache，也没有 DDR。饼是 HBM 上这一批 KV 的内部构成：CSA 索引、HCA、滑窗、CSA 压缩体。",
+        columns,
+        f"64K 合计 {gb_pie(tot64)}，压缩体 {pct64[3]:.1f}%，索引 {pct64[0]:.1f}%，HCA {pct64[1]:.1f}%，滑窗 {pct64[2]:.1f}%（{gb_pie(win64)}）。\n"
+        f"4M 合计 {gb_pie(tot4)}，压缩体 {pct4[3]:.1f}%，索引 {pct4[0]:.1f}%，HCA {pct4[1]:.1f}%，滑窗 {pct4[2]:.1f}%。滑窗不随长度涨，饼上不再画这一丝。\n"
+        "七档的比例几乎一样，变的是每卡条数和这四块的字节。",
+    )
+
+
 def audit(prs):
     wide, low = Inches(13.333), Inches(7.50)
     bad = []
@@ -576,6 +782,9 @@ def main():
     slide_where(prs, blank, data)
     slide_walk(prs, blank, data)
     slide_ten(prs, blank, data)
+    slide_pie_tier(prs, blank, data)
+    slide_pie_host(prs, blank, data)
+    slide_pie_hbm(prs, blank, data)
     prs.save(PPT)
     print("slides", len(prs.slides), "overflow", audit(prs))
     for row in data["rows"]:
@@ -589,6 +798,8 @@ def main():
                 f" swap {ms2(tr['swap'])} moe {ms2(tr['moe'])}"
                 f" T2 {tr['t2_c']/1e9:.1f}"
             )
+        hn, hr = pack(row["host30"])
+        parts.append(f"host {hn} DDR {(hr['ddr_h']+hr['ddr_c'])/1e9:.1f}")
         print(" | ".join(parts))
 
 

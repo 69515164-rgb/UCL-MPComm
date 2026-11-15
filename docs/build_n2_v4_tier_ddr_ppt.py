@@ -55,7 +55,7 @@ C_HCA = "5B8FA8"
 C_WIN = "C4A35A"
 C_LAT = "E07A3D"
 
-SLIDES = 10
+SLIDES = 12
 FOOTER = "N+2    ·    20T V4    ·    Decode DP=256 EP=256    ·    一级 29184 GB · 51.2 Tb/s    ·    二级 6.4 Tb/s · 容量不限"
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
@@ -208,8 +208,8 @@ def collect():
             item[f"hbm{tag}"] = hbm_search(s, limit)
             best, last = search(s, limit, decode_tier)
             item[f"tier{tag}"] = {"best": best, "last": last}
-        best, last = search(s, 0.030, decode_host)
-        item["host30"] = {"best": best, "last": last}
+            best, last = search(s, limit, decode_host)
+            item[f"host{tag}"] = {"best": best, "last": last}
         rows.append(item)
     return {"rows": rows}
 
@@ -661,6 +661,62 @@ def pie_label(title, batch, slices):
     return f"{title}\n批 {fmt_bs(batch)}\n合计 {gb_pie(total)}", slices
 
 
+def slide_h2d(prs, blank, data, page, tag, title):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, page, title, f"TPOT ≤ {tag} 毫秒    ·    H2D 每卡 {DDR_CAP / 1e9:.0f} GB、{HOST_BW / 1e9:.0f} GB/s    ·    换入叠在 MoE 上")
+    ui.banner(
+        slide, 0.90,
+        "H2D 卸载是主机 DDR。全读 KV 先放 HBM，空位放 CSA latent，剩下的经 H2D 进主机 DDR。相对 H2D 是两级池的系统吞吐。",
+        size=12,
+    )
+    head = ["输入", "HBM 批", "HBM 吞吐", "H2D 批", "H2D 毫秒", "H2D 吞吐", "两级批", "两级吞吐", "相对 H2D"]
+    body, kinds = [], ["head"]
+    for row in data["rows"]:
+        hn, hr = pack(row[f"hbm{tag}"])
+        dn, dr = pack(row[f"host{tag}"])
+        tn, tr = pack(row[f"tier{tag}"])
+        kinds.append("key" if row["S"] in (1048576, 4194304) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_bs(hn * v4.N),
+            fmt_rate(tps_of(hn, hr)),
+            fmt_bs(dn * v4.N),
+            ms2(dr["t"]),
+            fmt_rate(tps_of(dn, dr)),
+            fmt_bs(tn * v4.N),
+            fmt_rate(tps_of(tn, tr)),
+            signed_pct(tps_of(tn, tr), tps_of(dn, dr)),
+        ])
+    shape = ui.add_table(
+        slide, 0.28, 1.46,
+        [0.85, 1.40, 1.30, 1.40, 1.20, 1.35, 1.45, 1.40, 1.45],
+        [head] + body,
+        [0.34] + [0.46] * len(body),
+        kinds,
+        size=12,
+    )
+    margins(shape)
+    one = data["rows"][4]
+    four = data["rows"][-1]
+    dn, dr = pack(one[f"host{tag}"])
+    tn, tr = pack(one[f"tier{tag}"])
+    d4, r4 = pack(four[f"host{tag}"])
+    t4, b4 = pack(four[f"tier{tag}"])
+    ui.gold(
+        slide,
+        5.40,
+        1.55,
+        f"1M：H2D 批 {fmt_bs(dn * v4.N)}，换入 {ms2(dr['swap'])} 毫秒，吞吐 {fmt_rate(tps_of(dn, dr))}。"
+        f"两级批 {fmt_bs(tn * v4.N)}，换入 {ms2(tr['swap'])} 毫秒，吞吐 {fmt_rate(tps_of(tn, tr))}，"
+        f"{signed_pct(tps_of(tn, tr), tps_of(dn, dr))}。\n"
+        f"4M：H2D 批 {fmt_bs(d4 * v4.N)}，吞吐 {fmt_rate(tps_of(d4, r4))}。"
+        f"两级批 {fmt_bs(t4 * v4.N)}，吞吐 {fmt_rate(tps_of(t4, b4))}，"
+        f"{signed_pct(tps_of(t4, b4), tps_of(d4, r4))}。\n"
+        f"H2D 是 {HOST_BW / 1e9:.0f} GB/s。两级池一级 {T1_BW / 1e12:.2f} TB/s，二级 {T2_BW / 1e12:.2f} TB/s。同样的 CSA latent，池上的换入更短，批可以更大。",
+        13,
+    )
+
+
 def slide_pies(prs, blank, page, title, kicker, banner, columns, note):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, page, title, kicker)
@@ -696,7 +752,7 @@ def slide_pie_tier(prs, blank, data):
     one = columns[4][1]
     four = columns[-1][1]
     slide_pies(
-        prs, blank, 8,
+        prs, blank, 10,
         "二级池：HBM、在网 cache、二级 DDR 各放多少",
         "30 毫秒吞吐最高的批    ·    全读 = CSA index + HCA + sliding window    ·    latent = CSA latent",
         "饼按这一批的 KV 字节。HBM 拆成全读和 CSA latent。cache 是一级 114 GB。二级是总线 DDR。权重和预留不在饼里。",
@@ -713,7 +769,7 @@ def slide_pie_host(prs, blank, data):
     one = columns[4][1]
     four = columns[-1][1]
     slide_pies(
-        prs, blank, 9,
+        prs, blank, 11,
         "主机卸载：HBM 和 CPU DDR 各放多少",
         f"30 毫秒吞吐最高的批    ·    CPU DDR 每卡 {DDR_CAP / 1e9:.0f} GB、{HOST_BW / 1e9:.0f} GB/s",
         "每步全读的 KV 先放 HBM。HBM 空出来的容量放 CSA latent，放不下的进这张卡的 CPU DDR。DDR 里没有全读 KV。",
@@ -732,7 +788,7 @@ def slide_pie_hbm(prs, blank, data):
     tot64, pct64 = share(columns[0][1])
     tot4, pct4 = share(columns[-1][1])
     slide_pies(
-        prs, blank, 10,
+        prs, blank, 12,
         "不卸载：HBM 里这条 KV 怎么拆",
         "30 毫秒只放 HBM 的吞吐最高批    ·    每卡    ·    四块都在 GPU HBM",
         "没有 cache，也没有 DDR。饼是 HBM 上这一批 KV 的内部构成：CSA index、HCA、sliding window、CSA latent。",
@@ -782,6 +838,8 @@ def main():
     slide_where(prs, blank, data)
     slide_walk(prs, blank, data)
     slide_ten(prs, blank, data)
+    slide_h2d(prs, blank, data, 8, "30", "30 毫秒：两级池相对 H2D 卸载的吞吐")
+    slide_h2d(prs, blank, data, 9, "10", "10 毫秒：两级池相对 H2D 卸载的吞吐")
     slide_pie_tier(prs, blank, data)
     slide_pie_host(prs, blank, data)
     slide_pie_hbm(prs, blank, data)
@@ -798,8 +856,12 @@ def main():
                 f" swap {ms2(tr['swap'])} moe {ms2(tr['moe'])}"
                 f" T2 {tr['t2_c']/1e9:.1f}"
             )
-        hn, hr = pack(row["host30"])
-        parts.append(f"host {hn} DDR {(hr['ddr_h']+hr['ddr_c'])/1e9:.1f}")
+        for tag in ("10", "30"):
+            hn, hr = pack(row[f"host{tag}"])
+            parts.append(
+                f"h2d{tag} {hn}/{ms2(hr['t'])}/{fmt_rate(tps_of(hn, hr))}"
+                f" DDR {(hr['ddr_h']+hr['ddr_c'])/1e9:.1f}"
+            )
         print(" | ".join(parts))
 
 

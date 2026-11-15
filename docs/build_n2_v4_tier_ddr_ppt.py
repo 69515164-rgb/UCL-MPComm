@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""N+2 20T V4 with a two-level KV pool, TP=1.
+
+Tier 1 is the in-network cache already used by the 29184 GB deck:
+29184 GB at 51.2 Tb/s (6.40 TB/s), shared as 114 GB per GPU. Tier 2 is
+a bus DDR pool at 6.4 Tb/s (0.80 TB/s) with no capacity cap. Both rates
+are line rate / 8, the same conversion as the cache, with no extra 80%.
+
+Placement follows what each step actually reads. The CSA index, the HCA
+KV and the sliding window are scanned in full, so they stay on GPU HBM.
+The CSA latent body is touched only at 1024 positions per layer, so the
+bytes that do not fit in HBM fill the cache and then the DDR pool.
+
+Swap of the next layer overlaps the current layer's MoE. TPOT is
+max(HBM, attention compute) + max(swap, MoE). The batch is the one with
+the highest throughput that still meets TPOT. The baseline is HBM only.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+
+from pptx import Presentation
+from pptx.enum.text import MSO_ANCHOR
+from pptx.util import Emu, Inches
+
+spec = importlib.util.spec_from_file_location(
+    "slo_ui", "/agent/repos/ucl-mpcomm/docs/build_deepseek_20t_slo_ppt.py"
+)
+ui = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ui)
+
+vspec = importlib.util.spec_from_file_location(
+    "v4", "/agent/repos/ucl-mpcomm/docs/build_n2_20t_notp_ppt.py"
+)
+v4 = importlib.util.module_from_spec(vspec)
+vspec.loader.exec_module(v4)
+
+T1_BW = v4.POOL_51
+T1_TOTAL = 29184e9
+T1_CAP = T1_TOTAL / v4.N
+T2_BW = 6.4e12 / 8
+TIE = 1e-4
+SEL_BYTES = v4.N_CSA * 1024 * 576
+
+SLIDES = 7
+FOOTER = "N+2    ·    20T V4    ·    Decode DP=256 EP=256    ·    一级 29184 GB · 51.2 Tb/s    ·    二级 6.4 Tb/s · 容量不限"
+ui.SLIDES = SLIDES
+ui.FOOTER = FOOTER
+NAVY, TEAL = ui.NAVY, ui.TEAL
+PPT = "/agent/repos/ucl-mpcomm/docs/N+2-20T-V4-两级池.pptx"
+
+
+def hot_cold(s):
+    hot = (480.0 + 139.5) * s + v4.FIXED
+    cold = 4320.0 * s
+    cold_read = v4.N_CSA * min(1024.0, s / 4.0) * 576
+    return hot, cold, cold_read
+
+
+def decode_tier(n, s):
+    hot, cold, cold_read = hot_cold(s)
+    need_h = n * hot
+    need_c = n * cold
+    hbm_h = min(need_h, v4.ROOM_GPU)
+    hbm_c = min(need_c, v4.ROOM_GPU - hbm_h)
+    rest_h = need_h - hbm_h
+    rest_c = need_c - hbm_c
+    t1_h = min(rest_h, T1_CAP)
+    t1_c = min(rest_c, T1_CAP - t1_h)
+    t2_h = rest_h - t1_h
+    t2_c = rest_c - t1_c
+    b1 = b2 = 0.0
+    if need_h:
+        b1 += n * hot * (t1_h / need_h)
+        b2 += n * hot * (t2_h / need_h)
+    if need_c:
+        b1 += n * cold_read * (t1_c / need_c)
+        b2 += n * cold_read * (t2_c / need_c)
+    sel = min(1024.0, s / 4.0)
+    score = v4.N_CSA * 4096 * s + v4.N_HCA * 2048 * s + v4.N_CSA * 262144 * (sel + 128)
+    read = n * v4.n_read(s)
+    t_hbm = (read + v4.ATTN) / v4.HBM_BW
+    t_ca = n * (score + v4.PROJ) / (v4.PEAK * v4.align(n))
+    moe = v4.expert(float(n * v4.DP))["t"]
+    swap = b1 / T1_BW + b2 / T2_BW
+    other = max(t_hbm, t_ca)
+    return {
+        "t": other + max(swap, moe),
+        "swap": swap,
+        "hbm": t_hbm,
+        "ca": t_ca,
+        "moe": moe,
+        "n": n,
+        "hbm_h": hbm_h,
+        "hbm_c": hbm_c,
+        "t1_h": t1_h,
+        "t1_c": t1_c,
+        "t2_h": t2_h,
+        "t2_c": t2_c,
+        "b1": b1,
+        "b2": b2,
+    }
+
+
+def decode_uniform(n, s):
+    """Spill is a byte fraction of the whole KV, hot and cold together."""
+    kept = n * v4.store_seq(s)
+    overflow = max(kept - v4.ROOM_GPU, 0.0)
+    t1 = min(overflow, T1_CAP)
+    t2 = overflow - t1
+    read = n * v4.n_read(s)
+    swap = 0.0
+    if kept:
+        swap = read * (t1 / kept) / T1_BW + read * (t2 / kept) / T2_BW
+    base = decode_tier(n, s)
+    other = max(base["hbm"], base["ca"])
+    base["swap"] = swap
+    base["t"] = other + max(swap, base["moe"])
+    return base
+
+
+def _keep(best, tps, n, row):
+    # best is (tps, n, row, peak). Ties stay within 0.01% of the peak itself,
+    # so a long flat slope cannot walk the batch away from the maximum.
+    if best is None or tps > best[3] * (1.0 + 1e-12):
+        return (tps, n, row, tps)
+    if tps >= best[3] * (1.0 - TIE) and n > best[1]:
+        return (tps, n, row, best[3])
+    return best
+
+
+def search(s, limit, fn):
+    best = None
+    last = None
+    n = 1
+    while n < 200000:
+        row = fn(n, s)
+        if row["t"] > limit + 1e-12:
+            break
+        last = (n, row)
+        best = _keep(best, n * v4.N / row["t"], n, row)
+        n += 1
+    return best, last
+
+
+def hbm_search(s, limit):
+    n_fit = int(v4.ROOM_GPU // v4.store_seq(s))
+    best = None
+    last = None
+    for n in range(1, n_fit + 1):
+        row = decode_tier(n, s)
+        if row["swap"] > 1e-9:
+            break
+        if row["t"] > limit + 1e-12:
+            break
+        last = (n, row)
+        best = _keep(best, n * v4.N / row["t"], n, row)
+    return {"best": best, "last": last, "n_fit": n_fit}
+
+
+def collect():
+    rows = []
+    for s in v4.LENGTHS:
+        item = {"S": s, "n_fit": int(v4.ROOM_GPU // v4.store_seq(s))}
+        for limit, tag in ((0.010, "10"), (0.030, "30")):
+            item[f"hbm{tag}"] = hbm_search(s, limit)
+            best, last = search(s, limit, decode_tier)
+            item[f"tier{tag}"] = {"best": best, "last": last}
+        rows.append(item)
+    return {"rows": rows}
+
+
+def pack(found):
+    _tps, n, row, _peak = found["best"]
+    return n, row
+
+
+def fmt_len(s):
+    return v4.fmt_len(s)
+
+
+def fmt_bs(n):
+    return v4.fmt_bs(n)
+
+
+def fmt_rate(v):
+    return v4.fmt_rate(v)
+
+
+def signed_pct(new, old):
+    return v4.signed_pct(new, old)
+
+
+def ms2(v):
+    return v4.ms2(v)
+
+
+def gb_seq(n):
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    return f"{n / 1e6:.1f} MB"
+
+
+def gb1(n):
+    if abs(n) < 1e6:
+        return "0"
+    if n >= 1e12:
+        return f"{n / 1e12:.2f} TB"
+    return f"{n / 1e9:.1f} GB"
+
+
+def tps_of(n, row):
+    return n * v4.N / row["t"]
+
+
+def margins(shape):
+    for cell in shape.table.iter_cells():
+        cell.margin_top = Inches(0.02)
+        cell.margin_bottom = Inches(0.02)
+        cell.margin_left = Inches(0.05)
+        cell.margin_right = Inches(0.04)
+
+
+def slide_open(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 1, "两级池把长上下文的批从 HBM 房间里抬出来", "TPOT ≤ 30 毫秒    ·    换入叠在其他层的 MoE 上    ·    取系统吞吐最大的批")
+    ui.banner(slide, 0.92, "一级是在网 cache，29184 GB、51.2 Tb/s，容量和带宽都不变。二级是总线 DDR，6.4 Tb/s，容量不限。对照只用 GPU HBM。")
+    head = ["输入", "HBM 批", "HBM 吞吐", "两级批", "TPOT", "换入", "两级吞吐", "相对 HBM"]
+    body, kinds = [], ["head"]
+    for row in data["rows"]:
+        hn, hr = pack(row["hbm30"])
+        tn, tr = pack(row["tier30"])
+        kinds.append("key" if row["S"] in (1048576, 4194304) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_bs(hn * v4.N),
+            fmt_rate(tps_of(hn, hr)),
+            fmt_bs(tn * v4.N),
+            f"{ms2(tr['t'])} 毫秒",
+            f"{ms2(tr['swap'])} 毫秒",
+            fmt_rate(tps_of(tn, tr)),
+            signed_pct(tps_of(tn, tr), tps_of(hn, hr)),
+        ])
+    shape = ui.add_table(
+        slide, 0.42, 1.48,
+        [1.05, 1.70, 1.55, 1.70, 1.45, 1.40, 1.70, 1.45],
+        [head] + body,
+        [0.36] + [0.48] * len(body),
+        kinds,
+        size=13,
+    )
+    margins(shape)
+    r1 = data["rows"][4]
+    r4 = data["rows"][-1]
+    r64 = data["rows"][0]
+    hn, hr = pack(r1["hbm30"])
+    tn, tr = pack(r1["tier30"])
+    h4, a4 = pack(r4["hbm30"])
+    t4, b4 = pack(r4["tier30"])
+    h64, a64 = pack(r64["hbm30"])
+    t64, b64 = pack(r64["tier30"])
+    ui.gold(
+        slide,
+        5.55,
+        1.45,
+        f"1M 从批 {fmt_bs(hn * v4.N)}、{fmt_rate(tps_of(hn, hr))} 提到批 {fmt_bs(tn * v4.N)}、{fmt_rate(tps_of(tn, tr))}，"
+        f"{signed_pct(tps_of(tn, tr), tps_of(hn, hr))}。换入 {ms2(tr['swap'])} 毫秒，MoE {ms2(tr['moe'])} 毫秒，刚好盖住。\n"
+        f"4M 从批 {fmt_bs(h4 * v4.N)} 提到 {fmt_bs(t4 * v4.N)}，吞吐 {signed_pct(tps_of(t4, b4), tps_of(h4, a4))}，TPOT {ms2(b4['t'])} 毫秒。\n"
+        f"64K 从批 {fmt_bs(h64 * v4.N)} 到 {fmt_bs(t64 * v4.N)}，只高 {signed_pct(tps_of(t64, b64), tps_of(h64, a64))}。"
+        f"这一档 MoE 有 {ms2(b64['moe'])} 毫秒，HBM 读先把吞吐拉下来，换入 {ms2(b64['swap'])} 毫秒还盖在 MoE 里面。",
+        14,
+    )
+
+
+def slide_bytes(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 2, "索引和 HCA 每步全扫，压缩体只抽 1024 个", "30 层 CSA    ·    31 层 HCA    ·    S ≥ 4K 时每层抽满 1024")
+    ui.banner(slide, 0.92, "热数据 = CSA 索引 + HCA + 滑窗，每步整段都读。冷数据 = CSA 压缩体，每步只读抽中的 1024 个 latent。")
+    head = ["输入", "一条 KV", "热数据", "冷数据", "每步热读", "每步冷读"]
+    body, kinds = [], ["head"]
+    for s in v4.LENGTHS:
+        hot, cold, cold_read = hot_cold(s)
+        kinds.append("key" if s == 1048576 else "body")
+        body.append([
+            fmt_len(s),
+            gb_seq(v4.store_seq(s)),
+            gb_seq(hot),
+            gb_seq(cold),
+            gb_seq(hot),
+            f"{cold_read / 1e6:.2f} MB",
+        ])
+    shape = ui.add_table(
+        slide, 0.42, 1.48,
+        [1.40, 2.10, 2.20, 2.20, 2.30, 2.30],
+        [head] + body,
+        [0.36] + [0.46] * len(body),
+        kinds,
+        size=14,
+    )
+    margins(shape)
+    n1, r1 = pack(data["rows"][4]["tier30"])
+    ui.gold(
+        slide,
+        5.45,
+        1.55,
+        f"1M 一条 {v4.store_seq(1048576) / 1e9:.3f} GB。热数据 {hot_cold(1048576)[0] / 1e9:.3f} GB，冷数据 {hot_cold(1048576)[1] / 1e9:.3f} GB。\n"
+        f"每步冷读固定 {SEL_BYTES / 1e6:.2f} MB，和上下文长度无关。二级只有 {T2_BW / 1e12:.2f} TB/s。\n"
+        f"1M 的吞吐最高点是每卡 {n1} 条，冷读换入 {ms2(r1['swap'])} 毫秒，盖在 MoE {ms2(r1['moe'])} 毫秒里面。",
+        14,
+    )
+
+
+def slide_place(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 3, "热数据先占 HBM，冷数据再填两级", "每张卡独立落点    ·    一条序列不跨卡")
+    ui.banner(slide, 0.92, "同一类数据在各级之间按字节占比分摊这一步的读。抽中的 1024 个 latent 事先不确定，所以按冷数据的占比取。")
+    head = ["顺序", "介质", "容量", "带宽", "放什么"]
+    room = v4.ROOM_GPU
+    body = [
+        ["1", "GPU HBM", f"每卡 {room / 1e9:.2f} GB", "26.40 TB/s", "先放全部热数据。剩下的房间放冷的压缩体"],
+        ["2", "一级 在网 cache", f"合计 {T1_TOTAL / 1e9:.0f} GB\n每卡 {T1_CAP / 1e9:.0f} GB", f"{T1_BW / 1e12:.2f} TB/s\n51.2 Tb/s", "HBM 放不下的热数据先放这里。然后放冷的压缩体"],
+        ["3", "二级 总线 DDR", "容量不限", f"{T2_BW / 1e12:.2f} TB/s\n6.4 Tb/s", "一级放不下的热数据，然后剩下的冷压缩体"],
+    ]
+    kinds = ["head", "key", "body", "body"]
+    shape = ui.add_table(
+        slide, 0.42, 1.48,
+        [1.10, 2.30, 2.40, 2.20, 4.50],
+        [head] + body,
+        [0.36, 0.85, 0.95, 0.95],
+        kinds,
+        size=14,
+    )
+    margins(shape)
+    bits = []
+    for row in (data["rows"][0], data["rows"][4], data["rows"][-1]):
+        _n, r = pack(row["tier30"])
+        bits.append(f"{fmt_len(row['S'])} 每卡 {gb1(r['t2_c'])}")
+    ui.gold(
+        slide,
+        5.00,
+        1.95,
+        "30 毫秒的七个最优点上，热数据全部留在 HBM，一级和二级都没有热数据。\n"
+        f"一级每卡 {T1_CAP / 1e9:.0f} GB 被冷的压缩体装满。二级只接一级放不下的压缩体：{'，'.join(bits)}。\n"
+        "换入字节 = 冷读 × 该级冷数据占比。热读走 HBM 的 26.40 TB/s，不进换入。\n"
+        "下一层要的那一份在上一层做 MoE 时换入。整步换入不长于整步 MoE，TPOT 里就只有 HBM 和 MoE。",
+        14,
+    )
+
+
+def slide_formula(prs, blank):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 4, "换入盖住 MoE 时，步时只剩 HBM 和 MoE", "n 是一张卡上的条数    ·    吞吐 = 全局批 / TPOT")
+    ui.banner(slide, 0.92, "HBM 仍按整段稀疏读计。换入只计落在池里的那一部分。落到卡上之后的读取已经含在 HBM 里。")
+    head = ["项", "公式"]
+    body = [
+        ["热 / 冷", "热 = 30×(S/4)×64 + 31×(S/128)×576 + 滑窗\n冷 = 30×(S/4)×576"],
+        ["每步冷读", f"30 × min(1024, S/4) × 576。S ≥ 4K 时是 {SEL_BYTES / 1e6:.2f} MB"],
+        ["换入", "（热读 × 一级热占比 + 冷读 × 一级冷占比）/ 6.40 TB/s\n+（热读 × 二级热占比 + 冷读 × 二级冷占比）/ 0.80 TB/s"],
+        ["HBM", "(n × Read + 19.35 GB) / 26.40 TB/s"],
+        ["TPOT", "max(HBM, 计算) + max(换入, MoE)"],
+        ["寻优", "TPOT ≤ 10 或 30 毫秒里，取全局批 / TPOT 最大的 n。并列时取更大的批"],
+    ]
+    kinds = ["head"] + ["key" if i in (2, 4) else "body" for i in range(6)]
+    heights = [0.32, 0.62, 0.48, 0.70, 0.42, 0.42, 0.48]
+    shape = ui.add_table(
+        slide, 0.42, 1.46,
+        [1.40, 11.10],
+        [head] + body,
+        heights,
+        kinds,
+        size=13,
+    )
+    margins(shape)
+    ui.gold(
+        slide,
+        5.55,
+        1.45,
+        "最优点上一级热占比和二级热占比都是 0，换入只剩冷读那一项。\n"
+        "换入短于 MoE 时，加一条序列只多付 HBM 和 MoE。批的增加盖得过这两项，吞吐上升。\n"
+        "换入长过 MoE 之后，多出来的换入直接加进 TPOT。1M 的最高点就卡在这两项相等的那一条。",
+        14,
+    )
+
+
+def slide_where(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 5, "最优点上一级装满冷数据，二级接剩下的冷数据", "30 毫秒的吞吐最大批    ·    每卡容量    ·    集群二级 = 每卡 × 256")
+    ui.banner(slide, 0.90, "热数据一列是 HBM 上的索引、HCA 和滑窗。一级冷、二级冷都是 CSA 压缩体。这两列没有热数据。", size=12)
+    head = ["输入", "每卡条数", "HBM 热", "HBM 冷", "一级冷", "二级冷", "集群二级"]
+    body, kinds = [], ["head"]
+    for row in data["rows"]:
+        n, r = pack(row["tier30"])
+        kinds.append("key" if row["S"] in (1048576, 4194304) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_bs(n),
+            gb1(r["hbm_h"]),
+            gb1(r["hbm_c"]),
+            gb1(r["t1_c"]),
+            gb1(r["t2_c"]),
+            gb1(r["t2_c"] * v4.N),
+        ])
+    shape = ui.add_table(
+        slide, 0.36, 1.46,
+        [1.05, 1.55, 1.55, 1.55, 1.55, 1.70, 2.55],
+        [head] + body,
+        [0.36] + [0.48] * len(body),
+        kinds,
+        size=13,
+    )
+    margins(shape)
+    r1 = data["rows"][4]
+    n, r = pack(r1["tier30"])
+    ui.gold(
+        slide,
+        5.55,
+        1.45,
+        f"1M 每卡 {n} 条。热数据 {gb1(r['hbm_h'])} 全在 HBM，HBM 还留着 {gb1(r['hbm_c'])} 的压缩体。\n"
+        f"一级 {gb1(r['t1_c'])} 满。二级每卡 {gb1(r['t2_c'])}，256 卡合计 {gb1(r['t2_c'] * v4.N)}。\n"
+        f"这一步从二级读出 {gb1(r['b2'])}，用 {T2_BW / 1e12:.2f} TB/s 走 {ms2(r['b2'] / T2_BW)} 毫秒；"
+        f"从一级读出 {gb1(r['b1'])}，走 {ms2(r['b1'] / T1_BW)} 毫秒。换入合计 {ms2(r['swap'])} 毫秒。",
+        14,
+    )
+
+
+def slide_walk(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    s = 1048576
+    n_fit = int(v4.ROOM_GPU // v4.store_seq(s))
+    n_full = n_fit
+    while decode_tier(n_full + 1, s)["t2_c"] <= 1.0:
+        n_full += 1
+    best_n = pack(data["rows"][4]["tier30"])[0]
+    ui.chrome(slide, 6, "1M：换入追上 MoE 的那一条吞吐最高", "每卡从 HBM 装满扫到换入露出")
+    ui.banner(
+        slide,
+        0.92,
+        f"{n_fit} 条把 HBM 装满。{n_full} 条时一级还没溢出到二级。{best_n} 条换入和 MoE 对齐，{best_n + 1} 条换入开始露出。",
+    )
+    marks = []
+    for n in (n_fit, n_full, (n_fit + best_n) // 2, best_n, best_n + 1, best_n + 49):
+        if n not in marks:
+            marks.append(n)
+    head = ["每卡", "全局批", "换入", "MoE", "HBM", "TPOT", "吞吐", "二级冷"]
+    body, kinds = [], ["head"]
+    for n in marks:
+        r = decode_tier(n, s)
+        kinds.append("key" if n == best_n else "body")
+        body.append([
+            fmt_bs(n),
+            fmt_bs(n * v4.N),
+            f"{ms2(r['swap'])} 毫秒",
+            f"{ms2(r['moe'])} 毫秒",
+            f"{ms2(r['hbm'])} 毫秒",
+            f"{ms2(r['t'])} 毫秒",
+            fmt_rate(tps_of(n, r)),
+            gb1(r["t2_c"]),
+        ])
+    shape = ui.add_table(
+        slide, 0.32, 1.48,
+        [1.05, 1.55, 1.45, 1.45, 1.45, 1.45, 1.55, 1.55],
+        [head] + body,
+        [0.36] + [0.46] * len(body),
+        kinds,
+        size=13,
+    )
+    margins(shape)
+    uni, _last = search(s, 0.030, decode_uniform)
+    un, ur = uni[1], uni[2]
+    bn, br = pack(data["rows"][4]["tier30"])
+    later = decode_tier(best_n + 49, s)
+    ui.gold(
+        slide,
+        5.00,
+        1.95,
+        f"{bn} 条换入 {ms2(br['swap'])} 毫秒，MoE {ms2(br['moe'])} 毫秒，TPOT {ms2(br['t'])} 毫秒，吞吐 {fmt_rate(tps_of(bn, br))}。\n"
+        f"{bn + 1} 条换入长过 MoE，TPOT 改由换入定，吞吐开始下降。{best_n + 49} 条换入 {ms2(later['swap'])} 毫秒，吞吐回到 {fmt_rate(tps_of(best_n + 49, later))}。\n"
+        f"热数据和冷数据按占用比例一起切时，1M 最高到每卡 {un} 条、吞吐 {fmt_rate(tps_of(un, ur))}。"
+        f"热数据留在 HBM 之后是每卡 {bn} 条、{fmt_rate(tps_of(bn, br))}。\n"
+        f"这一步的冷读是 {gb1(bn * SEL_BYTES)}。HBM 上还有 {gb1(br['hbm_c'])} 冷数据，留出这块缓冲即可。",
+        14,
+    )
+
+
+def slide_ten(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, 7, "10 毫秒：128K 到 1M 和 30 毫秒是同一批", "TPOT ≤ 10 毫秒    ·    仍取系统吞吐最大的批")
+    ui.banner(slide, 0.90, "128K、256K、512K、1M 的吞吐最高点已经低于 10 毫秒，收紧时限不改变这一批。64K 在 HBM 还没满时就碰到 10 毫秒。", size=12)
+    head = ["输入", "HBM 批", "HBM 吞吐", "两级批", "TPOT", "两级吞吐", "相对 HBM", "和 30 毫秒"]
+    body, kinds = [], ["head"]
+    for row in data["rows"]:
+        hn, hr = pack(row["hbm10"])
+        tn, tr = pack(row["tier10"])
+        n30, _r30 = pack(row["tier30"])
+        if tn == n30:
+            same = "同一批"
+        elif tn < row["n_fit"]:
+            same = "HBM 未满"
+        else:
+            same = f"30 毫秒是 {fmt_bs(n30)} 条"
+        kinds.append("key" if row["S"] in (65536, 2097152, 4194304) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            fmt_bs(hn * v4.N),
+            fmt_rate(tps_of(hn, hr)),
+            fmt_bs(tn * v4.N),
+            f"{ms2(tr['t'])} 毫秒",
+            fmt_rate(tps_of(tn, tr)),
+            signed_pct(tps_of(tn, tr), tps_of(hn, hr)),
+            same,
+        ])
+    shape = ui.add_table(
+        slide, 0.32, 1.46,
+        [0.95, 1.55, 1.45, 1.55, 1.40, 1.55, 1.35, 2.20],
+        [head] + body,
+        [0.36] + [0.48] * len(body),
+        kinds,
+        size=13,
+    )
+    margins(shape)
+    r2 = data["rows"][5]
+    r4 = data["rows"][-1]
+    n2, a2 = pack(r2["tier10"])
+    m2, b2 = pack(r2["tier30"])
+    n4, a4 = pack(r4["tier10"])
+    m4, b4 = pack(r4["tier30"])
+    ui.gold(
+        slide,
+        5.55,
+        1.45,
+        f"2M 的 10 毫秒停在每卡 {n2} 条、TPOT {ms2(a2['t'])} 毫秒、吞吐 {fmt_rate(tps_of(n2, a2))}。"
+        f"30 毫秒放到每卡 {m2} 条、{fmt_rate(tps_of(m2, b2))}。\n"
+        f"4M 的 10 毫秒停在每卡 {n4} 条、吞吐 {fmt_rate(tps_of(n4, a4))}。30 毫秒放到每卡 {m4} 条、{fmt_rate(tps_of(m4, b4))}。\n"
+        "这两档的换入在 10 毫秒里还短于 MoE，是时限先把批截住。",
+        14,
+    )
+
+
+def audit(prs):
+    wide, low = Inches(13.333), Inches(7.50)
+    bad = []
+    for i, slide in enumerate(prs.slides, 1):
+        for shape in slide.shapes:
+            if shape.left is None:
+                continue
+            if shape.left + shape.width > wide + Emu(40000) or shape.top + shape.height > low + Emu(40000):
+                bad.append((i, int(shape.left), int(shape.top), int(shape.width), int(shape.height)))
+    return bad
+
+
+def check():
+    hot, cold, _read = hot_cold(1048576)
+    assert abs(hot + cold - v4.store_seq(1048576)) < 1.0
+    n_fit = int(v4.ROOM_GPU // v4.store_seq(1048576))
+    assert decode_tier(n_fit, 1048576)["swap"] < 1e-9
+    for s in v4.LENGTHS:
+        _best, _last = search(s, 0.030, decode_tier)
+        row = _best[2]
+        assert row["t1_h"] < 1.0 and row["t2_h"] < 1.0, (s, row["t1_h"], row["t2_h"])
+        assert abs(row["t1_c"] - T1_CAP) < 1e6 or row["t2_c"] < 1.0
+
+
+def main():
+    check()
+    data = collect()
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    prs.core_properties.title = "N+2：20T V4，一级在网 cache，二级 6.4 Tb/s"
+    blank = prs.slide_layouts[6]
+    slide_open(prs, blank, data)
+    slide_bytes(prs, blank, data)
+    slide_place(prs, blank, data)
+    slide_formula(prs, blank)
+    slide_where(prs, blank, data)
+    slide_walk(prs, blank, data)
+    slide_ten(prs, blank, data)
+    prs.save(PPT)
+    print("slides", len(prs.slides), "overflow", audit(prs))
+    for row in data["rows"]:
+        parts = [fmt_len(row["S"])]
+        for tag in ("10", "30"):
+            hn, hr = pack(row[f"hbm{tag}"])
+            tn, tr = pack(row[f"tier{tag}"])
+            parts.append(
+                f"{tag} hbm {hn}/{ms2(hr['t'])}/{fmt_rate(tps_of(hn, hr))}"
+                f" tier {tn}/{ms2(tr['t'])}/{fmt_rate(tps_of(tn, tr))}"
+                f" swap {ms2(tr['swap'])} moe {ms2(tr['moe'])}"
+                f" T2 {tr['t2_c']/1e9:.1f}"
+            )
+        print(" | ".join(parts))
+
+
+if __name__ == "__main__":
+    main()

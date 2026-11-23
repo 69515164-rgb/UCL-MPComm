@@ -248,10 +248,6 @@ def ms2(v):
     return v4.ms2(v)
 
 
-def ms3(v):
-    return f"{v * 1e3:.3f}"
-
-
 def gb_pie(n):
     if n >= 1e12:
         return f"{n / 1e12:.2f} TB"
@@ -789,35 +785,6 @@ def slide_pie_host(prs, blank, data):
     )
 
 
-def taken(a, b):
-    return a if a >= b else b
-
-
-def formula_bits(row):
-    left = taken(row["hbm"], row["ca"])
-    right = taken(row["swap"], row["moe"])
-    return left, right
-
-
-def walk_line(label, row, extra=""):
-    left, right = formula_bits(row)
-    line = (
-        f"{label} 批 {fmt_bs(row['n'] * v4.N)}："
-        f"max(HBM {ms3(row['hbm'])}, 计算 {ms3(row['ca'])}) = {ms3(left)}，"
-        f"max(换入 {ms3(row['swap'])}, MoE {ms3(row['moe'])}) = {ms3(right)}，"
-        f"相加 {ms3(row['t'])}。"
-    )
-    return line + extra
-
-
-def moe_line(row):
-    return (
-        f"MoE {ms3(row['moe'])} = 派发 {ms3(row['td'])}"
-        f" + max(权重 {ms3(row['tw'])}, GEMM {ms3(row['tg'])})"
-        f" + 合并 {ms3(row['tc'])}。"
-    )
-
-
 PATHS = (
     ("hbm", "只放 HBM", "换入为 0，KV 全在 GPU HBM"),
     ("host", "H2D 卸载", f"换入 = 主机字节 / {HOST_BW / 1e9:.0f} GB/s"),
@@ -825,65 +792,133 @@ PATHS = (
 )
 
 
+def ms_leaf(v):
+    return round(v * 1e3, 3)
+
+
+def shown(found, tier):
+    """Round the leaves first, then add, so the printed formula holds."""
+    hbm = ms_leaf(found["hbm"])
+    ca = ms_leaf(found["ca"])
+    td = ms_leaf(found["td"])
+    tw = ms_leaf(found["tw"])
+    tg = ms_leaf(found["tg"])
+    tc = ms_leaf(found["tc"])
+    gate = tw if tw >= tg else tg
+    moe = round(td + gate + tc, 3)
+    if tier:
+        t1 = ms_leaf(found["b1"] / T1_BW)
+        t2 = ms_leaf(found["b2"] / T2_BW)
+        swap = round(t1 + t2, 3)
+    else:
+        t1 = t2 = 0.0
+        swap = ms_leaf(found["swap"])
+    left = hbm if hbm >= ca else ca
+    right = swap if swap >= moe else moe
+    tpot = round(left + right, 3)
+    return {
+        "hbm": hbm, "ca": ca, "left": left, "t1": t1, "t2": t2, "swap": swap,
+        "td": td, "tw": tw, "tg": tg, "gate": gate, "tc": tc, "moe": moe,
+        "right": right, "t": tpot,
+    }
+
+
+def tpot_chrome(slide, page, path_name, tag, how):
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.08))
+    ui.solid(bar, ui.ACCENT)
+    ui.textbox(
+        slide, 0.42, 0.12, 10.6, 0.24,
+        f"{tag} 毫秒 · {path_name} · {how} · 单位毫秒",
+        12, True, ui.ACCENT, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    ui.textbox(
+        slide, 0.42, 0.36, 12.5, 0.70,
+        "TPOT = max(HBM, 计算) + max(换入, MoE)\nMoE = 派发 + max(权重, GEMM) + 合并",
+        20, True, ui.NAVY, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    ui.textbox(
+        slide, 11.4, 0.12, 1.5, 0.24,
+        f"{page}  /  {ui.SLIDES}",
+        12, False, ui.MUTED, align=ui.PP_ALIGN.RIGHT,
+    )
+    rule = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.42), Inches(7.18), Inches(12.5), Inches(0.01))
+    ui.solid(rule, ui.LINE)
+    ui.textbox(slide, 0.42, 7.20, 12.5, 0.24, ui.FOOTER, 11, False, ui.MUTED, anchor=MSO_ANCHOR.MIDDLE)
+
+
 def slide_tpot(prs, blank, data, page, tag, kind, path_name, how):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(
-        slide,
-        page,
-        f"{path_name}：TPOT = max(HBM, 计算) + max(换入, MoE)",
-        f"{tag} 毫秒里吞吐最大的批    ·    {how}    ·    表内单位毫秒",
-    )
+    tpot_chrome(slide, page, path_name, tag, how)
     tier = kind == "tier"
     if tier:
         head = ["输入", "每卡", "全局批", "HBM", "计算", "max(HBM,计算)", "一级", "二级", "换入", "MoE", "max(换入,MoE)", "TPOT"]
-        widths = [0.78, 0.95, 1.22, 0.95, 0.95, 1.55, 0.88, 0.88, 0.90, 0.90, 1.55, 1.00]
-        left_x = 0.36
+        widths = [0.72, 0.88, 1.12, 0.86, 0.86, 1.42, 0.78, 0.78, 0.82, 0.82, 1.42, 0.92]
     else:
         head = ["输入", "每卡", "全局批", "HBM", "计算", "max(HBM,计算)", "换入", "MoE", "max(换入,MoE)", "TPOT"]
-        widths = [0.90, 1.08, 1.38, 1.10, 1.10, 1.72, 1.10, 1.10, 1.72, 1.22]
-        left_x = 0.36
-    body, kinds, rows_out = [], ["head"], []
+        widths = [0.82, 1.00, 1.28, 1.02, 1.02, 1.58, 1.02, 1.02, 1.58, 1.12]
+    body, kinds = [], ["head"]
+    moe_body = []
     for row in data["rows"]:
         _n, found = pack(row[f"{kind}{tag}"])
-        left, right = formula_bits(found)
-        if abs((left + right) - found["t"]) > 1e-9:
-            raise RuntimeError((kind, tag, row["S"], left, right, found["t"]))
+        view = shown(found, tier)
+        if abs((view["td"] + view["gate"] + view["tc"]) - view["moe"]) > 1e-9:
+            raise RuntimeError((kind, tag, row["S"], view))
+        if abs((view["left"] + view["right"]) - view["t"]) > 1e-9:
+            raise RuntimeError((kind, tag, row["S"], view))
         kinds.append("key" if row["S"] in (1048576, 4194304) else "body")
         cells = [
             fmt_len(row["S"]),
             fmt_bs(found["n"]),
             fmt_bs(found["n"] * v4.N),
-            ms3(found["hbm"]),
-            ms3(found["ca"]),
-            ms3(left),
+            f"{view['hbm']:.3f}",
+            f"{view['ca']:.3f}",
+            f"{view['left']:.3f}",
         ]
         if tier:
-            cells.extend([ms3(found["b1"] / T1_BW), ms3(found["b2"] / T2_BW)])
+            cells.extend([f"{view['t1']:.3f}", f"{view['t2']:.3f}"])
         cells.extend([
-            ms3(found["swap"]),
-            ms3(found["moe"]),
-            ms3(right),
-            ms3(found["t"]),
+            f"{view['swap']:.3f}",
+            f"{view['moe']:.3f}",
+            f"{view['right']:.3f}",
+            f"{view['t']:.3f}",
         ])
         body.append(cells)
-        rows_out.append(found)
-    shape = ui.add_table(
-        slide, left_x, 1.02,
+        moe_body.append([
+            fmt_len(row["S"]),
+            fmt_bs(found["n"]),
+            fmt_bs(found["n"] * v4.N),
+            f"{view['td']:.3f}",
+            f"{view['tw']:.3f}",
+            f"{view['tg']:.3f}",
+            f"{view['gate']:.3f}",
+            f"{view['tc']:.3f}",
+            f"{view['moe']:.3f}",
+        ])
+    top = ui.add_table(
+        slide, 0.36, 1.12,
         widths,
         [head] + body,
-        [0.42] + [0.56] * len(body),
+        [0.28] + [0.30] * len(body),
         kinds,
-        size=13 if tier else 14,
+        size=12,
     )
-    margins(shape)
-    one = next(found for row, found in zip(data["rows"], rows_out) if row["S"] == 1048576)
-    ui.gold(
-        slide,
-        5.55,
-        1.48,
-        walk_line("1M", one) + "\n" + walk_line("4M", rows_out[-1]) + "\n" + moe_line(one),
-        13,
+    margins(top)
+    ui.textbox(
+        slide, 0.40, 3.56, 12.4, 0.24,
+        "MoE 逐项：派发 + max(权重, GEMM) + 合并",
+        13, True, ui.ACCENT, anchor=MSO_ANCHOR.MIDDLE,
     )
+    moe_head = ["输入", "每卡", "全局批", "派发", "权重", "GEMM", "max(权重,GEMM)", "合并", "MoE"]
+    moe_w = [0.90, 1.15, 1.48, 1.42, 1.42, 1.35, 2.00, 1.35, 1.43]
+    bottom = ui.add_table(
+        slide, 0.40, 3.84,
+        moe_w,
+        [moe_head] + moe_body,
+        [0.36] + [0.40] * len(moe_body),
+        kinds,
+        size=14,
+    )
+    margins(bottom)
 
 
 def slide_pie_hbm(prs, blank, data):

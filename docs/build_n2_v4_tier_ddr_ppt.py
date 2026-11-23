@@ -55,7 +55,7 @@ C_HCA = "5B8FA8"
 C_WIN = "C4A35A"
 C_LAT = "E07A3D"
 
-SLIDES = 12
+SLIDES = 14
 FOOTER = "N+2    ·    20T V4    ·    Decode DP=256 EP=256    ·    一级 233472 GB · 51.2 Tb/s    ·    二级 6.4 Tb/s · 容量不限"
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
@@ -136,6 +136,7 @@ def decode_host(n, s):
         "swap": swap,
         "moe": base["moe"],
         "hbm": base["hbm"],
+        "ca": base["ca"],
         "n": n,
         "hbm_h": hbm_h,
         "hbm_c": hbm_c,
@@ -776,6 +777,62 @@ def slide_pie_host(prs, blank, data):
     )
 
 
+def expose(row):
+    """The two terms that add into TPOT, and the two that stay hidden."""
+    hbm, ca, swap, moe = row["hbm"], row["ca"], row["swap"], row["moe"]
+    if hbm >= ca:
+        left, hide_l = f"HBM {ms2(hbm)}", f"计算 {ms2(ca)}"
+    else:
+        left, hide_l = f"计算 {ms2(ca)}", f"HBM {ms2(hbm)}"
+    if abs(swap - moe) <= 5e-5:
+        right, hide_r = f"换入≈MoE {ms2(max(swap, moe))}", ""
+    elif swap > moe:
+        right, hide_r = f"换入 {ms2(swap)}", f"MoE {ms2(moe)}"
+    else:
+        right, hide_r = f"MoE {ms2(moe)}", f"换入 {ms2(swap)}"
+    covered = "、".join(part for part in (hide_l, hide_r) if part)
+    return (
+        f"批 {fmt_bs(row['n'] * v4.N)} · {ms2(row['t'])} 毫秒",
+        f"相加  {left} + {right}",
+        f"盖住  {covered}",
+    )
+
+
+def slide_tpot(prs, blank, data, page, tag, title):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(
+        slide, page, title,
+        f"TPOT ≤ {tag} 毫秒里吞吐最大的批    ·    TPOT = max(HBM, 计算) + max(换入, MoE)",
+    )
+    ui.banner(
+        slide, 0.92,
+        "相加的两项进 TPOT。另一项被盖住，不另加时间。HBM 是这一步 KV 进卡之后的读取，换入是池或主机上那一段搬运。",
+        size=12,
+    )
+    head = ["输入", "只放 HBM", "H2D 卸载", "两级池"]
+    body, kinds = [], ["head"]
+    for row in data["rows"]:
+        _hn, hr = pack(row[f"hbm{tag}"])
+        _dn, dr = pack(row[f"host{tag}"])
+        _tn, tr = pack(row[f"tier{tag}"])
+        kinds.append("key" if row["S"] in (1048576, 4194304) else "body")
+        body.append([
+            fmt_len(row["S"]),
+            "\n".join(expose(hr)),
+            "\n".join(expose(dr)),
+            "\n".join(expose(tr)),
+        ])
+    shape = ui.add_table(
+        slide, 0.32, 1.46,
+        [0.95, 3.85, 3.85, 3.85],
+        [head] + body,
+        [0.30] + [0.68] * len(body),
+        kinds,
+        size=11,
+    )
+    margins(shape)
+
+
 def slide_pie_hbm(prs, blank, data):
     columns = []
     for row in data["rows"]:
@@ -839,6 +896,8 @@ def main():
     slide_pie_tier(prs, blank, data)
     slide_pie_host(prs, blank, data)
     slide_pie_hbm(prs, blank, data)
+    slide_tpot(prs, blank, data, 13, "30", "30 毫秒：两级池、H2D、HBM 的 TPOT 拆开")
+    slide_tpot(prs, blank, data, 14, "10", "10 毫秒：两级池、H2D、HBM 的 TPOT 拆开")
     prs.save(PPT)
     print("slides", len(prs.slides), "overflow", audit(prs))
     for row in data["rows"]:

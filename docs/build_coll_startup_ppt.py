@@ -104,9 +104,10 @@ def down_arrow(slide, x, y, w, h, fill):
 
 
 def flow(slide, x, y, w, steps, hot):
-    node_h = 0.30
-    gap = 0.16
-    for i, label in enumerate(steps):
+    node_h = 0.32
+    gap = 0.14
+    chip_w = 0.62
+    for i, (label, hw) in enumerate(steps):
         yy = y + i * (node_h + gap)
         marked = i in hot
         rect(
@@ -123,16 +124,28 @@ def flow(slide, x, y, w, steps, hot):
             slide,
             x + 0.06,
             yy,
-            w - 0.12,
+            w - chip_w - 0.10,
             node_h,
             label,
             11,
             marked,
             RED if marked else NAVY,
-            PP_ALIGN.CENTER,
+            PP_ALIGN.LEFT,
+        )
+        textbox(
+            slide,
+            x + w - chip_w,
+            yy,
+            chip_w - 0.04,
+            node_h,
+            hw,
+            10,
+            True,
+            RED if marked else TEAL,
+            PP_ALIGN.RIGHT,
         )
         if i + 1 < len(steps):
-            down_arrow(slide, x + w / 2 - 0.06, yy + node_h + 0.01, 0.12, 0.14, "B7C3CE")
+            down_arrow(slide, x + w / 2 - 0.06, yy + node_h + 0.005, 0.12, 0.13, "B7C3CE")
 
 
 def outcome(slide, x, y, w, kind, title, body):
@@ -144,7 +157,7 @@ def outcome(slide, x, y, w, kind, title, body):
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(0.06), Inches(1.18))
     solid(bar, accent)
     textbox(slide, x + 0.14, y + 0.04, w - 0.22, 0.24, title, 11, True, title_c)
-    textbox(slide, x + 0.14, y + 0.28, w - 0.22, 0.84, body, 12, False, INK, anchor=MSO_ANCHOR.TOP)
+    textbox(slide, x + 0.14, y + 0.28, w - 0.22, 0.86, body, 11, False, INK, anchor=MSO_ANCHOR.TOP)
 
 
 def column(slide, x, y, w, name, note, steps, hot, contradiction, sw, hw):
@@ -155,7 +168,7 @@ def column(slide, x, y, w, name, note, steps, hot, contradiction, sw, hw):
     flow(slide, x + 0.16, y + 0.76, w - 0.32, steps, hot)
     rect(slide, x + 0.10, y + 2.62, w - 0.20, 0.78, GOLD_BG, GOLD_LINE, 1.0)
     textbox(slide, x + 0.18, y + 2.64, w - 0.36, 0.22, "换算法的矛盾", 11, True, GOLD)
-    textbox(slide, x + 0.18, y + 2.86, w - 0.36, 0.50, contradiction, 12, False, INK, anchor=MSO_ANCHOR.TOP)
+    textbox(slide, x + 0.18, y + 2.86, w - 0.36, 0.50, contradiction, 11, False, INK, anchor=MSO_ANCHOR.TOP)
     outcome(slide, x + 0.10, y + 3.50, w - 0.20, "sw", "软件能收到", sw)
     outcome(slide, x + 0.10, y + 4.78, w - 0.20, "hw", "下一代硬件能收到", hw)
 
@@ -171,19 +184,19 @@ def build():
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.06))
     solid(bar, TEAL)
 
-    textbox(slide, 0.28, 0.12, 10.4, 0.34, "换算法时，启动开销收在哪一步", 22, True, NAVY)
+    textbox(slide, 0.28, 0.12, 9.2, 0.34, "换算法时，启动里哪一步最贵", 22, True, NAVY)
     textbox(
         slide,
         0.28,
         0.46,
-        9.6,
+        8.8,
         0.24,
-        "昇腾 950    ·    建域一次：rank 表、Jetty、窗口。换算法都不拆",
+        "建链只做一次。每一步右边是在哪块硬件上。红框是换算法要重做的。",
         12,
         False,
         MUTED,
     )
-    textbox(slide, 10.3, 0.16, 2.75, 0.24, "红框 = 换算法重做的那一跳", 11, True, RED, PP_ALIGN.RIGHT)
+    textbox(slide, 9.3, 0.16, 3.75, 0.24, "次数 = 这一步做不做，不是实测微秒", 11, True, RED, PP_ALIGN.RIGHT)
 
     left_x, top, col_w, gap = 0.22, 0.78, 2.82, 0.10
     column(
@@ -191,13 +204,13 @@ def build():
         left_x,
         top,
         col_w,
-        "AICPU_TS",
-        "默认 · 大数据",
-        ["主机选择算法", "AICPU 展开描述符", "描述符交回 STARS", "执行器搬运"],
+        "AICPU",
+        "默认。大数据走这里",
+        [("挑算法", "主机"), ("拆成搬运单", "AICPU"), ("送回调度器", "AICPU"), ("派去搬运", "STARS")],
         {1},
-        "缓存按形状存。\n换算法或改 count，展开整段重来。",
-        "同形状第二次跳过展开。\n换算法仍是全额展开。",
-        "按算法号直接盖 WQE。\n展开消失，只剩派发。",
+        "大头是拆单这一遍。\n换算法，这一遍一点省不掉。",
+        "形状不变：拆单 1 遍变 0。\n换算法：仍是每次 1 遍。",
+        "换算法也不用拆。\n盖 1 次章，拆单变成 0 遍。",
     )
     column(
         slide,
@@ -205,12 +218,12 @@ def build():
         top,
         col_w,
         "AIV",
-        "仅推理 · 小数据",
-        ["二进制只装一次", "每次 Kernel launch", "核内跑 Mesh", "占住 Vector 核"],
+        "只用于推理，小数据",
+        [("程序只装一次", "主机"), ("每次发一个核", "STARS"), ("核里自己搬", "AIV"), ("核被通信占住", "AIV")],
         {3},
-        "启动已是一次 launch。\n单域独占核，多域不能并行。",
-        "句柄常驻，核内可分支。\n换算法仍是一次 launch。",
-        "多组 Vector 可同时通信。\nlaunch 几乎不动，单域限制打开。",
+        "发核不是大头。\n大头是核被占，且只能 1 个域。",
+        "程序不重装。\n换算法仍是 1 次发核。",
+        "派核仍是 1 次。\n多组核可以同时做通信。",
     )
     column(
         slide,
@@ -218,41 +231,41 @@ def build():
         top,
         col_w,
         "CCU",
-        "MS 中转 / SCHED 调度",
-        ["空跑记成 REP", "翻译并装入微码", "rtCCULaunch", "Mission 执行"],
+        "片上专核。装不下就退回 AICPU",
+        [("空跑，把步骤记下", "主机"), ("微码写进片上", "主机"), ("提交一次任务", "STARS"), ("自己搬数据、做加法", "CCU")],
         {0, 1},
-        "快路径把 count 写进标签。\n一变就重录、重装微码。",
-        "建域时预翻译多套。\n换算法只剩一次 launch。",
-        "多套微码常驻，改入口。\n装入消失，写成一个算法号。",
+        "大头是微码重写进片上。\n长度一变，记和装都重做。",
+        "几套提前译好。\n换算法从 3 段收成 1 次。",
+        "微码不用再装。\n换算法只写 1 个号。",
     )
 
     rx, ry, rw = 8.96, 0.78, 4.10
     rect(slide, rx, ry, rw, 6.28, SOFT, LINE, 1.0)
     rect(slide, rx + 0.12, ry + 0.10, rw - 0.24, 0.36, TEAL)
     textbox(slide, rx + 0.18, ry + 0.10, rw - 0.36, 0.36, "推理融合算子", 14, True, WHITE, PP_ALIGN.CENTER)
-    textbox(slide, rx + 0.12, ry + 0.48, rw - 0.24, 0.22, "只用 AIV    ·    不再调用 HCCL", 10, False, MUTED, PP_ALIGN.CENTER)
+    textbox(slide, rx + 0.12, ry + 0.48, rw - 0.24, 0.22, "整段都在 Vector 核里，不再走 HCCL", 10, False, MUTED, PP_ALIGN.CENTER)
 
-    rect(slide, rx + 1.15, ry + 0.78, 1.80, 0.34, NAVY)
-    textbox(slide, rx + 1.15, ry + 0.78, 1.80, 0.34, "一次 AIV 核", 12, True, WHITE, PP_ALIGN.CENTER)
-    down_arrow(slide, rx + 1.93, ry + 1.14, 0.14, 0.16, "B7C3CE")
+    rect(slide, rx + 0.90, ry + 0.76, 2.30, 0.32, NAVY)
+    textbox(slide, rx + 0.90, ry + 0.76, 2.30, 0.32, "一层只发 1 次核 · AIV", 12, True, WHITE, PP_ALIGN.CENTER)
+    down_arrow(slide, rx + 1.93, ry + 1.10, 0.14, 0.14, "B7C3CE")
 
-    rect(slide, rx + 0.18, ry + 1.34, 1.78, 0.72, WHITE, LINE, 1.0)
-    textbox(slide, rx + 0.26, ry + 1.36, 1.62, 0.26, "UB Memory", 12, True, TEAL, PP_ALIGN.CENTER)
-    textbox(slide, rx + 0.26, ry + 1.62, 1.62, 0.40, "访存指令\n+ 软件标志", 12, False, INK, PP_ALIGN.CENTER, MSO_ANCHOR.TOP)
+    rect(slide, rx + 0.16, ry + 1.28, 1.84, 0.78, WHITE, LINE, 1.0)
+    textbox(slide, rx + 0.22, ry + 1.30, 1.72, 0.22, "机柜内 · UB", 11, True, TEAL, PP_ALIGN.CENTER)
+    textbox(slide, rx + 0.22, ry + 1.52, 1.72, 0.50, "核直接写对方内存\n再软件空等标志", 11, False, INK, PP_ALIGN.CENTER, MSO_ANCHOR.TOP)
 
-    rect(slide, rx + 2.14, ry + 1.34, 1.78, 0.72, WHITE, LINE, 1.0)
-    textbox(slide, rx + 2.22, ry + 1.36, 1.62, 0.26, "URMA", 12, True, TEAL, PP_ALIGN.CENTER)
-    textbox(slide, rx + 2.22, ry + 1.62, 1.62, 0.40, "逐条 SQE\n+ doorbell", 12, False, INK, PP_ALIGN.CENTER, MSO_ANCHOR.TOP)
+    rect(slide, rx + 2.10, ry + 1.28, 1.84, 0.78, WHITE, LINE, 1.0)
+    textbox(slide, rx + 2.16, ry + 1.30, 1.72, 0.22, "跨柜 · URMA", 11, True, TEAL, PP_ALIGN.CENTER)
+    textbox(slide, rx + 2.16, ry + 1.52, 1.72, 0.50, "核来填搬运单\n每个目的敲 1 次", 11, False, INK, PP_ALIGN.CENTER, MSO_ANCHOR.TOP)
 
-    rect(slide, rx + 0.14, ry + 2.18, rw - 0.28, 0.92, GOLD_BG, GOLD_LINE, 1.0)
-    textbox(slide, rx + 0.26, ry + 2.22, rw - 0.52, 0.22, "换算法的矛盾", 11, True, GOLD)
+    rect(slide, rx + 0.14, ry + 2.16, rw - 0.28, 0.96, GOLD_BG, GOLD_LINE, 1.0)
+    textbox(slide, rx + 0.26, ry + 2.18, rw - 0.52, 0.22, "换算法的矛盾", 11, True, GOLD)
     textbox(
         slide,
         rx + 0.26,
-        ry + 2.46,
+        ry + 2.40,
         rw - 0.52,
-        0.58,
-        "选择发生在核内，主机没有第二次启动。\n还在付的是计数交换，和 URMA 的逐条 doorbell。",
+        0.68,
+        "主机这边没有第二次启动。\n还在付的是：数一数各去多少，1 次来回；\n跨柜时，每个目的再敲 1 次门铃。",
         12,
         False,
         INK,
@@ -265,7 +278,7 @@ def build():
         rw - 0.28,
         "sw",
         "软件能收到",
-        "窗口和 Jetty 都预建，图捕获掉 launch。\n主机下发归零。计数往返和 doorbell 还在。",
+        "连接提前建好，整层收进图里。\n主机下发从每层 1 次变成 0。\n计数来回和敲门还在。",
     )
     outcome(
         slide,
@@ -274,7 +287,7 @@ def build():
         rw - 0.28,
         "hw",
         "下一代硬件能收到",
-        "硬件标志替换轮询，WQE 模板合并 doorbell。\n剩一次片上的计数交换。",
+        "不用软件空等。\n敲门从每条 1 次收成填个长度。\n还剩 1 次片上的计数来回。",
     )
 
     textbox(
@@ -283,7 +296,7 @@ def build():
         7.16,
         12.7,
         0.24,
-        "青 = 现有软件能缓存的程度        深蓝 = 下一代片上能再收掉的程度        资源不够时 CCU 仍退回 AICPU",
+        "青字是现有软件能少做的次数    深蓝是下一代片上还能再少的    图模式 AICPU 最多 6 个，CCU 同时最多 32 个任务",
         11,
         False,
         MUTED,

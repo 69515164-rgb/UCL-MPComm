@@ -3,7 +3,7 @@
 
 Full-read KV stays on HBM. Latent fills the in-network cache first, then the
 unlimited DDR pool. Cache total is 96 x 144 x 3 = 41472 GB, 162 GB per card.
-The cache is read at 3.6 TB/s. The DDR pool is read at 6.4 Tb/s.
+The cache is read at 3.6 TB/s. The DDR pool is read at 1.2 TB/s.
 Search still maximizes TPS inside the TPOT limit.
 """
 
@@ -23,13 +23,13 @@ spec.loader.exec_module(cui)
 ui = cui.ui
 v4 = cui.v4
 T1_BW = 3.6e12
-T2_BW = 6.4e12 / 8
+T2_BW = 1.2e12
 CACHE_TOTAL = 96 * 144 * 3 * 1e9
 CACHE_CAP = CACHE_TOTAL / v4.N
 SLIDES = 9
 FOOTER = (
     "N+2(cui)    ·    20T V4    ·    Decode 256 卡 TP=1    ·    "
-    "CSA latent 全部进两级池    ·    cache 41472 GB、3.6 TB/s    ·    DDR 6.4 Tb/s    ·    TPOT 10/30 毫秒"
+    "CSA latent 全部进两级池    ·    cache 41472 GB、3.6 TB/s    ·    DDR 1.2 TB/s    ·    TPOT 10/30 毫秒"
 )
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
@@ -87,11 +87,11 @@ def collect():
 
 def slide_config(prs, blank):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 1, "CSA latent 全部进两级池，cache 3.6 TB/s，DDR 6.4 Tb/s", "N+2(cui)    ·    临时调整    ·    寻优仍是时限内取最大 TPS")
+    ui.chrome(slide, 1, "CSA latent 全部进两级池，cache 3.6 TB/s，DDR 1.2 TB/s", "N+2(cui)    ·    临时调整    ·    寻优仍是时限内取最大 TPS")
     ui.banner(
         slide,
         0.92,
-        f"在网 cache 合计 96×144×3 = {CACHE_TOTAL / 1e9:.0f} GB，每卡 {CACHE_CAP / 1e9:.0f} GB，读入 3.6 TB/s。二级 DDR 不限，读入 6.4 Tb/s（0.80 TB/s）。",
+        f"在网 cache 合计 96×144×3 = {CACHE_TOTAL / 1e9:.0f} GB，每卡 {CACHE_CAP / 1e9:.0f} GB，读入 3.6 TB/s。二级 DDR 不限，读入 1.2 TB/s。",
     )
     head = ["项目", "这一版"]
     body = [
@@ -99,7 +99,7 @@ def slide_config(prs, blank):
         ["算力 / HBM", f"每 NPU 27640 TFLOPS FP4。HBM 384 GB，38400 GB/s。KV 房间 {cui.gb1(v4.ROOM_GPU)}"],
         ["全读 KV", "CSA index、HCA、滑窗。先放 HBM。放不下的全读先占 cache，再进二级 DDR"],
         ["CSA latent", f"一字节都不留在 HBM。先填每卡 {CACHE_CAP / 1e9:.0f} GB 在网 cache，剩下的进二级 DDR"],
-        ["读入", "cache 3.6 TB/s。二级 DDR 6.4 Tb/s（0.80 TB/s）。换入 = cache 抽读 / 3.6 + DDR 抽读 / 0.80"],
+        ["读入", "cache 3.6 TB/s。二级 DDR 1.2 TB/s。换入 = cache 抽读 / 3.6 + DDR 抽读 / 1.2"],
         ["对照", "只放 HBM：latent 能留在 HBM。主机：每卡 500 GB、200 GB/s，latent 先填 HBM 再进 CPU DDR"],
         ["时限", "TPOT ≤ 10 毫秒和 30 毫秒。时限内取系统 TPS 最大。TPS = 全局批 / TPOT"],
     ]
@@ -110,13 +110,13 @@ def slide_config(prs, blank):
 def slide_formula(prs, blank):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 2, "时限内取吞吐最大，latent 的抽读整段走两级池", "TPOT = max(HBM, 计算) + max(换入, MoE)")
-    ui.banner(slide, 0.92, "抽读落在 cache 上按 3.6 TB/s，落在 DDR 上按 0.80 TB/s。进卡之后，这一步的 KV 仍按 HBM 38.4 TB/s 再读一次。")
+    ui.banner(slide, 0.92, "抽读落在 cache 上按 3.6 TB/s，落在 DDR 上按 1.2 TB/s。进卡之后，这一步的 KV 仍按 HBM 38.4 TB/s 再读一次。")
     head = ["", "式子"]
     body = [
         ["全读", "每条 (480 + 139.5)×S + 4,497,408。先占 HBM"],
         ["latent 存储", f"每条 4320×S。全部不在 HBM。先填每卡 {CACHE_CAP / 1e9:.0f} GB cache，再进二级 DDR"],
         ["latent 抽读", "每条 30 层 × min(1024, S/4) × 576。这一段全部算卸载"],
-        ["换入", "cache 中的抽读 / 3.6 TB/s + DDR 中的抽读 / 0.80 TB/s"],
+        ["换入", "cache 中的抽读 / 3.6 TB/s + DDR 中的抽读 / 1.2 TB/s"],
         ["HBM", "(这一步要读的全部 KV + 19.35 GB) / 38.4 TB/s"],
         ["TPOT", "max(HBM, 计算) + max(换入, MoE)"],
         ["选批", "在 TPOT ≤ 10 或 30 毫秒里，取全局批 / TPOT 最大的每卡条数"],
@@ -128,7 +128,7 @@ def slide_formula(prs, blank):
 def slide_decode(prs, blank, data, page, tag, title):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, page, title, f"TPOT ≤ {tag} 毫秒    ·    系统吞吐 TPS = 全局批 / TPOT    ·    全局批 = 每卡 × 256")
-    ui.banner(slide, 0.92, "CSA latent 全部卸载。cache 按 3.6 TB/s 读，二级 DDR 按 0.80 TB/s 读。对照仍让 latent 先填 HBM。三列都是系统 TPS。")
+    ui.banner(slide, 0.92, "CSA latent 全部卸载。cache 按 3.6 TB/s 读，二级 DDR 按 1.2 TB/s 读。对照仍让 latent 先填 HBM。三列都是系统 TPS。")
     head = ["输入", "HBM 批", "HBM TPS", "主机批", "主机毫秒", "主机 TPS", "两级批", "两级毫秒", "两级 TPS", "相对主机"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
@@ -175,14 +175,14 @@ def slide_decode(prs, blank, data, page, tag, title):
         note += "七档换入和 MoE 打平，10 毫秒和 30 毫秒是同一批。"
     else:
         note += "七档在 10 毫秒和 30 毫秒都要分开选批。"
-    note += " cache 按 3.6 TB/s 读，DDR 按 0.80 TB/s 读。"
+    note += " cache 按 3.6 TB/s 读，DDR 按 1.2 TB/s 读。"
     ui.gold(slide, 5.20, 1.85, note, 14)
 
 
 def slide_place(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 5, "30 毫秒 TPS 最高的批，latent 先填 cache，超出的进 DDR", "系统吞吐 TPS = 全局批 / TPOT    ·    每卡")
-    ui.banner(slide, 0.92, "HBM 的 latent 一列是 0。cache 上限每卡 162 GB，读入 3.6 TB/s。DDR 不限，读入 0.80 TB/s。")
+    ui.banner(slide, 0.92, "HBM 的 latent 一列是 0。cache 上限每卡 162 GB，读入 3.6 TB/s。DDR 不限，读入 1.2 TB/s。")
     head = ["输入", "每卡", "HBM 全读", "HBM latent", "cache latent", "DDR latent", "换入毫秒", "TPS"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
@@ -222,7 +222,7 @@ def slide_place(prs, blank, data):
 def slide_tpot(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 6, "30 毫秒两级池的最优批，TPOT 按项打开", "毫秒    ·    TPOT = max(HBM, 计算) + max(换入, MoE)")
-    ui.banner(slide, 0.92, "换入 = cache 抽读 / 3.6 TB/s + DDR 抽读 / 0.80 TB/s。派发和合并走总线 3.6 TB/s，权重用 HBM，GEMM 用 27.64 PFLOPS。")
+    ui.banner(slide, 0.92, "换入 = cache 抽读 / 3.6 TB/s + DDR 抽读 / 1.2 TB/s。派发和合并走总线 3.6 TB/s，权重用 HBM，GEMM 用 27.64 PFLOPS。")
     head = ["输入", "每卡", "HBM", "计算", "左", "换入", "派发", "权重", "GEMM", "合并", "MoE", "右", "TPOT"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
@@ -274,10 +274,10 @@ def slide_pie(prs, blank, data):
         prs, blank, 7,
         "两级池：HBM 只留全读，latent 分在 cache 和 DDR",
         "30 毫秒系统 TPS 最高的批    ·    每卡    ·    饼旁是占比",
-        f"饼按存储字节。HBM 上没有 CSA latent。cache 每卡最多 {CACHE_CAP / 1e9:.0f} GB，读入 3.6 TB/s。超出的整段 latent 进二级 DDR，读入 0.80 TB/s。",
+        f"饼按存储字节。HBM 上没有 CSA latent。cache 每卡最多 {CACHE_CAP / 1e9:.0f} GB，读入 3.6 TB/s。超出的整段 latent 进二级 DDR，读入 1.2 TB/s。",
         columns,
         f"1M：{cui.occ_note(columns[4][1])}。\n4M：{cui.occ_note(columns[-1][1])}。\n"
-        "cache 按 3.6 TB/s 读，DDR 按 0.80 TB/s 读。落在 DDR 的抽读更慢。",
+        "cache 按 3.6 TB/s 读，DDR 按 1.2 TB/s 读。落在 DDR 的抽读更慢。",
     )
 
 

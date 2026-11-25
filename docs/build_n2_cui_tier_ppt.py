@@ -6,8 +6,8 @@ by another 70% or 80%.
 
 Per CPU: DDR 2 TB/s and 2 TB, attached to 4 NPUs.
 Per NPU host path: min(H2D 1.6 Tb/s, DDR/4) = 200 GB/s, 500 GB.
-Both pool tiers move at 6.4 Tb/s per NPU. The cache only adds a 27 GB
-capacity window in front of the unlimited DDR pool.
+Both pool tiers move at 6.4 Tb/s per NPU. The cache is four copies,
+27648 GB total, 108 GB per NPU, in front of the unlimited DDR pool.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ DDR_BW = DDR_NODE_BW / GPU_PER_CPU
 DDR_CAP = DDR_NODE_CAP / GPU_PER_CPU
 HOST_BW = min(H2D_BW, DDR_BW)
 POOL_BW = 6.4e12 / 8
-T1_TOTAL = 6912e9
+T1_TOTAL = 27648e9
 T1_CAP = T1_TOTAL / v4.N
 T1_BW = POOL_BW
 T2_BW = POOL_BW
@@ -68,11 +68,11 @@ C_WIN = "C4A35A"
 C_LAT = "E07A3D"
 FOOTER = (
     "N+2(cui)    ·    20T V4    ·    Decode 256 卡 TP=1    ·    "
-    "cache 6912 GB    ·    池带宽每卡 6.4 Tb/s    ·    TTFT 10 秒    ·    TPOT 10/30 毫秒"
+    "在网 cache 4 份 27648 GB    ·    池带宽每卡 6.4 Tb/s    ·    TTFT 10 秒    ·    TPOT 10/30 毫秒"
 )
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
-PPT = "/agent/repos/ucl-mpcomm/docs/N+2(cui)-20T-V4-两级池-590A.pptx"
+PPT = "/agent/repos/ucl-mpcomm/docs/N+2(cui)-20T-V4-两级池(在网4份)-590A.pptx"
 
 
 def hot_cold(s):
@@ -309,8 +309,8 @@ def slide_config(prs, blank):
         ["主机路径", "min(200, 500) = 200 GB/s，容量每 NPU 500 GB。这是基线 2"],
         ["总线平面", "每 NPU 3.6 TB/s。派发和合并走这里，机内不再做 fullmesh"],
         ["参数面", "1.6 Tb/s。25% 是 50 GB/s，100% 是 200 GB/s。prefix 命中 99.5%"],
-        ["一级 cache", f"合计 6912 GB，每 NPU {gb1(T1_CAP)}，访问 6.4 Tb/s（0.80 TB/s）"],
-        ["二级 DDR 池", "容量不限，每 NPU 同样 6.4 Tb/s。一级只多 27 GB 的容量"],
+        ["一级 cache", f"4 份，合计 {T1_TOTAL / 1e9:.0f} GB，每 NPU {T1_CAP / 1e9:.0f} GB，访问 6.4 Tb/s（0.80 TB/s）"],
+        ["二级 DDR 池", f"容量不限，每 NPU 同样 6.4 Tb/s。一级只多 {T1_CAP / 1e9:.0f} GB 的容量"],
         ["时限", "TTFT ≤ 10 秒，TPOT ≤ 10 毫秒和 30 毫秒。时限内取吞吐最大的批"],
     ]
     kinds = ["head"] + ["body"] * len(body)
@@ -328,10 +328,10 @@ def slide_formula(prs, blank):
         ["Prefill", "n = 每卡条数，全局批 = n×64。TTFT = 拉 KV + max(HBM, 计算) + MoE + 尾部"],
         ["拉 KV / 尾部", "带宽用这一组的参数面：50 GB/s 或 200 GB/s。尾部只计没被前 60 层盖住的那段"],
         ["Prefill 房间", f"每卡 KV 超过 {gb1(v4.PF_ROOM)} 就停。这一阶段不把 KV 换进池"],
-        ["Decode 放置", "全读 KV 先放 HBM。HBM 空位再放 CSA latent。剩下的先填每卡 27 GB cache，再进二级池"],
+        ["Decode 放置", f"全读 KV 先放 HBM。HBM 空位再放 CSA latent。剩下的先填每卡 {T1_CAP / 1e9:.0f} GB cache，再进二级池"],
         ["基线 1", "全部留在 HBM。放不下就停。换入 = 0"],
         ["基线 2", "放不下的进这张卡的 CPU DDR，最多 500 GB，换入带宽 200 GB/s"],
-        ["两级池", "换入 = 池中字节 / 0.80 TB/s。一级和二级同速，27 GB 只改变落点"],
+        ["两级池", f"换入 = 池中字节 / 0.80 TB/s。一级和二级同速，{T1_CAP / 1e9:.0f} GB 只改变落点"],
         ["TPOT", "max(HBM, 计算) + max(换入, MoE)。下一层换入叠在这一层 MoE 上"],
         ["吞吐", "Prefill 是全局批 × 输入 / TTFT，单位 token/秒。Decode 是全局批 / TPOT，单位条/秒"],
     ]
@@ -427,7 +427,7 @@ def slide_ttft(prs, blank, data):
 def slide_decode(prs, blank, data, page, tag, title):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, page, title, f"TPOT ≤ {tag} 毫秒    ·    系统吞吐 TPS = 全局批 / TPOT    ·    全局批 = 每卡 × 256")
-    ui.banner(slide, 0.92, "基线 1 只放 HBM。基线 2 是 HBM 加每卡 500 GB CPU DDR。两级池是 27 GB cache 再加不限容量的二级，换入都按 0.80 TB/s。TPS 是三条路径各自的系统吞吐。")
+    ui.banner(slide, 0.92, f"基线 1 只放 HBM。基线 2 是 HBM 加每卡 500 GB CPU DDR。两级池是每卡 {T1_CAP / 1e9:.0f} GB cache 再加不限容量的二级，换入都按 0.80 TB/s。TPS 是三条路径各自的系统吞吐。")
     head = ["输入", "HBM 批", "HBM TPS", "主机批", "主机毫秒", "主机 TPS", "两级批", "两级毫秒", "两级 TPS", "相对主机"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
@@ -469,7 +469,7 @@ def slide_decode(prs, blank, data, page, tag, title):
 def slide_place(prs, blank, data):
     slide = prs.slides.add_slide(blank)
     ui.chrome(slide, 7, "30 毫秒 TPS 最高的批，全读留在 HBM，latent 再填两级", "系统吞吐 TPS = 全局批 / TPOT    ·    每卡容量    ·    集群二级 = 每卡二级 × 256")
-    ui.banner(slide, 0.92, "一级每卡只有 27 GB。两级同速，所以换入时间不看字节落在一级还是二级。TPS 是这一档两级池的系统吞吐。")
+    ui.banner(slide, 0.92, f"一级每卡 {T1_CAP / 1e9:.0f} GB，是 4 份在网 cache。两级同速，所以换入时间不看字节落在一级还是二级。TPS 是这一档两级池的系统吞吐。")
     head = ["输入", "每卡", "全读 HBM", "latent HBM", "一级", "二级", "集群二级", "换入毫秒", "TPS"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
@@ -501,7 +501,7 @@ def slide_place(prs, blank, data):
         5.40,
         1.60,
         "全读一列是 CSA index、HCA 和滑窗，按这一步整段都要读，所以不换出 HBM。\n"
-        "一级先接 HBM 放不下的 latent，最多 27 GB。超过的进二级。\n"
+        f"一级先接 HBM 放不下的 latent，最多每卡 {T1_CAP / 1e9:.0f} GB。超过的进二级。\n"
         "换入字节按抽读算：全读不进换入，latent 只按落在池里的比例乘每层抽中的 1024 个位置。",
         14,
     )
@@ -664,16 +664,32 @@ def pie_columns(data, key, parts_of):
     return columns
 
 
+def tier_note(data, columns):
+    held, full = [], []
+    for item, (_label, slices) in zip(data["rows"], columns):
+        name = fmt_len(item["S"])
+        if slices[3][1] > 1e6:
+            full.append(name)
+        elif slices[2][1] > 1e6:
+            held.append(name)
+    bits = [f"1M：{occ_note(columns[4][1])}。", f"4M：{occ_note(columns[-1][1])}。"]
+    bits.append("全读都在 HBM。")
+    if held:
+        bits.append(f"{'、'.join(held)} 的溢出还装得进每卡 {T1_CAP / 1e9:.0f} GB cache。")
+    if full:
+        bits.append(f"{'、'.join(full)} 把 cache 顶满，剩下的进二级。")
+    return "\n".join(bits[:2] + [" ".join(bits[2:])])
+
+
 def slide_pie_tier(prs, blank, data):
     columns = pie_columns(data, "tier30", lambda item, n, row: parts_tier(row))
     slide_pies(
         prs, blank, 9,
         "二级池卸载：HBM、在网 cache、二级 DDR 各占多少",
         "30 毫秒系统 TPS 最高的批    ·    每卡    ·    饼旁是占比",
-        "全读是 CSA index、HCA 和滑窗，留在 HBM。HBM 空位再放 CSA latent。剩下的先填每卡 27 GB 在网 cache，再进二级 DDR。权重不在饼里。",
+        f"全读是 CSA index、HCA 和滑窗，留在 HBM。HBM 空位再放 CSA latent。剩下的先填每卡 {T1_CAP / 1e9:.0f} GB 在网 cache，再进二级 DDR。权重不在饼里。",
         columns,
-        f"1M：{occ_note(columns[4][1])}。\n4M：{occ_note(columns[-1][1])}。\n"
-        "七档的全读都在 HBM。cache 每卡顶满 27 GB，多出来的 latent 在二级 DDR。",
+        tier_note(data, columns),
     )
 
 
@@ -712,7 +728,7 @@ def main():
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
-    prs.core_properties.title = "N+2(cui)：20T V4 两级池"
+    prs.core_properties.title = "N+2(cui)：20T V4 两级池，在网 cache 四份"
     blank = prs.slide_layouts[6]
     slide_config(prs, blank)
     slide_formula(prs, blank)

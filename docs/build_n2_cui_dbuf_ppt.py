@@ -76,17 +76,23 @@ def decode_db(n, s):
     b_ddr = n * p["cold_read"] * (1.0 - frac)
     swap = b_cache / T1_BW + b_ddr / T2_BW
     al = v4.align(n)
-    t_idx = max(n * p["index"] / v4.HBM_BW, n * p["idx_flops"] / (v4.PEAK * al))
+    idx_hbm = n * p["index"] / v4.HBM_BW
+    idx_cmp = n * p["idx_flops"] / (v4.PEAK * al)
+    t_idx = max(idx_hbm, idx_cmp)
     t_hbm = (n * (p["hca"] + p["sample"] + p["win"]) + v4.ATTN) / v4.HBM_BW
     t_ca = n * p["attn_flops"] / (v4.PEAK * al)
     t_attn = max(t_hbm, t_ca)
     moe = v4.expert(float(n * v4.N), v4.N)
-    prep = t_idx + swap
+    # Indexer and attention share one HBM and one cube, so attention waits.
+    # Swap uses the pool port and runs beside attention + MoE.
     comp = t_attn + moe["t"]
+    tail = max(swap, comp)
     return {
         "n": n,
-        "t": max(comp, prep),
+        "t": t_idx + tail,
         "idx": t_idx,
+        "idx_hbm": idx_hbm,
+        "idx_cmp": idx_cmp,
         "swap": swap,
         "attn": t_attn,
         "hbm": t_hbm,
@@ -96,8 +102,9 @@ def decode_db(n, s):
         "tw": moe["tw"],
         "tg": moe["tg"],
         "tc": moe["tc"],
-        "prep": prep,
+        "prep": t_idx + swap,
         "comp": comp,
+        "tail": tail,
         "foot": foot,
         "hbm_h": 2 * hot_one,
         "hbm_c": 2 * sample_one,
@@ -118,7 +125,13 @@ def collect():
         for limit, tag in ((0.010, "10"), (0.030, "30")):
             item[f"hbm{tag}"] = cui.search(limit, lambda n, s=s: cui.decode_hbm(n, s), tps)
             item[f"host{tag}"] = cui.search(limit, lambda n, s=s: cui.decode_host(n, s), tps)
-            item[f"db{tag}"] = cui.search(limit, lambda n, s=s: decode_db(n, s), tps)
+            def db_ok(n, s=s, limit=limit):
+                row = decode_db(n, s)
+                if row is None or 2 * row["t"] > limit + 1e-12:
+                    return None
+                return row
+
+            item[f"db{tag}"] = cui.search(limit, db_ok, tps)
         rows.append(item)
     return {"rows": rows}
 
@@ -138,7 +151,7 @@ def slide_config(prs, blank):
         ["全读 KV", "CSA index、HCA、滑窗。两批都留在 HBM。放不下的批丢掉"],
         ["CSA latent", f"整段一字节都不留在 HBM。先填每卡 {CACHE_CAP / 1e9:.0f} GB 在网 cache，剩下的进二级 DDR"],
         ["双缓冲", "每批一份抽读，只放这一步抽中的 1024 个 latent。1M 每条 17.69 MB。两份一起算进房间"],
-        ["节拍", "节拍 = max(attention + MoE, indexer + 换入)。一条 TPOT 是连续两拍。系统 TPS = 这一批 × 256 / 节拍"],
+        ["节拍", "节拍 = indexer + max(换入, attention + MoE)。一条 TPOT 是连续两拍。系统 TPS = 这一批 × 256 / 节拍"],
         ["对照", "只放 HBM：latent 能留在 HBM。主机：每卡 500 GB、200 GB/s。时限内取系统 TPS 最大"],
     ]
     kinds = ["head"] + ["key" if i in (2, 3, 4) else "body" for i in range(len(body))]
@@ -147,8 +160,8 @@ def slide_config(prs, blank):
 
 def slide_formula(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 2, "系统吞吐用节拍去除这一批，也等于用一条 TPOT 去除两批", "节拍 = max(attention + MoE, indexer + 换入)    ·    一条 TPOT = 连续两拍")
-    ui.banner(slide, 0.92, "换入批只读 HBM 里的 CSA index。抽读落在 cache 上按 3.6 TB/s，落在 DDR 上按 1.2 TB/s，写入另一块缓冲。")
+    ui.chrome(slide, 2, "系统吞吐用节拍去除这一批，也等于用一条 TPOT 去除两批", "节拍 = indexer + max(换入, attention + MoE)    ·    一条 TPOT = 连续两拍")
+    ui.banner(slide, 0.92, "indexer 和 attention 共用一条 HBM、一块算力，所以 indexer 先做完。换入走池，和后一批的 attention、MoE 同时。")
     head = ["", "式子"]
     body = [
         ["全读", "每条 (480 + 139.5)×S + 4,497,408。两批都留在 HBM"],
@@ -156,12 +169,12 @@ def slide_formula(prs, blank, data):
         ["抽读", "每条 30 层 × min(1024, S/4) × 576。S ≥ 4K 时是 17.69 MB。缓冲只放这一段"],
         ["换入", "cache 中的抽读 / 3.6 TB/s + DDR 中的抽读 / 1.2 TB/s"],
         ["indexer", "max(本批 index 字节 / 38.4 TB/s, 30×4096×S 的计算)"],
-        ["节拍", "max(attention + MoE, indexer + 换入)。这一拍有一批吐出 token"],
-        ["一条 TPOT", "准备那一拍 + 计算那一拍。同一条请求先做 indexer 和换入，下一拍再做 attention 和 MoE"],
+        ["节拍", "indexer + max(换入, attention + MoE)。这一拍有一批吐出 token"],
+        ["一条 TPOT", "连续两拍。同一条请求这一拍做 indexer 和换入，下一拍做 attention 和 MoE"],
         ["系统 TPS", "这一批 × 256 / 节拍 = 两批 × 256 / 一条 TPOT。分子和分母一起加倍，是同一个数"],
     ]
     kinds = ["head"] + ["key" if i in (5, 6, 7) else "body" for i in range(len(body))]
-    ui.add_table(slide, 0.42, 1.46, [2.15, 10.35], [head] + body, [0.30] + [0.44] * len(body), kinds, size=13)
+    ui.add_table(slide, 0.42, 1.46, [2.15, 10.35], [head] + body, [0.28] + [0.42] * len(body), kinds, size=13)
     _tps, n, row = cui.pack(data["rows"][4]["db30"])
     cycle, tpot = ms_pair(row["t"])
     ui.gold(
@@ -222,16 +235,12 @@ def slide_decode(prs, blank, data, page, tag, title):
         else:
             diff.append((name, cui.pack(item["db10"]), cui.pack(item["db30"])))
     if same and diff:
-        note += f"{same[0]} 到 {same[-1]} 准备和计算打平，10 毫秒和 30 毫秒是同一批。"
-        cuts = "，".join(
-            f"{name} 收到 10 毫秒是每卡 {cui.fmt_bs(lo[1])} 条" for name, lo, _hi in diff
-        )
-        note += cuts + "。"
+        note += f"{same[0]} 到 {same[-1]} 一条 TPOT 在 10 毫秒以内，两档是同一批。{diff[0][0]} 起 10 毫秒要把批减小。"
     elif not diff:
-        note += "七档一条 TPOT 都在 7 毫秒以内，10 毫秒和 30 毫秒是同一批。"
+        longest = max(2 * cui.pack(item[f"db{tag}"])[2]["t"] for item in data["rows"])
+        note += f"七档一条 TPOT 最长 {cui.ms2(longest)} 毫秒，10 毫秒和 30 毫秒是同一批。"
     else:
         note += "七档在 10 毫秒和 30 毫秒都要分开选批。"
-    note += " cache 按 3.6 TB/s 读，DDR 按 1.2 TB/s 读。"
     ui.gold(slide, 5.20, 1.85, note, 14)
 
 
@@ -277,33 +286,32 @@ def slide_place(prs, blank, data):
 
 def slide_tpot(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 6, "30 毫秒双缓冲的最优批，节拍按项打开", "毫秒    ·    节拍 = max(attention + MoE, indexer + 换入)")
-    ui.banner(slide, 0.92, "准备 = indexer + 换入。计算 = attention + MoE。节拍取较大的一边。派发和合并走总线 3.6 TB/s。")
-    head = ["输入", "每卡", "indexer", "换入", "准备", "attention", "派发", "权重", "GEMM", "合并", "MoE", "计算", "节拍"]
+    ui.chrome(slide, 6, "30 毫秒双缓冲的最优批，节拍按项打开", "毫秒    ·    节拍 = indexer + max(换入, attention + MoE)")
+    ui.banner(slide, 0.92, "indexer 先占 HBM 和算力。随后换入走池，和 attention、MoE 同时。后段取这两边的较大值。")
+    head = ["输入", "每卡", "indexer", "attention", "MoE", "换入", "后段", "节拍"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
         _tps, n, row = cui.pack(item["db30"])
         body.append([
             cui.fmt_len(item["S"]), cui.fmt_bs(n),
-            cui.ms2(row["idx"]), cui.ms2(row["swap"]), cui.ms2(row["prep"]), cui.ms2(row["attn"]),
-            cui.ms2(row["td"]), cui.ms2(row["tw"]), cui.ms2(row["tg"]), cui.ms2(row["tc"]),
-            cui.ms2(row["moe"]), cui.ms2(row["comp"]), cui.ms2(row["t"]),
+            cui.ms2(row["idx"]), cui.ms2(row["attn"]), cui.ms2(row["moe"]), cui.ms2(row["swap"]),
+            cui.ms2(row["tail"]), cui.ms2(row["t"]),
         ])
         kinds.append("key" if item["S"] in (1048576, 4194304) else "body")
-    widths = [0.85, 0.8, 1.05, 0.9, 0.9, 1.15, 0.85, 0.85, 0.9, 0.85, 0.85, 0.9, 0.9]
-    ui.add_table(slide, 0.28, 1.48, widths, [head] + body, [0.36] + [0.46] * len(body), kinds, size=11)
+    ui.add_table(
+        slide, 0.42, 1.48,
+        [1.25, 1.15, 1.45, 1.55, 1.35, 1.35, 1.55, 1.45],
+        [head] + body, [0.36] + [0.46] * len(body), kinds, size=13,
+    )
     _tps6, _n6, row = cui.pack(data["rows"][4]["db30"])
     c, p = ms_pair(row["t"])
-    side = "准备" if row["prep"] >= row["comp"] else "计算"
     ui.gold(
         slide,
         5.40,
         1.60,
-        f"1M：indexer {cui.ms2(row['idx'])}，换入 {cui.ms2(row['swap'])}，准备 {cui.ms2(row['prep'])}。"
-        f"attention {cui.ms2(row['attn'])}，MoE {cui.ms2(row['moe'])}"
-        f"（派发 {cui.ms2(row['td'])}，权重 {cui.ms2(row['tw'])}，GEMM {cui.ms2(row['tg'])}，合并 {cui.ms2(row['tc'])}），"
-        f"计算 {cui.ms2(row['comp'])}。\n"
-        f"节拍取{side}这一边，{c} 毫秒。一条 TPOT {p} 毫秒。"
+        f"1M：indexer {cui.ms2(row['idx'])} 毫秒，其中 HBM 读 {cui.ms2(row['idx_hbm'])}、算力 {cui.ms2(row['idx_cmp'])}。"
+        f"attention {cui.ms2(row['attn'])}，MoE {cui.ms2(row['moe'])}，换入 {cui.ms2(row['swap'])}。\n"
+        f"后段取 max(换入, attention + MoE) = {cui.ms2(row['tail'])}。节拍 {c} 毫秒，一条 TPOT {p} 毫秒。"
         f"系统 TPS = {cui.fmt_bs(row['n'])}×256 / {c} 毫秒"
         f" = 2×{cui.fmt_bs(row['n'])}×256 / {p} 毫秒 = {cui.fmt_rate(_tps6)}。",
         14,
@@ -338,23 +346,43 @@ def slide_pie(prs, blank, data):
     )
 
 
-def _seg(slide, x, y, w, h, fill, label):
+def _seg(slide, x, y, w, h, fill, label, color):
+    if w < 0.04:
+        return
     shape = slide.shapes.add_shape(ui.MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
     ui.solid(shape, fill)
-    if w >= 1.05:
-        ui.textbox(slide, x + 0.04, y, w - 0.08, h, label, 11, True, ui.WHITE, ui.PP_ALIGN.CENTER)
+    if w >= 0.70 and label:
+        ui.textbox(slide, x + 0.02, y, w - 0.04, h, label, 11 if w >= 1.05 else 9, True, color, ui.PP_ALIGN.CENTER)
 
 
-def _slot(slide, x, y, w, h, parts, cycle):
+def _bar(slide, x, y, w, h, parts, cycle):
     cursor = x
-    for sec, fill, label in parts:
+    for sec, fill, label, color in parts:
         sw = w * sec / cycle
-        _seg(slide, cursor, y, sw, h, fill, label)
+        _seg(slide, cursor, y, sw, h, fill, label, color)
         cursor += sw
-    pad = cycle - sum(sec for sec, _fill, _label in parts)
-    if pad > 1e-6 and w * pad / cycle >= 0.08:
-        shape = slide.shapes.add_shape(ui.MSO_SHAPE.RECTANGLE, Inches(cursor), Inches(y), Inches(w * pad / cycle), Inches(h))
-        ui.solid(shape, "E6EBEF")
+
+
+def _sides(row, compute):
+    """compute=True means this row waits, then runs attention and MoE."""
+    idx, attn, moe, swap = row["idx"], row["attn"], row["moe"], row["swap"]
+    pad = abs(swap - (attn + moe))
+    if compute:
+        parts = [
+            (idx, "E6EBEF", "等 HBM", ui.NAVY),
+            (attn, "0E7A76", f"attention\n{cui.ms2(attn)}", ui.WHITE),
+            (moe, "1B4F8A", f"MoE\n{cui.ms2(moe)}", ui.WHITE),
+        ]
+        if swap > attn + moe:
+            parts.append((pad, "F4F7FA", "", ui.NAVY))
+    else:
+        parts = [
+            (idx, "3D7CC9", f"indexer\n{cui.ms2(idx)}", ui.WHITE),
+            (swap, "E07A3D", f"换入\n{cui.ms2(swap)}", ui.WHITE),
+        ]
+        if attn + moe > swap:
+            parts.append((pad, "F4F7FA", "", ui.NAVY))
+    return parts
 
 
 def slide_timeline(prs, blank, data):
@@ -364,50 +392,49 @@ def slide_timeline(prs, blank, data):
     cycle, tpot = ms_pair(cycle_s)
     ui.chrome(
         slide, 10,
-        "两批错开：一边换入，另一边做 attention 和 MoE",
+        "indexer 先做完，换入再盖住 attention 和 MoE",
         f"1M 每卡 {cui.fmt_bs(n)} 条    ·    节拍 {cycle} 毫秒    ·    一条 TPOT {tpot} 毫秒",
     )
-    ui.banner(slide, 0.92, "同一批内部前后相接。两批之间同时进行，节拍取较长的一边。每一拍结束，正在计算的那批吐出一个 token。")
+    ui.banner(slide, 0.92, "计算批在 indexer 期间等 HBM。indexer 结束后，换入走池的口，attention 和 MoE 同时开始。每一拍结束，计算批吐出一个 token。")
     x0, slot_w, gap = 1.85, 3.55, 0.12
-    y_a, y_b, bar_h = 2.05, 3.15, 0.82
-    prep = [(row["idx"], "3D7CC9", f"indexer\n{cui.ms2(row['idx'])} 毫秒"), (row["swap"], "E07A3D", f"换入\n{cui.ms2(row['swap'])} 毫秒")]
-    comp = [(row["attn"], "0E7A76", f"attention\n{cui.ms2(row['attn'])} 毫秒"), (row["moe"], "1B4F8A", f"MoE\n{cui.ms2(row['moe'])} 毫秒")]
-    slots = [("第 1 拍", comp, prep, "甲吐出 token"), ("第 2 拍", prep, comp, "乙吐出 token"), ("第 3 拍", comp, prep, "甲再吐出 token")]
-    ui.textbox(slide, 0.32, y_a, 1.45, bar_h, "甲批", 14, True, ui.NAVY, ui.PP_ALIGN.RIGHT)
-    ui.textbox(slide, 0.32, y_b, 1.45, bar_h, "乙批", 14, True, ui.NAVY, ui.PP_ALIGN.RIGHT)
-    for i, (title, a_parts, b_parts, token) in enumerate(slots):
+    y_a, y_b, bar_h = 1.98, 3.12, 0.78
+    slots = [("第 1 拍", True, "甲吐出 token"), ("第 2 拍", False, "乙吐出 token"), ("第 3 拍", True, "甲再吐出 token")]
+    ui.textbox(slide, 0.28, y_a, 1.50, bar_h, "甲批", 14, True, ui.NAVY, ui.PP_ALIGN.RIGHT)
+    ui.textbox(slide, 0.28, y_b, 1.50, bar_h, "乙批", 14, True, ui.NAVY, ui.PP_ALIGN.RIGHT)
+    for i, (title, jia_computes, token) in enumerate(slots):
         x = x0 + i * (slot_w + gap)
-        ui.textbox(slide, x, 1.50, slot_w, 0.28, f"{title}    {cycle} 毫秒", 13, True, ui.NAVY, ui.PP_ALIGN.CENTER)
-        _slot(slide, x, y_a, slot_w, bar_h, a_parts, cycle_s)
-        ui.textbox(slide, x, y_a + bar_h, slot_w, 0.26, "同时", 11, True, ui.TEAL, ui.PP_ALIGN.CENTER)
-        _slot(slide, x, y_b, slot_w, bar_h, b_parts, cycle_s)
-        ui.textbox(slide, x, y_b + bar_h + 0.02, slot_w, 0.28, token, 12, True, ui.GOLD, ui.PP_ALIGN.CENTER)
+        ui.textbox(slide, x, 1.48, slot_w, 0.26, f"{title}    {cycle} 毫秒", 13, True, ui.NAVY, ui.PP_ALIGN.CENTER)
+        _bar(slide, x, y_a, slot_w, bar_h, _sides(row, jia_computes), cycle_s)
+        tail_x = x + slot_w * row["idx"] / cycle_s
+        tail_w = slot_w * row["tail"] / cycle_s
+        ui.textbox(slide, tail_x, y_a + bar_h, tail_w, 0.24, "同时", 11, True, ui.TEAL, ui.PP_ALIGN.CENTER)
+        _bar(slide, x, y_b, slot_w, bar_h, _sides(row, not jia_computes), cycle_s)
+        ui.textbox(slide, x, y_b + bar_h + 0.02, slot_w, 0.26, token, 12, True, ui.GOLD, ui.PP_ALIGN.CENTER)
     ui.textbox(
-        slide, x0 + slot_w, 4.32, 2 * slot_w + gap, 0.28,
+        slide, x0 + slot_w, 4.28, 2 * slot_w + gap, 0.26,
         f"甲相邻两个 token 的间隔 = 一条 TPOT = {tpot} 毫秒",
         13, True, ui.GOLD, ui.PP_ALIGN.CENTER,
     )
     legend = [
+        ("E6EBEF", "等 HBM"),
         ("3D7CC9", "indexer"),
         ("E07A3D", "换入"),
         ("0E7A76", "attention"),
         ("1B4F8A", "MoE"),
     ]
     for i, (color, name) in enumerate(legend):
-        lx = 1.85 + i * 2.6
-        sw = slide.shapes.add_shape(ui.MSO_SHAPE.RECTANGLE, Inches(lx), Inches(4.72), Inches(0.28), Inches(0.22))
+        lx = 1.55 + i * 2.15
+        sw = slide.shapes.add_shape(ui.MSO_SHAPE.RECTANGLE, Inches(lx), Inches(4.64), Inches(0.26), Inches(0.20))
         ui.solid(sw, color)
-        ui.textbox(slide, lx + 0.36, 4.68, 2.0, 0.30, name, 13, False, ui.INK)
+        ui.textbox(slide, lx + 0.32, 4.58, 1.7, 0.30, name, 12, False, ui.INK)
     ui.gold(
         slide,
-        5.15,
-        1.85,
-        f"第 1 拍，乙的 indexer {cui.ms2(row['idx'])} 毫秒和换入 {cui.ms2(row['swap'])} 毫秒，"
-        f"盖在甲的 attention {cui.ms2(row['attn'])} 毫秒和 MoE {cui.ms2(row['moe'])} 毫秒下面。第 2 拍对调。\n"
-        "同一批里 indexer 做完再换入，attention 做完再做 MoE，这两段相加。互相盖住的是两批之间的准备和计算。\n"
-        f"系统 TPS = {cui.fmt_bs(n)}×256 / {cycle} 毫秒"
-        f" = 2×{cui.fmt_bs(n)}×256 / {tpot} 毫秒"
-        f" = {cui.fmt_rate(_tps)}。甲隔一拍吐一次，卡上同时有两批。",
+        5.10,
+        1.90,
+        f"第 1 拍乙先做 indexer {cui.ms2(row['idx'])} 毫秒。这段 HBM 读是 {cui.ms2(row['idx_hbm'])} 毫秒，算力只有 {cui.ms2(row['idx_cmp'])} 毫秒，甲只能等。\n"
+        f"随后乙换入 {cui.ms2(row['swap'])} 毫秒，甲同时做 attention {cui.ms2(row['attn'])} 毫秒和 MoE {cui.ms2(row['moe'])} 毫秒。换入走池，不占这 38.4 TB/s。\n"
+        f"节拍 {cycle} 毫秒，一条 TPOT {tpot} 毫秒。系统 TPS = {cui.fmt_bs(n)}×256 / {cycle} 毫秒"
+        f" = 2×{cui.fmt_bs(n)}×256 / {tpot} 毫秒 = {cui.fmt_rate(_tps)}。",
         14,
     )
 

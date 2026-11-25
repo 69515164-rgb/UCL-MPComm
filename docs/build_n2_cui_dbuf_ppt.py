@@ -26,7 +26,7 @@ T1_BW = 3.6e12
 T2_BW = 1.2e12
 CACHE_TOTAL = 96 * 144 * 3 * 1e9
 CACHE_CAP = CACHE_TOTAL / v4.N
-SLIDES = 9
+SLIDES = 10
 FOOTER = (
     "N+2(cui)    ·    20T V4    ·    Decode 256 卡 TP=1    ·    "
     "CSA latent 进两级池    ·    HBM 双缓冲只放抽读    ·    cache 3.6 TB/s    ·    DDR 1.2 TB/s    ·    TPOT 10/30 毫秒"
@@ -34,6 +34,12 @@ FOOTER = (
 ui.SLIDES = SLIDES
 ui.FOOTER = FOOTER
 PPT = "/agent/repos/ucl-mpcomm/docs/N+2(cui)-20T-V4-两级池放CSA LATENT HBM DB抽读-590A.pptx"
+
+
+def ms_pair(cycle):
+    """Round the cycle first, then double it, so 3.03 ms pairs with 6.06 ms."""
+    shown = round(cycle * 1e3, 2)
+    return f"{shown:.2f}", f"{shown * 2:.2f}"
 
 
 def parts(s):
@@ -132,16 +138,16 @@ def slide_config(prs, blank):
         ["全读 KV", "CSA index、HCA、滑窗。两批都留在 HBM。放不下的批丢掉"],
         ["CSA latent", f"整段一字节都不留在 HBM。先填每卡 {CACHE_CAP / 1e9:.0f} GB 在网 cache，剩下的进二级 DDR"],
         ["双缓冲", "每批一份抽读，只放这一步抽中的 1024 个 latent。1M 每条 17.69 MB。两份一起算进房间"],
-        ["节拍", "节拍 = max(attention + MoE, indexer + 换入)。同一批里 indexer 先做完再换入"],
+        ["节拍", "节拍 = max(attention + MoE, indexer + 换入)。一条 TPOT 是连续两拍。系统 TPS = 这一批 × 256 / 节拍"],
         ["对照", "只放 HBM：latent 能留在 HBM。主机：每卡 500 GB、200 GB/s。时限内取系统 TPS 最大"],
     ]
     kinds = ["head"] + ["key" if i in (2, 3, 4) else "body" for i in range(len(body))]
     ui.add_table(slide, 0.42, 1.48, [2.15, 10.35], [head] + body, [0.32] + [0.52] * len(body), kinds, size=14)
 
 
-def slide_formula(prs, blank):
+def slide_formula(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 2, "时限内取吞吐最大，抽读换入和另一批的计算错开", "节拍 = max(attention + MoE, indexer + 换入)")
+    ui.chrome(slide, 2, "系统吞吐用节拍去除这一批，也等于用一条 TPOT 去除两批", "节拍 = max(attention + MoE, indexer + 换入)    ·    一条 TPOT = 连续两拍")
     ui.banner(slide, 0.92, "换入批只读 HBM 里的 CSA index。抽读落在 cache 上按 3.6 TB/s，落在 DDR 上按 1.2 TB/s，写入另一块缓冲。")
     head = ["", "式子"]
     body = [
@@ -150,18 +156,32 @@ def slide_formula(prs, blank):
         ["抽读", "每条 30 层 × min(1024, S/4) × 576。S ≥ 4K 时是 17.69 MB。缓冲只放这一段"],
         ["换入", "cache 中的抽读 / 3.6 TB/s + DDR 中的抽读 / 1.2 TB/s"],
         ["indexer", "max(本批 index 字节 / 38.4 TB/s, 30×4096×S 的计算)"],
-        ["节拍", "max(attention + MoE, indexer + 换入)。稳态每拍完成一批"],
-        ["选批", "2 × 每批 × (全读 + 抽读) ≤ 315.7 GB，并且节拍 ≤ 10 或 30 毫秒，取这一批 × 256 / 节拍最大"],
+        ["节拍", "max(attention + MoE, indexer + 换入)。这一拍有一批吐出 token"],
+        ["一条 TPOT", "准备那一拍 + 计算那一拍。同一条请求先做 indexer 和换入，下一拍再做 attention 和 MoE"],
+        ["系统 TPS", "这一批 × 256 / 节拍 = 两批 × 256 / 一条 TPOT。分子和分母一起加倍，是同一个数"],
     ]
-    kinds = ["head"] + ["key" if i in (2, 3, 5) else "body" for i in range(len(body))]
-    ui.add_table(slide, 0.42, 1.48, [2.15, 10.35], [head] + body, [0.32] + [0.48] * len(body), kinds, size=14)
+    kinds = ["head"] + ["key" if i in (5, 6, 7) else "body" for i in range(len(body))]
+    ui.add_table(slide, 0.42, 1.46, [2.15, 10.35], [head] + body, [0.30] + [0.44] * len(body), kinds, size=13)
+    _tps, n, row = cui.pack(data["rows"][4]["db30"])
+    cycle, tpot = ms_pair(row["t"])
+    ui.gold(
+        slide,
+        5.40,
+        1.55,
+        f"1M 每卡 {cui.fmt_bs(n)} 条。节拍 {cycle} 毫秒，一条 TPOT {tpot} 毫秒。\n"
+        f"系统 TPS = {cui.fmt_bs(n)}×256 / {cycle} 毫秒"
+        f" = 2×{cui.fmt_bs(n)}×256 / {tpot} 毫秒"
+        f" = {cui.fmt_rate(_tps)}。\n"
+        "只把分母换成一条 TPOT、分子仍用一批，会把常驻的另一批漏掉。",
+        14,
+    )
 
 
 def slide_decode(prs, blank, data, page, tag, title):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, page, title, f"TPOT ≤ {tag} 毫秒    ·    系统吞吐 TPS = 全局批 / 节拍    ·    全局批 = 这一批 × 256")
-    ui.banner(slide, 0.92, "DB 列是抽读双缓冲。一批做 attention 和 MoE，另一批先做 indexer 再换入。三列都是系统 TPS。")
-    head = ["输入", "HBM 批", "HBM TPS", "主机批", "主机毫秒", "主机 TPS", "DB 批", "DB 毫秒", "DB TPS", "相对主机"]
+    ui.chrome(slide, page, title, f"一条 TPOT ≤ {tag} 毫秒    ·    系统 TPS = 这一批 × 256 / 节拍 = 两批 × 256 / 一条 TPOT")
+    ui.banner(slide, 0.92, "DB 列的毫秒是节拍。一条 TPOT 是连续两拍。系统 TPS 用节拍去除这一批，等于用一条 TPOT 去除两批。")
+    head = ["输入", "HBM 批", "HBM TPS", "主机批", "主机毫秒", "主机 TPS", "DB 批", "节拍", "DB TPS", "相对主机"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
         hbm, host, db = cui.pack(item[f"hbm{tag}"]), cui.pack(item[f"host{tag}"]), cui.pack(item[f"db{tag}"])
@@ -184,11 +204,15 @@ def slide_decode(prs, blank, data, page, tag, title):
     one, four = data["rows"][4], data["rows"][-1]
     o1, h1 = cui.pack(one[f"db{tag}"]), cui.pack(one[f"host{tag}"])
     o4, h4 = cui.pack(four[f"db{tag}"]), cui.pack(four[f"host{tag}"])
+    c1, p1 = ms_pair(o1[2]["t"])
+    c4, p4 = ms_pair(o4[2]["t"])
     note = (
-        f"1M：DB 每卡 {cui.fmt_bs(o1[1])} 条、节拍 {cui.ms2(o1[2]['t'])} 毫秒、系统 TPS {cui.fmt_rate(o1[0])}。"
-        f"主机每卡 {cui.fmt_bs(h1[1])} 条、TPS {cui.fmt_rate(h1[0])}，相对主机 {cui.signed_pct(o1[0], h1[0])}。\n"
-        f"4M：DB 每卡 {cui.fmt_bs(o4[1])} 条、节拍 {cui.ms2(o4[2]['t'])} 毫秒、系统 TPS {cui.fmt_rate(o4[0])}。"
-        f"主机 TPS {cui.fmt_rate(h4[0])}，相对主机 {cui.signed_pct(o4[0], h4[0])}。\n"
+        f"1M：节拍 {c1} 毫秒，一条 TPOT {p1} 毫秒。"
+        f"系统 TPS = {cui.fmt_bs(o1[1])}×256 / {c1} 毫秒"
+        f" = 2×{cui.fmt_bs(o1[1])}×256 / {p1} 毫秒"
+        f" = {cui.fmt_rate(o1[0])}，相对主机 {cui.signed_pct(o1[0], h1[0])}。\n"
+        f"4M：节拍 {c4} 毫秒，一条 TPOT {p4} 毫秒，"
+        f"系统 TPS {cui.fmt_rate(o4[0])}，相对主机 {cui.signed_pct(o4[0], h4[0])}。\n"
     )
     same, diff = [], []
     for item in data["rows"]:
@@ -204,7 +228,7 @@ def slide_decode(prs, blank, data, page, tag, title):
         )
         note += cuts + "。"
     elif not diff:
-        note += "七档准备和计算在 3 毫秒上下打平，10 毫秒和 30 毫秒是同一批。"
+        note += "七档一条 TPOT 都在 7 毫秒以内，10 毫秒和 30 毫秒是同一批。"
     else:
         note += "七档在 10 毫秒和 30 毫秒都要分开选批。"
     note += " cache 按 3.6 TB/s 读，DDR 按 1.2 TB/s 读。"
@@ -213,7 +237,7 @@ def slide_decode(prs, blank, data, page, tag, title):
 
 def slide_place(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 5, "30 毫秒 TPS 最高的批，抽读在 HBM，整段 latent 在池里", "系统吞吐 TPS = 全局批 / 节拍    ·    每卡")
+    ui.chrome(slide, 5, "30 毫秒 TPS 最高的批，抽读在 HBM，整段 latent 在池里", "系统 TPS = 这一批 × 256 / 节拍 = 两批 × 256 / 一条 TPOT    ·    每卡")
     ui.banner(slide, 0.92, "HBM 全读是两批加在一起。HBM 抽读是两份缓冲。cache 上限每卡 162 GB，读入 3.6 TB/s。DDR 不限，读入 1.2 TB/s。")
     head = ["输入", "每卡", "HBM 全读", "HBM 抽读", "cache latent", "DDR latent", "换入毫秒", "TPS"]
     body, kinds = [], ["head"]
@@ -268,7 +292,8 @@ def slide_tpot(prs, blank, data):
         kinds.append("key" if item["S"] in (1048576, 4194304) else "body")
     widths = [0.85, 0.8, 1.05, 0.9, 0.9, 1.15, 0.85, 0.85, 0.9, 0.85, 0.85, 0.9, 0.9]
     ui.add_table(slide, 0.28, 1.48, widths, [head] + body, [0.36] + [0.46] * len(body), kinds, size=11)
-    row = cui.pack(data["rows"][4]["db30"])[2]
+    _tps6, _n6, row = cui.pack(data["rows"][4]["db30"])
+    c, p = ms_pair(row["t"])
     side = "准备" if row["prep"] >= row["comp"] else "计算"
     ui.gold(
         slide,
@@ -278,7 +303,9 @@ def slide_tpot(prs, blank, data):
         f"attention {cui.ms2(row['attn'])}，MoE {cui.ms2(row['moe'])}"
         f"（派发 {cui.ms2(row['td'])}，权重 {cui.ms2(row['tw'])}，GEMM {cui.ms2(row['tg'])}，合并 {cui.ms2(row['tc'])}），"
         f"计算 {cui.ms2(row['comp'])}。\n"
-        f"节拍取{side}这一边，{cui.ms2(row['t'])} 毫秒。两边接近，再加条数准备涨得更快，系统 TPS 下降。",
+        f"节拍取{side}这一边，{c} 毫秒。一条 TPOT {p} 毫秒。"
+        f"系统 TPS = {cui.fmt_bs(row['n'])}×256 / {c} 毫秒"
+        f" = 2×{cui.fmt_bs(row['n'])}×256 / {p} 毫秒 = {cui.fmt_rate(_tps6)}。",
         14,
     )
 
@@ -311,6 +338,80 @@ def slide_pie(prs, blank, data):
     )
 
 
+def _seg(slide, x, y, w, h, fill, label):
+    shape = slide.shapes.add_shape(ui.MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    ui.solid(shape, fill)
+    if w >= 1.05:
+        ui.textbox(slide, x + 0.04, y, w - 0.08, h, label, 11, True, ui.WHITE, ui.PP_ALIGN.CENTER)
+
+
+def _slot(slide, x, y, w, h, parts, cycle):
+    cursor = x
+    for sec, fill, label in parts:
+        sw = w * sec / cycle
+        _seg(slide, cursor, y, sw, h, fill, label)
+        cursor += sw
+    pad = cycle - sum(sec for sec, _fill, _label in parts)
+    if pad > 1e-6 and w * pad / cycle >= 0.08:
+        shape = slide.shapes.add_shape(ui.MSO_SHAPE.RECTANGLE, Inches(cursor), Inches(y), Inches(w * pad / cycle), Inches(h))
+        ui.solid(shape, "E6EBEF")
+
+
+def slide_timeline(prs, blank, data):
+    slide = prs.slides.add_slide(blank)
+    _tps, n, row = cui.pack(data["rows"][4]["db30"])
+    cycle_s = row["t"]
+    cycle, tpot = ms_pair(cycle_s)
+    ui.chrome(
+        slide, 10,
+        "两批错开：一边换入，另一边做 attention 和 MoE",
+        f"1M 每卡 {cui.fmt_bs(n)} 条    ·    节拍 {cycle} 毫秒    ·    一条 TPOT {tpot} 毫秒",
+    )
+    ui.banner(slide, 0.92, "同一批内部前后相接。两批之间同时进行，节拍取较长的一边。每一拍结束，正在计算的那批吐出一个 token。")
+    x0, slot_w, gap = 1.85, 3.55, 0.12
+    y_a, y_b, bar_h = 2.05, 3.15, 0.82
+    prep = [(row["idx"], "3D7CC9", f"indexer\n{cui.ms2(row['idx'])} 毫秒"), (row["swap"], "E07A3D", f"换入\n{cui.ms2(row['swap'])} 毫秒")]
+    comp = [(row["attn"], "0E7A76", f"attention\n{cui.ms2(row['attn'])} 毫秒"), (row["moe"], "1B4F8A", f"MoE\n{cui.ms2(row['moe'])} 毫秒")]
+    slots = [("第 1 拍", comp, prep, "甲吐出 token"), ("第 2 拍", prep, comp, "乙吐出 token"), ("第 3 拍", comp, prep, "甲再吐出 token")]
+    ui.textbox(slide, 0.32, y_a, 1.45, bar_h, "甲批", 14, True, ui.NAVY, ui.PP_ALIGN.RIGHT)
+    ui.textbox(slide, 0.32, y_b, 1.45, bar_h, "乙批", 14, True, ui.NAVY, ui.PP_ALIGN.RIGHT)
+    for i, (title, a_parts, b_parts, token) in enumerate(slots):
+        x = x0 + i * (slot_w + gap)
+        ui.textbox(slide, x, 1.50, slot_w, 0.28, f"{title}    {cycle} 毫秒", 13, True, ui.NAVY, ui.PP_ALIGN.CENTER)
+        _slot(slide, x, y_a, slot_w, bar_h, a_parts, cycle_s)
+        ui.textbox(slide, x, y_a + bar_h, slot_w, 0.26, "同时", 11, True, ui.TEAL, ui.PP_ALIGN.CENTER)
+        _slot(slide, x, y_b, slot_w, bar_h, b_parts, cycle_s)
+        ui.textbox(slide, x, y_b + bar_h + 0.02, slot_w, 0.28, token, 12, True, ui.GOLD, ui.PP_ALIGN.CENTER)
+    ui.textbox(
+        slide, x0 + slot_w, 4.32, 2 * slot_w + gap, 0.28,
+        f"甲相邻两个 token 的间隔 = 一条 TPOT = {tpot} 毫秒",
+        13, True, ui.GOLD, ui.PP_ALIGN.CENTER,
+    )
+    legend = [
+        ("3D7CC9", "indexer"),
+        ("E07A3D", "换入"),
+        ("0E7A76", "attention"),
+        ("1B4F8A", "MoE"),
+    ]
+    for i, (color, name) in enumerate(legend):
+        lx = 1.85 + i * 2.6
+        sw = slide.shapes.add_shape(ui.MSO_SHAPE.RECTANGLE, Inches(lx), Inches(4.72), Inches(0.28), Inches(0.22))
+        ui.solid(sw, color)
+        ui.textbox(slide, lx + 0.36, 4.68, 2.0, 0.30, name, 13, False, ui.INK)
+    ui.gold(
+        slide,
+        5.15,
+        1.85,
+        f"第 1 拍，乙的 indexer {cui.ms2(row['idx'])} 毫秒和换入 {cui.ms2(row['swap'])} 毫秒，"
+        f"盖在甲的 attention {cui.ms2(row['attn'])} 毫秒和 MoE {cui.ms2(row['moe'])} 毫秒下面。第 2 拍对调。\n"
+        "同一批里 indexer 做完再换入，attention 做完再做 MoE，这两段相加。互相盖住的是两批之间的准备和计算。\n"
+        f"系统 TPS = {cui.fmt_bs(n)}×256 / {cycle} 毫秒"
+        f" = 2×{cui.fmt_bs(n)}×256 / {tpot} 毫秒"
+        f" = {cui.fmt_rate(_tps)}。甲隔一拍吐一次，卡上同时有两批。",
+        14,
+    )
+
+
 def main():
     data = collect()
     prs = Presentation()
@@ -319,7 +420,7 @@ def main():
     prs.core_properties.title = "N+2(cui)：20T V4，两级池放 CSA latent，HBM 双缓冲抽读"
     blank = prs.slide_layouts[6]
     slide_config(prs, blank)
-    slide_formula(prs, blank)
+    slide_formula(prs, blank, data)
     slide_decode(prs, blank, data, 3, "30", "30 毫秒内，抽读双缓冲的系统 TPS 和主机、只放 HBM 比")
     slide_decode(prs, blank, data, 4, "10", "10 毫秒再收紧一次，仍取三条路径各自的最高系统 TPS")
     slide_place(prs, blank, data)
@@ -346,6 +447,7 @@ def main():
         f"64K 合计 {cui.gb_pie(tot64)}，CSA latent {pct64[3]:.1f}%。\n"
         f"4M 合计 {cui.gb_pie(tot4)}，CSA latent {pct4[3]:.1f}%。比例几乎不随长度变。",
     )
+    slide_timeline(prs, blank, data)
     prs.save(PPT)
     for item in data["rows"]:
         def brief(found):

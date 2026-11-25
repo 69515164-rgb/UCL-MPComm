@@ -13,6 +13,7 @@ capacity window in front of the unlimited DDR pool.
 from __future__ import annotations
 
 import importlib.util
+import math
 
 from pptx import Presentation
 from pptx.util import Inches
@@ -56,7 +57,15 @@ TTFT_LIMIT = 10.0
 TIE = 1e-4
 NPU_PER_SERVER = 8
 
-SLIDES = 8
+SLIDES = 11
+C_HOT = "1B4F8A"
+C_COLD = "8FCBB8"
+C_CACHE = "3D7CC9"
+C_DDR = "E07A3D"
+C_INDEX = "1B4F8A"
+C_HCA = "5B8FA8"
+C_WIN = "C4A35A"
+C_LAT = "E07A3D"
 FOOTER = (
     "N+2(cui)    ·    20T V4    ·    Decode 256 卡 TP=1    ·    "
     "cache 6912 GB    ·    池带宽每卡 6.4 Tb/s    ·    TTFT 10 秒    ·    TPOT 10/30 毫秒"
@@ -159,6 +168,8 @@ def decode_host(n, s):
     if placed is None:
         return None
     swap = (placed["b_hot"] + placed["b_cold"]) / HOST_BW
+    placed["ddr_h"] = placed["rest_h"]
+    placed["ddr_c"] = placed["rest_c"]
     return finish(n, s, placed, swap, v4.N)
 
 
@@ -415,9 +426,9 @@ def slide_ttft(prs, blank, data):
 
 def slide_decode(prs, blank, data, page, tag, title):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, page, title, f"TPOT ≤ {tag} 毫秒    ·    三条路径各自取条/秒最大的批    ·    全局批 = 每卡 × 256")
-    ui.banner(slide, 0.92, "基线 1 只放 HBM。基线 2 是 HBM 加每卡 500 GB CPU DDR。两级池是 27 GB cache 再加不限容量的二级，换入都按 0.80 TB/s。")
-    head = ["输入", "HBM 批", "HBM 条/秒", "主机批", "主机毫秒", "主机条/秒", "两级批", "两级毫秒", "两级条/秒", "相对主机"]
+    ui.chrome(slide, page, title, f"TPOT ≤ {tag} 毫秒    ·    系统吞吐 TPS = 全局批 / TPOT    ·    全局批 = 每卡 × 256")
+    ui.banner(slide, 0.92, "基线 1 只放 HBM。基线 2 是 HBM 加每卡 500 GB CPU DDR。两级池是 27 GB cache 再加不限容量的二级，换入都按 0.80 TB/s。TPS 是三条路径各自的系统吞吐。")
+    head = ["输入", "HBM 批", "HBM TPS", "主机批", "主机毫秒", "主机 TPS", "两级批", "两级毫秒", "两级 TPS", "相对主机"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
         h, host, tier = pack(item[f"hbm{tag}"]), pack(item[f"host{tag}"]), pack(item[f"tier{tag}"])
@@ -438,10 +449,10 @@ def slide_decode(prs, blank, data, page, tag, title):
     t1, h1 = pack(one[f"tier{tag}"]), pack(one[f"host{tag}"])
     t4, h4 = pack(four[f"tier{tag}"]), pack(four[f"host{tag}"])
     note = (
-        f"1M：两级每卡 {fmt_bs(t1[1])} 条、TPOT {ms2(t1[2]['t'])} 毫秒、{fmt_rate(t1[0])} 条/秒。"
-        f"主机每卡 {fmt_bs(h1[1]) if h1 else '—'} 条、{fmt_rate(h1[0]) if h1 else '—'}。"
+        f"1M：两级每卡 {fmt_bs(t1[1])} 条、TPOT {ms2(t1[2]['t'])} 毫秒、系统 TPS {fmt_rate(t1[0])}。"
+        f"主机每卡 {fmt_bs(h1[1]) if h1 else '—'} 条、TPS {fmt_rate(h1[0]) if h1 else '—'}。"
         f"相对主机 {signed_pct(t1[0], h1[0]) if h1 else '—'}。\n"
-        f"4M：两级每卡 {fmt_bs(t4[1])} 条、TPOT {ms2(t4[2]['t'])} 毫秒、{fmt_rate(t4[0])}。"
+        f"4M：两级每卡 {fmt_bs(t4[1])} 条、TPOT {ms2(t4[2]['t'])} 毫秒、系统 TPS {fmt_rate(t4[0])}。"
         f"主机 {fmt_rate(h4[0]) if h4 else '—'}，相对主机 {signed_pct(t4[0], h4[0]) if h4 else '—'}。\n"
     )
     if tag == "10":
@@ -457,16 +468,16 @@ def slide_decode(prs, blank, data, page, tag, title):
 
 def slide_place(prs, blank, data):
     slide = prs.slides.add_slide(blank)
-    ui.chrome(slide, 7, "30 毫秒最优点上，全读留在 HBM，latent 再填两级", "每卡    ·    集群二级 = 每卡二级 × 256")
-    ui.banner(slide, 0.92, "一级每卡只有 27 GB。两级同速，所以换入时间不看字节落在一级还是二级，只看有多少字节离开了 HBM。")
-    head = ["输入", "每卡", "全读 HBM", "latent HBM", "一级", "二级", "集群二级", "换入毫秒"]
+    ui.chrome(slide, 7, "30 毫秒 TPS 最高的批，全读留在 HBM，latent 再填两级", "系统吞吐 TPS = 全局批 / TPOT    ·    每卡容量    ·    集群二级 = 每卡二级 × 256")
+    ui.banner(slide, 0.92, "一级每卡只有 27 GB。两级同速，所以换入时间不看字节落在一级还是二级。TPS 是这一档两级池的系统吞吐。")
+    head = ["输入", "每卡", "全读 HBM", "latent HBM", "一级", "二级", "集群二级", "换入毫秒", "TPS"]
     body, kinds = [], ["head"]
     for item in data["rows"]:
         got = pack(item["tier30"])
         if got is None:
-            body.append([fmt_len(item["S"])] + ["—"] * 7)
+            body.append([fmt_len(item["S"])] + ["—"] * 8)
         else:
-            _tps, n, row = got
+            tps, n, row = got
             lvl1 = row["t1_h"] + row["t1_c"]
             lvl2 = row["t2_h"] + row["t2_c"]
             body.append(
@@ -479,10 +490,11 @@ def slide_place(prs, blank, data):
                     gb1(lvl2),
                     gb1(lvl2 * v4.N),
                     ms2(row["swap"]),
+                    fmt_rate(tps),
                 ]
             )
         kinds.append("body")
-    widths = [1.15, 1.15, 1.55, 1.7, 1.4, 1.45, 1.7, 1.4]
+    widths = [0.95, 0.95, 1.40, 1.50, 1.20, 1.30, 1.55, 1.25, 1.40]
     ui.add_table(slide, 0.42, 1.48, widths, [head] + body, [0.36] + [0.46] * len(body), kinds, size=13)
     ui.gold(
         slide,
@@ -540,6 +552,161 @@ def slide_tpot(prs, blank, data):
     )
 
 
+def gb_pie(n):
+    if n >= 1e12:
+        return f"{n / 1e12:.2f} TB"
+    if n >= 1e9:
+        return f"{n / 1e9:.1f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.0f} MB"
+    return "0"
+
+
+def share(slices):
+    total = sum(v for _label, v, _color in slices)
+    if total <= 0:
+        return total, [0.0] * len(slices)
+    raw = [v / total * 100 for _label, v, _color in slices]
+    rounded = [round(x, 1) for x in raw]
+    drift = round(100.0 - sum(rounded), 1)
+    biggest = max(range(len(slices)), key=lambda i: slices[i][1])
+    rounded[biggest] = round(rounded[biggest] + drift, 1)
+    return total, rounded
+
+
+def add_pie(slide, cx, cy, r, slices):
+    alive = [(v, c) for _label, v, c in slices if v > 0]
+    if not alive:
+        return
+    if len(alive) == 1:
+        oval = slide.shapes.add_shape(
+            ui.MSO_SHAPE.OVAL, Inches(cx - r), Inches(cy - r), Inches(2 * r), Inches(2 * r)
+        )
+        ui.solid(oval, alive[0][1])
+        return
+    total = sum(v for v, _c in alive)
+    theta = 0.0
+    for value, color in alive:
+        sweep = 360.0 * value / total
+        if sweep < 1.2:
+            theta += sweep
+            continue
+        steps = max(2, int(math.ceil(sweep / 6)))
+        pts = [(cx, cy)]
+        for i in range(steps + 1):
+            ang = math.radians(theta + sweep * i / steps)
+            pts.append((cx + r * math.sin(ang), cy - r * math.cos(ang)))
+        theta += sweep
+        builder = slide.shapes.build_freeform(Inches(pts[0][0]), Inches(pts[0][1]))
+        builder.add_line_segments([(Inches(x), Inches(y)) for x, y in pts[1:]], close=True)
+        ui.solid(builder.convert_to_shape(), color)
+
+
+def occ_note(slices):
+    _total, pct = share(slices)
+    return "，".join(
+        f"{name} {gb_pie(value)}（{p:.1f}%）"
+        for (name, value, _color), p in zip(slices, pct)
+        if value >= 1e6
+    )
+
+
+def parts_tier(row):
+    return [
+        ("HBM 全读", row["hbm_h"], C_HOT),
+        ("HBM latent", row["hbm_c"], C_COLD),
+        ("在网 cache", row["t1_h"] + row["t1_c"], C_CACHE),
+        ("二级 DDR", row["t2_h"] + row["t2_c"], C_DDR),
+    ]
+
+
+def parts_host(row):
+    return [
+        ("HBM 全读", row["hbm_h"], C_HOT),
+        ("HBM latent", row["hbm_c"], C_COLD),
+        ("CPU DDR", row["ddr_h"] + row["ddr_c"], C_DDR),
+    ]
+
+
+def parts_hbm(s, n):
+    return [
+        ("CSA index", 480.0 * s * n, C_INDEX),
+        ("HCA", 139.5 * s * n, C_HCA),
+        ("滑窗", v4.FIXED * n, C_WIN),
+        ("CSA latent", 4320.0 * s * n, C_LAT),
+    ]
+
+
+def slide_pies(prs, blank, page, title, kicker, banner, columns, note):
+    slide = prs.slides.add_slide(blank)
+    ui.chrome(slide, page, title, kicker)
+    ui.banner(slide, 0.90, banner, size=12)
+    gap = 12.90 / len(columns)
+    for i, (label, slices) in enumerate(columns):
+        x = 0.22 + i * gap
+        ui.textbox(slide, x, 1.36, gap - 0.04, 0.58, label, 11, True, ui.NAVY, anchor=ui.MSO_ANCHOR.MIDDLE)
+        add_pie(slide, x + gap / 2.0, 2.55, 0.42, slices)
+        _total, pct = share(slices)
+        items = []
+        for (name, value, color), p in zip(slices, pct):
+            shown = "<0.1%" if p == 0.0 and value > 0 else f"{p:.1f}%"
+            items.append((color, f"{name}  {shown}\n{gb_pie(value)}"))
+        ui.add_key(slide, x + 0.02, 3.08, gap - 0.08, items, size=10, row=0.42)
+    ui.gold(slide, 5.55, 1.45, note, 13)
+
+
+def pie_columns(data, key, parts_of):
+    columns = []
+    for item in data["rows"]:
+        tps, n, row = pack(item[key])
+        slices = parts_of(item, n, row)
+        columns.append((f"{fmt_len(item['S'])}\nTPS {fmt_rate(tps)}\n合计 {gb_pie(share(slices)[0])}", slices))
+    return columns
+
+
+def slide_pie_tier(prs, blank, data):
+    columns = pie_columns(data, "tier30", lambda item, n, row: parts_tier(row))
+    slide_pies(
+        prs, blank, 9,
+        "二级池卸载：HBM、在网 cache、二级 DDR 各占多少",
+        "30 毫秒系统 TPS 最高的批    ·    每卡    ·    饼旁是占比",
+        "全读是 CSA index、HCA 和滑窗，留在 HBM。HBM 空位再放 CSA latent。剩下的先填每卡 27 GB 在网 cache，再进二级 DDR。权重不在饼里。",
+        columns,
+        f"1M：{occ_note(columns[4][1])}。\n4M：{occ_note(columns[-1][1])}。\n"
+        "七档的全读都在 HBM。cache 每卡顶满 27 GB，多出来的 latent 在二级 DDR。",
+    )
+
+
+def slide_pie_host(prs, blank, data):
+    columns = pie_columns(data, "host30", lambda item, n, row: parts_host(row))
+    slide_pies(
+        prs, blank, 10,
+        "主机 CPU 卸载：HBM 和 CPU DDR 各占多少",
+        "30 毫秒系统 TPS 最高的批    ·    每卡    ·    CPU DDR 上限 500 GB",
+        "全读 KV 先放 HBM，空位放 CSA latent。放不下的进这张卡的 CPU DDR。DDR 里没有全读 KV。",
+        columns,
+        f"1M：{occ_note(columns[4][1])}。\n4M：{occ_note(columns[-1][1])}。\n"
+        f"每卡 DDR 上限 {DDR_CAP / 1e9:.0f} GB。4M 用了 {gb_pie(columns[-1][1][2][1])}。",
+    )
+
+
+def slide_pie_hbm(prs, blank, data):
+    columns = pie_columns(data, "hbm30", lambda item, n, row: parts_hbm(item["S"], n))
+    tot64, pct64 = share(columns[0][1])
+    tot4, pct4 = share(columns[-1][1])
+    slide_pies(
+        prs, blank, 11,
+        "不卸载：HBM 里的 KV 怎么拆",
+        "30 毫秒系统 TPS 最高的批    ·    每卡    ·    四块都在 HBM",
+        "没有 cache，也没有 DDR。饼是这一批 KV 在 HBM 里的构成：CSA index、HCA、滑窗、CSA latent。",
+        columns,
+        f"64K 合计 {gb_pie(tot64)}，CSA latent {pct64[3]:.1f}%，index {pct64[0]:.1f}%，HCA {pct64[1]:.1f}%，滑窗 {pct64[2]:.1f}%。\n"
+        f"4M 合计 {gb_pie(tot4)}，CSA latent {pct4[3]:.1f}%，index {pct4[0]:.1f}%，HCA {pct4[1]:.1f}%，滑窗 "
+        f"{'<0.1%' if pct4[2] == 0.0 else f'{pct4[2]:.1f}%'}。\n"
+        "滑窗不随长度涨。七档的比例几乎一样，变的是每卡条数和字节。",
+    )
+
+
 def main():
     data = collect()
     prs = Presentation()
@@ -551,10 +718,13 @@ def main():
     slide_formula(prs, blank)
     slide_prefill(prs, blank, data)
     slide_ttft(prs, blank, data)
-    slide_decode(prs, blank, data, 5, "30", "30 毫秒内，两级池的条/秒高于只放 HBM，也高于主机 DDR")
-    slide_decode(prs, blank, data, 6, "10", "10 毫秒再收紧一次，仍取三条路径各自的最高吞吐")
+    slide_decode(prs, blank, data, 5, "30", "30 毫秒内，两级池的系统 TPS 高于只放 HBM，也高于主机 DDR")
+    slide_decode(prs, blank, data, 6, "10", "10 毫秒再收紧一次，仍取三条路径各自的最高系统 TPS")
     slide_place(prs, blank, data)
     slide_tpot(prs, blank, data)
+    slide_pie_tier(prs, blank, data)
+    slide_pie_host(prs, blank, data)
+    slide_pie_hbm(prs, blank, data)
     prs.save(PPT)
     print("ROOM_GPU_GB", round(v4.ROOM_GPU / 1e9, 2))
     print("PF_ROOM_GB", round(v4.PF_ROOM / 1e9, 2))
